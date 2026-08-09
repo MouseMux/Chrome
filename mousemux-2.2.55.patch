@@ -1,0 +1,533 @@
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 20c68ae8dd..8302b2fd16 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4995,6 +4995,8 @@ static_library("ui") {
+         "accessibility_util.h",
+         "views/accessibility/accessibility_util.cc",
+         "views/chrome_views_delegate_win.cc",
++        "views/mouse_mux/mouse_mux_control_dialog.cc",
++        "views/mouse_mux/mouse_mux_control_dialog.h",
+       ]
+     }
+ 
+diff --git a/chrome/browser/ui/views/chrome_browser_main_extra_parts_views.cc b/chrome/browser/ui/views/chrome_browser_main_extra_parts_views.cc
+index a9c4941e0b..9d41fc82a5 100644
+--- a/chrome/browser/ui/views/chrome_browser_main_extra_parts_views.cc
++++ b/chrome/browser/ui/views/chrome_browser_main_extra_parts_views.cc
+@@ -36,6 +36,12 @@
+ #include "ui/wm/core/wm_state.h"
+ #endif  // defined(USE_AURA)
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/feature_list.h"
++#include "chrome/browser/ui/views/mouse_mux/mouse_mux_control_dialog.h"
++#include "content/common/features.h"
++#endif  // BUILDFLAG(IS_WIN)
++
+ #if BUILDFLAG(IS_LINUX)
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -172,6 +178,12 @@ void ChromeBrowserMainExtraPartsViews::PostBrowserStart() {
+   relaunch_notification_controller_ =
+       std::make_unique<RelaunchNotificationController>(
+           UpgradeDetector::GetInstance());
++
++#if BUILDFLAG(IS_WIN)
++  if (base::FeatureList::IsEnabled(features::kMouseMuxIntegration)) {
++    mouse_mux::MouseMuxControlDialog::Show();
++  }
++#endif  // BUILDFLAG(IS_WIN)
+ }
+ 
+ void ChromeBrowserMainExtraPartsViews::PostMainMessageLoopRun() {
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 58c5295575..11604dac57 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3570,6 +3570,17 @@ source_set("browser") {
+ 
+   if (is_win) {
+     deps += [ "//ui/base/ime/win" ]
++
++    # MouseMux integration for WebSocket-based mouse input.
++    sources += [
++      "renderer_host/input/mouse_mux/mouse_mux_client.cc",
++      "renderer_host/input/mouse_mux/mouse_mux_client.h",
++      "renderer_host/input/mouse_mux/mouse_mux_config.h",
++      "renderer_host/input/mouse_mux/mouse_mux_control_server.cc",
++      "renderer_host/input/mouse_mux/mouse_mux_control_server.h",
++      "renderer_host/input/mouse_mux/mouse_mux_input_controller.cc",
++      "renderer_host/input/mouse_mux/mouse_mux_input_controller.h",
++    ]
+   }
+ 
+   if (use_aura) {
+diff --git a/content/browser/renderer_host/render_widget_host_impl.cc b/content/browser/renderer_host/render_widget_host_impl.cc
+index 93fe27d2e7..ed5cb5023f 100644
+--- a/content/browser/renderer_host/render_widget_host_impl.cc
++++ b/content/browser/renderer_host/render_widget_host_impl.cc
+@@ -3804,6 +3804,10 @@ void RenderWidgetHostImpl::SetupInputRouter() {
+   GetRenderInputRouter()->SetupInputRouter(GetScaleFactorForView(view_.get()));
+ }
+ 
++void RenderWidgetHostImpl::ResetInputRouterForInjection() {
++  SetupInputRouter();
++}
++
+ void RenderWidgetHostImpl::SetForceEnableZoom(bool enabled) {
+   if (auto* remote =
+           mojo_rir_delegate_impl_.GetRenderInputRouterDelegateRemote()) {
+diff --git a/content/browser/renderer_host/render_widget_host_impl.h b/content/browser/renderer_host/render_widget_host_impl.h
+index bffb574713..a9b1405c0e 100644
+--- a/content/browser/renderer_host/render_widget_host_impl.h
++++ b/content/browser/renderer_host/render_widget_host_impl.h
+@@ -716,6 +716,10 @@ class CONTENT_EXPORT RenderWidgetHostImpl
+   // TODO(mustaq@chromium.org): Fix the odd name, should be capitalized!
+   input::InputRouter* input_router();
+ 
++  // MouseMux: Reset input router state when it appears stuck (pending ack
++  // timeout), allowing injected events to flow through.
++  void ResetInputRouterForInjection();
++
+   void SetForceEnableZoom(bool);
+ 
+   // Get the BrowserAccessibilityManager for the root of the frame tree,
+diff --git a/content/browser/renderer_host/render_widget_host_view_aura.cc b/content/browser/renderer_host/render_widget_host_view_aura.cc
+index 1aeb55dc79..f235a22238 100644
+--- a/content/browser/renderer_host/render_widget_host_view_aura.cc
++++ b/content/browser/renderer_host/render_widget_host_view_aura.cc
+@@ -114,6 +114,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/time/time.h"
+ #include "components/stylus_handwriting/win/features.h"
++#include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
+ #include "content/browser/renderer_host/input/stylus_handwriting_controller_win.h"
+ #include "content/browser/renderer_host/legacy_render_widget_host_win.h"
+ #include "content/common/features.h"
+@@ -373,6 +374,11 @@ RenderWidgetHostViewAura::RenderWidgetHostViewAura(
+ 
+ #if BUILDFLAG(IS_WIN)
+   UpdateArabicIndicDigitInputStateIfNecessary();
++
++  // Register with MouseMux controller for event injection.
++  if (base::FeatureList::IsEnabled(features::kMouseMuxIntegration)) {
++    MouseMuxInputController::GetInstance()->RegisterView(this);
++  }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+   host()->render_frame_metadata_provider()->AddObserver(this);
+@@ -1520,6 +1526,15 @@ void RenderWidgetHostViewAura::InsertText(
+ }
+ 
+ void RenderWidgetHostViewAura::InsertChar(const ui::KeyEvent& event) {
++  // MouseMux: block NATIVE WM_CHAR messages when keyboard input is blocked,
++  // but allow SDK-injected InsertChar calls (marked with EF_IS_SYNTHESIZED).
++  // Native WM_CHAR arrives through TranslateMessage and must be blocked to
++  // prevent double character insertion with SDK-injected events.
++  if (event_handler_->IsNativeKeyboardInputBlocked() &&
++      !(event.flags() & ui::EF_IS_SYNTHESIZED)) {
++    return;
++  }
++
+   if (popup_child_host_view_ && popup_child_host_view_->NeedsInputGrab()) {
+     popup_child_host_view_->InsertChar(event);
+     return;
+@@ -2778,6 +2793,11 @@ RenderWidgetHostViewAura::~RenderWidgetHostViewAura() {
+   // RenderWidgetHostViewAura::OnWindowDestroying and the pointer should
+   // be set to NULL.
+   CHECK(!legacy_render_widget_host_HWND_);
++
++  // Unregister from MouseMux controller.
++  if (base::FeatureList::IsEnabled(features::kMouseMuxIntegration)) {
++    MouseMuxInputController::GetInstance()->UnregisterView(this);
++  }
+ #endif
+ 
+   if (text_input_manager_)
+diff --git a/content/browser/renderer_host/render_widget_host_view_event_handler.cc b/content/browser/renderer_host/render_widget_host_view_event_handler.cc
+index a51a44a147..f6c42ad6e4 100644
+--- a/content/browser/renderer_host/render_widget_host_view_event_handler.cc
++++ b/content/browser/renderer_host/render_widget_host_view_event_handler.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "content/browser/renderer_host/render_widget_host_view_event_handler.h"
+ 
++#include <cstdio>
++
+ #include "base/command_line.h"
++#include "base/logging.h"
++#include "base/strings/stringprintf.h"
+ #include "base/metrics/user_metrics.h"
+ #include "base/metrics/user_metrics_action.h"
+ #include "base/numerics/safe_conversions.h"
+@@ -13,6 +17,7 @@
+ #include "components/input/render_widget_host_input_event_router.h"
+ #include "components/input/switches.h"
+ #include "components/viz/common/features.h"
++#include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
+ #include "content/browser/renderer_host/input/touch_selection_controller_client_aura.h"
+ #include "content/browser/renderer_host/overscroll_controller.h"
+ #include "content/browser/renderer_host/render_view_host_delegate.h"
+@@ -238,6 +243,27 @@ bool RenderWidgetHostViewEventHandler::IsKeyboardLocked() const {
+ void RenderWidgetHostViewEventHandler::OnKeyEvent(ui::KeyEvent* event) {
+   TRACE_EVENT0("input", "RenderWidgetHostViewBase::OnKeyEvent");
+ 
++  // MouseMux integration: block native keyboard input when enabled.
++#ifdef MOUSEMUX_DEBUG
++  {
++    // Records whether OnKeyEvent is reached at all.  This writes the key code
++    // of EVERY keystroke to disk and flushes per key — it must never be
++    // compiled into a release build, and it is not cheap even in debug.
++    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH, "a");
++    if (diag) {
++      fprintf(diag, "[OnKeyEvent] blocked=%d type=%s vkey=0x%x code=%d\n",
++              native_keyboard_input_blocked_ ? 1 : 0,
++              event->type() == ui::EventType::kKeyPressed ? "DOWN" : "UP",
++              event->key_code(), static_cast<int>(event->code()));
++      fflush(diag);
++    }
++  }
++#endif
++  if (native_keyboard_input_blocked_) {
++    event->SetHandled();
++    return;
++  }
++
+   if (NeedsInputGrab(popup_child_host_view_)) {
+     popup_child_event_handler_->OnKeyEvent(event);
+     if (event->handled())
+@@ -323,6 +349,14 @@ void RenderWidgetHostViewEventHandler::OnMouseEvent(ui::MouseEvent* event) {
+   if (event->flags() & ui::EF_CURSOR_HIDE)
+     return;
+ 
++  // MouseMux integration: block native mouse input when enabled.
++  // Preserve non-client events (window move/resize) by checking EF_IS_NON_CLIENT.
++  if (native_mouse_input_blocked_ &&
++      !(event->flags() & ui::EF_IS_NON_CLIENT)) {
++    event->SetHandled();
++    return;
++  }
++
+   ForwardMouseEventToParent(event);
+   // TODO(mgiuca): Return if event->handled() returns true. This currently
+   // breaks drop-down lists which means something is incorrectly setting
+@@ -475,6 +509,21 @@ void RenderWidgetHostViewEventHandler::OnScrollEvent(ui::ScrollEvent* event) {
+ void RenderWidgetHostViewEventHandler::OnTouchEvent(ui::TouchEvent* event) {
+   TRACE_EVENT0("input", "RenderWidgetHostViewBase::OnTouchEvent");
+ 
++#ifdef MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
++  // MouseMux integration: block native touch input when enabled, matching
++  // what OnMouseEvent does for mouse.  ui::TouchEvent is not a ui::MouseEvent,
++  // so the check there never sees these.  Dropped before pointer_state_ is
++  // touched so a blocked touch leaves no half-tracked pointer behind.
++  // Injected pen/touch is unaffected: it reaches the renderer as a
++  // WebMouseEvent and never passes through this handler.
++  MMTRACE("NATIVE/TouchEvent", "native ui::TouchEvent type=%d blocked=%d",
++          static_cast<int>(event->type()), native_mouse_input_blocked_ ? 1 : 0);
++  if (native_mouse_input_blocked_) {
++    event->SetHandled();
++    return;
++  }
++#endif
++
+   bool had_no_pointer = !pointer_state_.GetPointerCount();
+ 
+   // Update the touch event first.
+diff --git a/content/browser/renderer_host/render_widget_host_view_event_handler.h b/content/browser/renderer_host/render_widget_host_view_event_handler.h
+index d975a34154..53c3f91dd7 100644
+--- a/content/browser/renderer_host/render_widget_host_view_event_handler.h
++++ b/content/browser/renderer_host/render_widget_host_view_event_handler.h
+@@ -145,6 +145,18 @@ class CONTENT_EXPORT RenderWidgetHostViewEventHandler
+   }
+   void set_window(aura::Window* window) { window_ = window; }
+ 
++  // MouseMux integration: block native mouse input when enabled.
++  void SetNativeMouseInputBlocked(bool blocked) {
++    native_mouse_input_blocked_ = blocked;
++  }
++  bool IsNativeMouseInputBlocked() const { return native_mouse_input_blocked_; }
++
++  // MouseMux integration: block native keyboard input when enabled.
++  void SetNativeKeyboardInputBlocked(bool blocked) {
++    native_keyboard_input_blocked_ = blocked;
++  }
++  bool IsNativeKeyboardInputBlocked() const { return native_keyboard_input_blocked_; }
++
+   // Lock/Unlock processing of future mouse pointer events.
+   blink::mojom::PointerLockResult LockPointer(bool request_unadjusted_movement);
+   // Change the current lock to have the given unadjusted_movement.
+@@ -322,6 +334,12 @@ class CONTENT_EXPORT RenderWidgetHostViewEventHandler
+ 
+   // Used to identify pointing device that can fire fling events.
+   base::flat_set<int> fling_capable_device_ids_;
++
++  // MouseMux integration: when true, native mouse input is blocked.
++  bool native_mouse_input_blocked_ = false;
++
++  // MouseMux integration: when true, native keyboard input is blocked.
++  bool native_keyboard_input_blocked_ = false;
+ };
+ 
+ }  // namespace content
+diff --git a/content/common/features.cc b/content/common/features.cc
+index ee57a03b5f..6a7f62f987 100644
+--- a/content/common/features.cc
++++ b/content/common/features.cc
+@@ -470,6 +470,13 @@ BASE_FEATURE(kMediaDevicesSystemMonitorCache,
+ // Allow cross-context transfer of MediaStreamTracks.
+ BASE_FEATURE(kMediaStreamTrackTransfer, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++#if BUILDFLAG(IS_WIN)
++// Enable MouseMux integration for WebSocket-based mouse input.
++BASE_FEATURE(kMouseMuxIntegration,
++             "MouseMuxIntegration",
++             base::FEATURE_DISABLED_BY_DEFAULT);
++#endif
++
+ // If enabled Mojo uses a dedicated background thread to listen for incoming
+ // IPCs. Otherwise it's configured to use Content's IO thread for that purpose.
+ BASE_FEATURE(kMojoDedicatedThread, base::FEATURE_DISABLED_BY_DEFAULT);
+diff --git a/content/common/features.h b/content/common/features.h
+index 1f0da9ad14..1cdb4b5c0a 100644
+--- a/content/common/features.h
++++ b/content/common/features.h
+@@ -158,6 +158,9 @@ CONTENT_EXPORT BASE_DECLARE_FEATURE(
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kMainFrameProcessReuseAllowIPAndLocalhost);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kMediaDevicesSystemMonitorCache);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kMediaStreamTrackTransfer);
++#if BUILDFLAG(IS_WIN)
++CONTENT_EXPORT BASE_DECLARE_FEATURE(kMouseMuxIntegration);
++#endif
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kMojoDedicatedThread);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kMultipleSpareRPHs);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE_PARAM(size_t, kMultipleSpareRPHsCount);
+diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+index 4467ed08af..309f10afd1 100644
+--- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
++++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+@@ -70,6 +70,68 @@
+ #include "ui/wm/core/window_animations.h"
+ #include "ui/wm/public/scoped_tooltip_disabler.h"
+ 
++#include "ui/events/event_utils.h"
++#include "ui/gfx/win/msg_util.h"
++
++// MouseMux defines — duplicated from mouse_mux_config.h to avoid a
++// content/ → ui/views layering violation.  Keep in sync with config.h.
++//
++// EVERY MouseMux define used in this file must appear below, including the
++// disabled ones.  A define that is #ifdef'd here but missing from this list is
++// silently dead — the guard never fires, and enabling it in config.h does
++// nothing at all, with no warning.  MOUSEMUX_EXPERIMENT_NATIVE_BLOCK_HARD was
++// exactly that from v13 to v15.
++#define MOUSEMUX_NATIVE_BLOCK
++// #define MOUSEMUX_EXPERIMENT_NATIVE_BLOCK_HARD
++// #define MOUSEMUX_EXPERIMENT_NC_HANDLING
++// #define MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
++// #define MOUSEMUX_DEBUG_TRACE
++
++#ifdef MOUSEMUX_DEBUG_TRACE
++// Duplicated from mouse_mux_config.h for the same reason as the defines:
++// ui/views cannot include content/.  Keep in sync.
++#include <stdarg.h>
++#include <stdio.h>
++
++#define MOUSEMUX_DEBUG_TRACE_PATH "O:\\chrome-log.txt"
++static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
++  FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH, "a");
++  if (!f) {
++    return;
++  }
++  SYSTEMTIME st;
++  GetLocalTime(&st);
++  fprintf(f, "[%02d:%02d:%02d.%03d|p%lu] %-22s ", st.wHour, st.wMinute,
++          st.wSecond, st.wMilliseconds, GetCurrentProcessId(), stage);
++  va_list args;
++  va_start(args, fmt);
++  vfprintf(f, fmt, args);
++  va_end(args);
++  fputc('\n', f);
++  fclose(f);
++}
++#define MMTRACE_VIEWS(stage, ...) MouseMuxTraceViews(stage, __VA_ARGS__)
++#else
++#define MMTRACE_VIEWS(stage, ...) ((void)0)
++#endif
++#define WM_MOUSEMUX_LBUTTONDOWN  (WM_APP + 0x100)
++#define WM_MOUSEMUX_LBUTTONUP    (WM_APP + 0x101)
++#define WM_MOUSEMUX_RBUTTONDOWN  (WM_APP + 0x102)
++#define WM_MOUSEMUX_RBUTTONUP    (WM_APP + 0x103)
++#define WM_MOUSEMUX_MBUTTONDOWN  (WM_APP + 0x104)
++#define WM_MOUSEMUX_MBUTTONUP    (WM_APP + 0x105)
++
++#ifdef MOUSEMUX_NATIVE_BLOCK
++// Global flag set by MouseMuxInputController::SetNativeInputBlocked().
++// When true, PreHandleMSG drops native mouse button messages so that
++// only SDK custom messages (WM_MOUSEMUX_*) reach the views UI layer.
++// Lives in namespace content to match the extern in the controller.
++namespace content {
++bool g_mousemux_native_input_blocked = false;
++HWND g_mousemux_dialog_hwnd = nullptr;  // Exempt from native blocking.
++}  // namespace content
++#endif
++
+ DEFINE_UI_CLASS_PROPERTY_TYPE(views::DesktopWindowTreeHostWin*)
+ 
+ namespace views {
+@@ -1321,6 +1383,132 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
+                                             WPARAM w_param,
+                                             LPARAM l_param,
+                                             LRESULT* result) {
++#ifdef MOUSEMUX_NATIVE_BLOCK
++  // When native input is blocked, drop native mouse button messages so
++  // only SDK custom messages (WM_MOUSEMUX_*) reach the views UI.
++  if (content::g_mousemux_native_input_blocked &&
++      GetAcceleratedWidget() != content::g_mousemux_dialog_hwnd) {
++    switch (message) {
++      // Client-area mouse buttons.
++      case WM_LBUTTONDOWN: case WM_LBUTTONUP:
++      case WM_RBUTTONDOWN: case WM_RBUTTONUP:
++      case WM_MBUTTONDOWN: case WM_MBUTTONUP:
++#ifdef MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
++      // Pen and touch.  Windows delivers these as WM_POINTER*/WM_TOUCH
++      // rather than mouse messages, so the cases above never catch them —
++      // without this, native pen/touch still reaches Chrome while blocked.
++      case WM_POINTERDOWN: case WM_POINTERUPDATE: case WM_POINTERUP:
++      case WM_POINTERENTER: case WM_POINTERLEAVE:
++      case WM_TOUCH:
++#endif
++#ifdef MOUSEMUX_EXPERIMENT_NC_HANDLING
++      // Non-client area mouse buttons (title bar, caption buttons, resize).
++      // Must block these too — otherwise native clicks on the title bar
++      // activate/raise the wrong window via DefWindowProc.
++      case WM_NCLBUTTONDOWN: case WM_NCLBUTTONUP:
++      case WM_NCRBUTTONDOWN: case WM_NCRBUTTONUP:
++      case WM_NCMBUTTONDOWN: case WM_NCMBUTTONUP:
++#ifdef MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
++      // Non-client pen/touch, blocked on the same terms as NC mouse buttons.
++      case WM_NCPOINTERDOWN: case WM_NCPOINTERUP:
++#endif
++#endif
++#ifdef MOUSEMUX_EXPERIMENT_NATIVE_BLOCK_HARD
++      // Mouse movement (prevents hover/highlight from other mice).
++      case WM_MOUSEMOVE:
++      case WM_NCMOUSEMOVE:
++      // Keyboard (other keyboards). WM_SYSKEY* left unblocked for Alt+F4.
++      case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
++#endif
++        MMTRACE_VIEWS("NATIVE/PreHandleMSG",
++                      "BLOCKED msg=0x%04x hwnd=%p", message,
++                      (void*)GetAcceleratedWidget());
++        *result = 0;
++        return true;  // Swallow native input.
++      default:
++        break;
++    }
++  }
++#endif
++
++  // MouseMux custom messages: convert to native mouse events and process.
++  // The controller posts WM_MOUSEMUX_* instead of WM_LBUTTONDOWN etc. so
++  // SDK clicks never collide with native mouse messages.
++  if (message >= WM_MOUSEMUX_LBUTTONDOWN &&
++      message <= WM_MOUSEMUX_MBUTTONUP) {
++    static const UINT kNativeMsg[] = {
++        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
++        WM_RBUTTONUP,   WM_MBUTTONDOWN, WM_MBUTTONUP,
++    };
++    UINT native_msg = kNativeMsg[message - WM_MOUSEMUX_LBUTTONDOWN];
++
++    HWND hwnd = GetAcceleratedWidget();
++    bool is_down = (native_msg == WM_LBUTTONDOWN ||
++                    native_msg == WM_RBUTTONDOWN ||
++                    native_msg == WM_MBUTTONDOWN);
++
++    // Convert client coords (lParam) to screen coords.
++    POINT screen_pt = {CR_GET_X_LPARAM(l_param), CR_GET_Y_LPARAM(l_param)};
++    ::ClientToScreen(hwnd, &screen_pt);
++
++#ifdef MOUSEMUX_EXPERIMENT_NC_HANDLING
++    // Hit-test to check if the click lands in the non-client area
++    // (title bar, caption buttons, resize edges).  SendEventToSink does
++    // NOT handle non-client events — no Views exist there — so we must
++    // handle activation, close, min/max via Win32 APIs directly.
++    LRESULT hit_test = ::SendMessage(
++        hwnd, WM_NCHITTEST, 0, MAKELPARAM(screen_pt.x, screen_pt.y));
++
++    if (hit_test != HTCLIENT) {
++      // Non-client area.
++      if (is_down) {
++        ::SetForegroundWindow(hwnd);
++        ::BringWindowToTop(hwnd);
++      } else {
++        // Trigger the action on mouseup (matches normal Windows behaviour).
++        switch (hit_test) {
++          case HTCLOSE:
++            ::PostMessage(hwnd, WM_CLOSE, 0, 0);
++            break;
++          case HTMINBUTTON:
++            ::PostMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
++            break;
++          case HTMAXBUTTON:
++            if (::IsZoomed(hwnd))
++              ::PostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
++            else
++              ::PostMessage(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
++            break;
++          default:
++            break;
++        }
++      }
++      *result = 0;
++      return true;  // Consumed.
++    }
++#endif  // MOUSEMUX_EXPERIMENT_NC_HANDLING
++
++    // Client area: build a CHROME_MSG so MouseEventFromMSG handles
++    // coordinate transforms, DPI scaling, and button detection correctly.
++    CHROME_MSG fake_msg = {};
++    fake_msg.hwnd = hwnd;
++    fake_msg.message = native_msg;
++    fake_msg.wParam = w_param;
++    fake_msg.lParam = l_param;
++    fake_msg.time = static_cast<DWORD>(::GetMessageTime());
++    fake_msg.pt = {screen_pt.x, screen_pt.y};
++
++    // On mousedown, raise the window — normal WM_LBUTTONDOWN does this via
++    // DefWindowProc, but our custom path bypasses that.
++    if (is_down) {
++      ::SetForegroundWindow(hwnd);
++    }
++
++    ui::MouseEvent event = ui::MouseEventFromMSG(fake_msg);
++    SendEventToSink(&event);
++    *result = 0;
++    return true;  // Consumed — do not pass to default handler.
++  }
+   return false;
+ }
+ 
+diff --git a/ui/views/window/dialog_delegate.h b/ui/views/window/dialog_delegate.h
+index fbfbc2da5d..04121164d5 100644
+--- a/ui/views/window/dialog_delegate.h
++++ b/ui/views/window/dialog_delegate.h
+@@ -173,6 +173,10 @@ namespace webid {
+ class AccountSelectionModalView;
+ }
+ 
++namespace mouse_mux {
++class MouseMuxControlDialog;
++}
++
+ namespace views {
+ 
+ class BubbleFrameView;
+@@ -833,6 +837,7 @@ class VIEWS_EXPORT DialogDelegateView : public DialogDelegate, public View {
+                            SystemModalWindowReleasesCapture);
+   friend class ::web_app::LaunchAppUserChoiceDialogView;
+   friend class ::webid::AccountSelectionModalView;
++  friend class ::mouse_mux::MouseMuxControlDialog;
+ 
+   DialogDelegateView();
+ 
