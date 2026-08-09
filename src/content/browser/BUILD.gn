@@ -3575,6 +3575,9 @@ source_set("browser") {
     sources += [
       "renderer_host/input/mouse_mux/mouse_mux_client.cc",
       "renderer_host/input/mouse_mux/mouse_mux_client.h",
+      "renderer_host/input/mouse_mux/mouse_mux_config.h",
+      "renderer_host/input/mouse_mux/mouse_mux_control_server.cc",
+      "renderer_host/input/mouse_mux/mouse_mux_control_server.h",
       "renderer_host/input/mouse_mux/mouse_mux_input_controller.cc",
       "renderer_host/input/mouse_mux/mouse_mux_input_controller.h",
     ]

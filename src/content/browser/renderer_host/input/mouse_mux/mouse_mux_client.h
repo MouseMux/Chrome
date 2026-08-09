@@ -13,6 +13,7 @@
 #include "base/memory/raw_ptr.h"
 #include "base/observer_list.h"
 #include "base/sequence_checker.h"
+#include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
 #include "content/common/content_export.h"
 #include "mojo/public/cpp/bindings/receiver.h"
 #include "mojo/public/cpp/bindings/remote.h"
@@ -31,12 +32,28 @@ class CONTENT_EXPORT MouseMuxClient
   // Debug logging callback type.
   using DebugLogCallback = base::RepeatingCallback<void(const std::string&)>;
 
+#ifdef MOUSEMUX_PEN_TOUCH_INJECT
+  // Pointer device subtype, from the user list "subtype" field.
+  // The MouseMux server reports "mouse", "pen_external", "pen_internal",
+  // "touch", "touchpad" or "unknown".  touchpad maps to kMouse: it drives a
+  // cursor rather than making direct contact, so web content should see it
+  // as a mouse even though the SDK sends it down the pen path.
+  enum class PointerSubtype {
+    kMouse,
+    kPen,
+    kTouch,
+  };
+#endif
+
   // User info from MouseMux server.
   struct UserInfo {
     int user_id = 0;
     int hwid_mouse = 0;
     int hwid_keyboard = 0;
     std::string name;
+#ifdef MOUSEMUX_PEN_TOUCH_INJECT
+    PointerSubtype subtype = PointerSubtype::kMouse;
+#endif
   };
 
   // Observer interface for receiving MouseMux events.
@@ -59,6 +76,23 @@ class CONTENT_EXPORT MouseMuxClient
     // |delta| is the wheel delta (positive = up/forward, negative = down/back).
     // |horizontal| is true for horizontal scroll, false for vertical.
     virtual void OnMouseWheel(int hwid, float x, float y, int delta, bool horizontal) = 0;
+
+#ifdef MOUSEMUX_PEN_TOUCH_INJECT
+    // Called when a pen/touch motion event is received.  The server sends
+    // these instead of motion events for pen, touch and touchpad devices.
+    // |hwid| is the hardware device ID.
+    // |x|, |y| are physical screen coordinates in pixels.
+    // |pressure| is 0-1024; 0 means hovering with no contact.
+    // |tilt_x|, |tilt_y| are degrees from vertical, -90..90.
+    // |rotation| is barrel rotation in degrees.
+    virtual void OnPenMotion(int hwid,
+                             float x,
+                             float y,
+                             int pressure,
+                             int tilt_x,
+                             int tilt_y,
+                             int rotation) = 0;
+#endif
 
     // Called when connection state changes.
     virtual void OnConnectionStateChanged(bool connected) = 0;

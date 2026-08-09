@@ -3,7 +3,15 @@
 This document details all modifications made to Chromium source files. For new files (the `mouse_mux/` directories), simply copy them into your Chromium checkout. For modified files, apply the changes described below.
 
 **Base Chromium Version**: 146.0.7650.0
-**Patch Version**: 2.2.46
+**Patch Version**: 2.2.55
+
+> **The authoritative file list is [`docs/CHROMIUM_VERSION.md`](docs/CHROMIUM_VERSION.md).**
+> It splits the patch into files that are new (safe to copy wholesale) and
+> upstream files carrying an edit (must be re-applied by hand on a Chromium
+> bump), and says what each edit does. Sections further down this document
+> date from 2.2.46 and no longer list everything.
+>
+> Changelog for this version: [`docs/UPDATE-v16.txt`](docs/UPDATE-v16.txt).
 
 ---
 
@@ -15,6 +23,9 @@ These directories contain entirely new files - copy them into your Chromium sour
 src/content/browser/renderer_host/input/mouse_mux/
   mouse_mux_client.cc
   mouse_mux_client.h
+  mouse_mux_config.h            <- compile-time switches
+  mouse_mux_control_server.cc
+  mouse_mux_control_server.h
   mouse_mux_input_controller.cc
   mouse_mux_input_controller.h
 
@@ -22,6 +33,14 @@ src/chrome/browser/ui/views/mouse_mux/
   mouse_mux_control_dialog.cc
   mouse_mux_control_dialog.h
 ```
+
+`mouse_mux_config.h` holds every compile-time switch. Read the convention at
+the top of it before flipping anything: `MOUSEMUX_EXPERIMENT_*` is off by
+definition, and `MOUSEMUX_DEBUG*` must stay off in any build that leaves the
+build machine.
+
+The launcher (`launcher/launcher.c`) is standalone C and is **not** part of the
+Chromium build. Build it with `launcher/build_launcher.py`.
 
 Also copy `icon.ico` to the directory where chrome.exe will be located.
 

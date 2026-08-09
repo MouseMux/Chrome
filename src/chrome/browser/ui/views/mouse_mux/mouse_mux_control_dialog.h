@@ -5,8 +5,10 @@
 #ifndef CHROME_BROWSER_UI_VIEWS_MOUSE_MUX_MOUSE_MUX_CONTROL_DIALOG_H_
 #define CHROME_BROWSER_UI_VIEWS_MOUSE_MUX_MOUSE_MUX_CONTROL_DIALOG_H_
 
-// Uncomment the following line to enable full debug UI and logging.
-// #define MOUSEMUX_DEBUG
+// MOUSEMUX_DEBUG and other defines live in mouse_mux_config.h (tiny header).
+// We include ONLY the config here to avoid pulling in the full controller
+// header, which would cause cascade rebuilds of everything in chrome/browser/ui.
+#include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
 
 #include <string>
 #include <vector>
@@ -58,15 +60,23 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // Called when capture state changes.
   void OnCaptureStateChanged(bool captured);
 
+  // Called when native input blocking state changes (e.g. from control server).
+  void OnNativeBlockingChanged(bool blocked);
+
+  // Shows or hides the dialog window.  Driven by the controller so the
+  // control server can reach it without content depending on ui/views.
+  void OnVisibilityChanged(bool visible);
+
  private:
   // Keyboard event handler - returns true to consume the event.
   bool OnKeyboardEvent(int vkey, bool shift, bool ctrl, bool alt, bool is_down);
   // views::DialogDelegateView overrides.
-  bool ShouldShowWindowTitle() const override;
-  bool ShouldShowWindowIcon() const override;
-  ui::ImageModel GetWindowIcon() override;
   gfx::Size CalculatePreferredSize(
       const views::SizeBounds& available_size) const override;
+  bool ShouldShowWindowTitle() const override;
+  bool ShouldShowWindowIcon() const override;
+  bool ShouldShowCloseButton() const override;
+  ui::ImageModel GetWindowIcon() override;
 
   void SetupContents();
 
@@ -79,6 +89,13 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   // Called when Capture button is clicked.
   void OnCaptureClicked();
+
+  // Collapses the dialog to a small strip, and expands it again.  Deliberately
+  // not the same as the control server's "visible" flag: collapsing leaves a
+  // window on screen to click, so a user can always get back.  Fully hiding is
+  // automation-only, because only automation can undo it.
+  void OnCollapseClicked();
+  void SetCollapsed(bool collapsed);
 
   // Called when hotkey dropdown selection changes.
   void OnHotkeyChanged();
@@ -109,6 +126,12 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   raw_ptr<views::Label> mousemux_status_label_ = nullptr;
   raw_ptr<views::MdTextButton> release_owner_button_ = nullptr;
   raw_ptr<views::MdTextButton> capture_button_ = nullptr;
+
+  // Shown only while collapsed: the icon plus the one control left to click.
+  raw_ptr<views::View> expand_row_ = nullptr;
+  // Build info in the frame's button row; hidden while collapsed.
+  raw_ptr<views::View> build_label_ = nullptr;
+  bool collapsed_ = false;
   raw_ptr<views::Combobox> hotkey_dropdown_ = nullptr;
   std::unique_ptr<ui::ComboboxModel> hotkey_model_;
 #ifdef MOUSEMUX_DEBUG

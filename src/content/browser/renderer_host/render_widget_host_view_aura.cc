@@ -1526,6 +1526,15 @@ void RenderWidgetHostViewAura::InsertText(
 }
 
 void RenderWidgetHostViewAura::InsertChar(const ui::KeyEvent& event) {
+  // MouseMux: block NATIVE WM_CHAR messages when keyboard input is blocked,
+  // but allow SDK-injected InsertChar calls (marked with EF_IS_SYNTHESIZED).
+  // Native WM_CHAR arrives through TranslateMessage and must be blocked to
+  // prevent double character insertion with SDK-injected events.
+  if (event_handler_->IsNativeKeyboardInputBlocked() &&
+      !(event.flags() & ui::EF_IS_SYNTHESIZED)) {
+    return;
+  }
+
   if (popup_child_host_view_ && popup_child_host_view_->NeedsInputGrab()) {
     popup_child_host_view_->InsertChar(event);
     return;

@@ -42,6 +42,9 @@ Add to the `browser` source_set's `sources`:
 ```gn
 "renderer_host/input/mouse_mux/mouse_mux_client.cc",
 "renderer_host/input/mouse_mux/mouse_mux_client.h",
+"renderer_host/input/mouse_mux/mouse_mux_config.h",
+"renderer_host/input/mouse_mux/mouse_mux_control_server.cc",
+"renderer_host/input/mouse_mux/mouse_mux_control_server.h",
 "renderer_host/input/mouse_mux/mouse_mux_input_controller.cc",
 "renderer_host/input/mouse_mux/mouse_mux_input_controller.h",
 ```
@@ -56,11 +59,42 @@ Add to the `ui` source_set's `sources`:
 ### src/content/browser/renderer_host/render_widget_host_view_aura.cc
 This file has the integration hooks. Key changes:
 1. Include the MouseMux headers at the top
-2. In constructor: Initialize MouseMux controller if feature enabled
-3. In destructor: Clean up MouseMux registration
-4. Feature check: `base::FeatureList::IsEnabled(features::kMouseMuxIntegration)`
+2. In constructor: Register the view with the controller if the feature is enabled
+3. In destructor: Unregister
+4. In `InsertChar`: drop native `WM_CHAR` while keyboard input is blocked
+   (this is what prevents doubled characters)
+5. Feature check: `base::FeatureList::IsEnabled(features::kMouseMuxIntegration)`
 
-See the provided copy for exact changes needed.
+### Further modified files (added since 2.2.46)
+
+These also carry MouseMux edits and are **not** described in the 2.2.46 list
+above. Every edit is marked with a `MouseMux` comment, so
+`grep -n -i mousemux <file>` finds them all. See
+[`docs/CHROMIUM_VERSION.md`](docs/CHROMIUM_VERSION.md) for what each one does.
+
+| file | edit |
+|---|---|
+| `src/content/browser/renderer_host/render_widget_host_view_event_handler.{h,cc}` | native mouse/keyboard blocking flags and their setters |
+| `src/content/browser/renderer_host/render_widget_host_impl.{h,cc}` | `ResetInputRouterForInjection()` for stuck pending-ack state |
+| `src/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc` | the largest edit: `WM_MOUSEMUX_*` custom messages, native blocking in `PreHandleMSG`, and the duplicated define list |
+| `src/ui/views/window/dialog_delegate.h` | friends `mouse_mux::MouseMuxControlDialog` |
+| `src/chrome/browser/ui/views/chrome_browser_main_extra_parts_views.cc` | shows the control dialog from `PostBrowserStart()` |
+
+**Note:** `src/chrome/browser/chrome_browser_main.cc` and
+`src/content/browser/renderer_host/render_widget_host_view_aura.h` were tracked
+up to 2.2.46 but no longer carry any MouseMux edit — the dialog hook moved to
+`chrome_browser_main_extra_parts_views.cc`. They have been removed from this
+repo, because copying a stale pristine upstream file over a newer Chromium is
+worse than not having it.
+
+### The layering constraint
+
+`content/` cannot depend on `ui/views` — the build enforces it. So
+`desktop_window_tree_host_win.cc` **duplicates** the MouseMux defines and the
+`WM_MOUSEMUX_*` message numbers instead of including `mouse_mux_config.h`, and
+the dialog is reached from the content layer by callback only. Those two lists
+must be kept in sync by hand: a define used there but missing from its local
+list is silently dead.
 
 ## Step 3: Apply Windows Build Fixes (Windows Only)
 

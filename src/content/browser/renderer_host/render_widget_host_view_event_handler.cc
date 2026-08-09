@@ -4,7 +4,11 @@
 
 #include "content/browser/renderer_host/render_widget_host_view_event_handler.h"
 
+#include <cstdio>
+
 #include "base/command_line.h"
+#include "base/logging.h"
+#include "base/strings/stringprintf.h"
 #include "base/metrics/user_metrics.h"
 #include "base/metrics/user_metrics_action.h"
 #include "base/numerics/safe_conversions.h"
@@ -13,6 +17,7 @@
 #include "components/input/render_widget_host_input_event_router.h"
 #include "components/input/switches.h"
 #include "components/viz/common/features.h"
+#include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
 #include "content/browser/renderer_host/input/touch_selection_controller_client_aura.h"
 #include "content/browser/renderer_host/overscroll_controller.h"
 #include "content/browser/renderer_host/render_view_host_delegate.h"
@@ -239,6 +244,21 @@ void RenderWidgetHostViewEventHandler::OnKeyEvent(ui::KeyEvent* event) {
   TRACE_EVENT0("input", "RenderWidgetHostViewBase::OnKeyEvent");
 
   // MouseMux integration: block native keyboard input when enabled.
+#ifdef MOUSEMUX_DEBUG
+  {
+    // Records whether OnKeyEvent is reached at all.  This writes the key code
+    // of EVERY keystroke to disk and flushes per key — it must never be
+    // compiled into a release build, and it is not cheap even in debug.
+    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH, "a");
+    if (diag) {
+      fprintf(diag, "[OnKeyEvent] blocked=%d type=%s vkey=0x%x code=%d\n",
+              native_keyboard_input_blocked_ ? 1 : 0,
+              event->type() == ui::EventType::kKeyPressed ? "DOWN" : "UP",
+              event->key_code(), static_cast<int>(event->code()));
+      fflush(diag);
+    }
+  }
+#endif
   if (native_keyboard_input_blocked_) {
     event->SetHandled();
     return;
@@ -488,6 +508,21 @@ void RenderWidgetHostViewEventHandler::OnScrollEvent(ui::ScrollEvent* event) {
 
 void RenderWidgetHostViewEventHandler::OnTouchEvent(ui::TouchEvent* event) {
   TRACE_EVENT0("input", "RenderWidgetHostViewBase::OnTouchEvent");
+
+#ifdef MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
+  // MouseMux integration: block native touch input when enabled, matching
+  // what OnMouseEvent does for mouse.  ui::TouchEvent is not a ui::MouseEvent,
+  // so the check there never sees these.  Dropped before pointer_state_ is
+  // touched so a blocked touch leaves no half-tracked pointer behind.
+  // Injected pen/touch is unaffected: it reaches the renderer as a
+  // WebMouseEvent and never passes through this handler.
+  MMTRACE("NATIVE/TouchEvent", "native ui::TouchEvent type=%d blocked=%d",
+          static_cast<int>(event->type()), native_mouse_input_blocked_ ? 1 : 0);
+  if (native_mouse_input_blocked_) {
+    event->SetHandled();
+    return;
+  }
+#endif
 
   bool had_no_pointer = !pointer_state_.GetPointerCount();
 

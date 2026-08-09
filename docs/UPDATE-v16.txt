@@ -1,0 +1,154 @@
+MouseMux Chrome Patches v16 - Build #55 - 2026-08-09
+=====================================================
+
+Chromium base: 146.0.7650.0   (see CHROMIUM_VERSION.md before upgrading)
+Client version reported to the SDK: 2.2.55
+
+A release-hardening pass over v15 (Build #53).  No new features.  The theme is
+that the build now says what it is: diagnostics are off and provably absent
+from the binary, and every compile-time switch is named for how trustworthy it
+actually is.
+
+Behaviour against 2.2.53 is unchanged except for one deliberate item, in 3.
+
+
+1. RELEASE MODE: ALL DIAGNOSTICS OFF
+   - MOUSEMUX_TRACE (added after v15 for the touch investigation, and ON in
+     the 2.2.54-TRACE build) is off.  It wrote input coordinates and key codes
+     to O:\chrome-log.txt, reopening the file on every line.
+   - MOUSEMUX_DEBUG remains off, as in v15.
+   - Verified in the shipped chrome.dll, not just in source.  None of these
+     strings occur in the binary:
+         mousemux_diag.log
+         mousemux_debug.log
+         chrome-log.txt
+         "MouseMux trace build alive"
+     The code is compiled out, so no runtime flag can turn it back on.
+   - LOG(ERROR) calls in the client and control server are retained.  They fire
+     only on connection or parse failure and carry no input data.
+
+
+2. COMPILE-TIME SWITCHES RENAMED
+   The prefix now states maturity, so the intended default is readable from
+   the name alone:
+
+       MOUSEMUX_*             shipped and verified.  ON.
+       MOUSEMUX_EXPERIMENT_*  unverified or known-broken.  OFF by definition.
+       MOUSEMUX_DEBUG*        writes input to disk.  OFF for release.
+
+       was                              now
+       ---------------------------------------------------------------
+       EXPERIMENT_AURA_UI_CLICK_THROUGH MOUSEMUX_AURA_UI_CLICK_THROUGH
+       MOUSEMUX_FULL_NATIVE_BLOCK       MOUSEMUX_NATIVE_BLOCK
+       MOUSEMUX_FULL_NATIVE_BLOCK_HARD  MOUSEMUX_EXPERIMENT_NATIVE_BLOCK_HARD
+       MOUSEMUX_NC_HANDLING             MOUSEMUX_EXPERIMENT_NC_HANDLING
+       MOUSEMUX_TRACE                   MOUSEMUX_DEBUG_TRACE
+       MOUSEMUX_PEN_TOUCH               split - see 3
+
+   Two names were actively misleading before this.  The aura click-through was
+   called EXPERIMENT despite being verified and shipping since v10, while
+   pen/touch was NOT called an experiment despite being the one unverified
+   thing that was on.
+
+   MOUSEMUX_DEBUG keeps its name.  It was already correct and already off, and
+   renaming it would have touched 75 sites for nothing.
+
+   mouse_mux_config.h is reorganised into SHIPPED / EXPERIMENTS / DIAGNOSTICS
+   sections with the convention documented at the top.
+
+
+3. PEN/TOUCH SPLIT INTO TWO SWITCHES
+   MOUSEMUX_PEN_TOUCH guarded two halves that carry very different risk, so it
+   is now two defines:
+
+       MOUSEMUX_PEN_TOUCH_INJECT             ON
+           Parses "pointer.pen.notify.M2A" and injects events with blink
+           pointer properties.  Lives entirely in mouse_mux_client.* and
+           mouse_mux_input_controller.*.  This half can only ADD events.
+           Kept ON deliberately: the server sends this message type for
+           TOUCHPAD devices too, so disabling it would stop touchpads moving -
+           a regression against 2.2.53, which shipped with it on.
+
+       MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK   OFF   <-- the one behaviour change
+           When native input is blocked, also drops WM_POINTER*/WM_TOUCH in
+           PreHandleMSG and ui::TouchEvent in the content layer.  Lives
+           entirely in render_widget_host_view_event_handler.cc and
+           desktop_window_tree_host_win.cc.
+
+   The blocking half is off because it is the only untested path that can
+   SUBTRACT input.  If injection does not deliver, a touchscreen goes
+   completely dead with no way back short of restarting the browser - and
+   nobody has run this on a touchscreen yet.  Off, a touch device keeps
+   working natively even while blocking is on.  That is weaker blocking and a
+   far better failure mode.
+
+   The two halves share no file, so the split was a clean cut.
+
+
+4. A SWITCH THAT NEVER WORKED IS NOW WIRED UP
+   ui/views cannot include content/, so desktop_window_tree_host_win.cc
+   re-declares the MouseMux defines it needs at the top of the file.
+   MOUSEMUX_FULL_NATIVE_BLOCK_HARD was #ifdef'd in that file but was NOT in
+   that list - so it was dead from v13 through v15.  Enabling it in
+   mouse_mux_config.h did nothing at all, silently.
+
+   The mirrored list now carries every define the file uses INCLUDING the
+   disabled ones, with a comment recording the trap.  Both lists are meant to
+   diff cleanly; entries in config.h that need mirroring say so.
+
+
+5. LAUNCHER: SEAT REGISTRY IS A HELD MUTEX  (new since v15)
+   Rewritten from 399 to 591 lines.  Seat N is occupied for exactly as long as
+   a launcher holds Local\MouseMuxChromeSeat_<installhash>_<N>.  No probing,
+   no timers, no state on disk to go stale, and the kernel releases the mutex
+   even on a hard kill.
+
+   - The LAUNCHER holds the mutex and stays resident until its browser exits.
+     One launcher process per launch; "-n 4" is one launcher holding four
+     seats, waiting on all four and releasing each as its browser closes.
+     Consequence: a script that waits on launcher.exe blocks until the
+     browsers close.
+   - No Chrome-side change, so launcher and chrome.exe versions stay
+     independent.
+   - --do-not-de-elevate is mandatory and load-bearing.  Without it an
+     elevated launch makes Chrome relaunch itself and let the original process
+     exit, and the launcher would free a seat that still has a live browser.
+   - "Seat occupied" and "launch failed" are distinct results.  Collapsing
+     them (both returned 0 once) retried one broken launch across all 64
+     seats.  A spawn-miss budget of 3 backs this up.
+   - MAX_SEATS is 64, now pinned by _STATIC_ASSERT against
+     MAXIMUM_WAIT_OBJECTS, since all seats are waited on in one call.
+   - Each launch costs ~3s (STARTUP_PROBE_MS) before reporting ready.  That is
+     the price of detecting a Chrome that handed its command line to an
+     instance already holding the profile.
+   - The control port survives only as a non-fatal warning.
+
+   Build it with build_launcher.py, which reads the SDK paths out of
+   out/Release/environment.x64 - no VS developer prompt needed.  Do NOT invoke
+   clang-cl from a Git Bash / MSYS shell: it rewrites /TC into a path and the
+   link fails.
+
+
+6. SMALLER CHANGES
+   - Removed the unconditional LOG(WARNING) "[MouseMux] PostBrowserStart:
+     feature enabled=" that fired on every launch in release.
+   - kClientVersion 2.2.53 -> 2.2.55, kBuildDate -> 2026-08-09.
+     2.2.54 was spent on the TRACE build.  kSdkVersion stays 2.2.35: it
+     records the protocol revision this client was written against, and
+     raising it would claim support nobody has verified.
+   - mouse_mux_client.cc: the trace-only local trace_subtype is now guarded by
+     MOUSEMUX_DEBUG_TRACE.  With tracing off MMTRACE expands to ((void)0) and
+     its arguments are never expanded, leaving the variable unused - which /WX
+     turns into a build failure.  This was the only such local in the tree.
+
+
+7. STILL UNVERIFIED / KNOWN OPEN
+   - Pen and touch have never been run on real hardware.  Injection is on,
+     blocking is off (see 3).  The original report - pen events producing no
+     input while MouseMux is connected - is undiagnosed; the 2.2.54-TRACE
+     build was built for exactly this and has not been run on a touchscreen.
+   - Title bar / HTCAPTION clicks still do not work via synthetic events.
+     Chrome's DefWindowProc modal loop only responds to real OS input.
+     MOUSEMUX_EXPERIMENT_NC_HANDLING is the abandoned attempt.
+   - ARCHITECTURE.md is STALE.  It has not been updated since v12 and predates
+     pen/touch, the launcher, the port move, auto-reconnect and collapse.
