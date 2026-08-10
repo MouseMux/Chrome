@@ -302,6 +302,40 @@ index 1f0da9ad14..1cdb4b5c0a 100644
  CONTENT_EXPORT BASE_DECLARE_FEATURE(kMojoDedicatedThread);
  CONTENT_EXPORT BASE_DECLARE_FEATURE(kMultipleSpareRPHs);
  CONTENT_EXPORT BASE_DECLARE_FEATURE_PARAM(size_t, kMultipleSpareRPHsCount);
+diff --git a/third_party/dom_distiller_js/protoc_plugins/json_values_converter.bat b/third_party/dom_distiller_js/protoc_plugins/json_values_converter.bat
+index 8e4a136633..f497c50593 100755
+--- a/third_party/dom_distiller_js/protoc_plugins/json_values_converter.bat
++++ b/third_party/dom_distiller_js/protoc_plugins/json_values_converter.bat
+@@ -1,3 +1,3 @@
+ @echo off
+ 
+-call python3 %~dp0\json_values_converter.py
++call O:\devtools\shell\msys64\mingw64\bin\python3.exe %~dp0\json_values_converter.py
+diff --git a/tools/protoc_wrapper/protoc-gen-ts_proto.bat b/tools/protoc_wrapper/protoc-gen-ts_proto.bat
+index 8e5091ab27..41501d25a8 100755
+--- a/tools/protoc_wrapper/protoc-gen-ts_proto.bat
++++ b/tools/protoc_wrapper/protoc-gen-ts_proto.bat
+@@ -4,4 +4,4 @@
+ :: Use of this source code is governed by a BSD-style license that can be
+ :: found in the LICENSE file.
+ 
+-python3 "%~dp0protoc-gen-ts_proto.py" %*
+\ No newline at end of file
++O:\devtools\shell\msys64\mingw64\bin\python3.exe "%~dp0protoc-gen-ts_proto.py" %*
+\ No newline at end of file
+diff --git a/tools/protoc_wrapper/protoc_wrapper.py b/tools/protoc_wrapper/protoc_wrapper.py
+index 2fa714732d..9552944251 100755
+--- a/tools/protoc_wrapper/protoc_wrapper.py
++++ b/tools/protoc_wrapper/protoc_wrapper.py
+@@ -208,7 +208,7 @@ def main(argv):
+   if options.plugin_out_dir:
+     plugin_options = FormatGeneratorOptions(options.plugin_options)
+     protoc_cmd += [
+-      "--plugin", "protoc-gen-plugin=" + os.path.relpath(options.plugin),
++      "--plugin", "protoc-gen-plugin=" + os.path.abspath(options.plugin),
+       "--plugin_out", plugin_options + options.plugin_out_dir
+     ]
+ 
 diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
 index 4467ed08af..309f10afd1 100644
 --- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
