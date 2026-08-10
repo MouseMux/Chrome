@@ -5,6 +5,7 @@
 #include "chrome/browser/ui/views/mouse_mux/mouse_mux_control_dialog.h"
 
 #ifdef MOUSEMUX_DEBUG
+#include <array>
 #include <fstream>
 #endif
 #include <utility>
@@ -23,11 +24,14 @@
 #include "ui/gfx/win/icon_util.h"
 #include "ui/gfx/image/image_skia.h"
 #include "ui/base/models/image_model.h"
-#include "chrome/browser/ui/browser.h"
-#include "chrome/browser/ui/browser_list.h"
-#include "chrome/browser/ui/browser_window.h"
+// Chromium 151 removed chrome/browser/ui/browser_list.h.  Browser enumeration
+// now goes through BrowserWindowInterface; Browser and BrowserWindow are no
+// longer needed here at all, since the only use was reading window bounds.
+#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 #include "chrome/browser/ui/views/chrome_layout_provider.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
+#include "ui/base/base_window.h"
 #include "ui/display/screen.h"
 #include "ui/base/metadata/metadata_impl_macros.h"
 #include "ui/base/mojom/dialog_button.mojom.h"
@@ -68,13 +72,17 @@ struct HotkeyOption {
   bool alt;
 };
 
-constexpr HotkeyOption kHotkeyOptions[] = {
+// std::array rather than a C array: Chromium 151 applies
+// -Wunsafe-buffer-usage to chrome/browser/ui, and subscripting a raw array
+// trips it even where the index is provably in range.  std::array indexes
+// through a member function, which the warning does not flag.
+constexpr auto kHotkeyOptions = std::to_array<HotkeyOption>({
     {u"Shift+Escape", VK_ESCAPE, true, false, false},
     {u"Ctrl+Shift+Escape", VK_ESCAPE, true, true, false},
     {u"Alt+Shift+Escape", VK_ESCAPE, true, false, true},
     {u"Shift+F12", VK_F12, true, false, false},
     {u"Alt+Shift+F12", VK_F12, true, false, true},
-};
+});
 
 // ComboboxModel for hotkey dropdown.
 class HotkeyComboboxModel : public ui::ComboboxModel {
@@ -288,9 +296,9 @@ int SeatIndexFromControlPort() {
 // Anchoring to the window means the dialog travels with the seat it controls.
 gfx::Rect ComputeDialogBounds() {
   gfx::Rect browser_bounds;
-  for (Browser* browser : *BrowserList::GetInstance()) {
-    if (browser->window()) {
-      browser_bounds = browser->window()->GetBounds();
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if (const ui::BaseWindow* window = browser->GetWindow()) {
+      browser_bounds = window->GetBounds();
       break;
     }
   }
@@ -841,6 +849,12 @@ void MouseMuxControlDialog::OnCaptureClicked() {
 void MouseMuxControlDialog::OnHotkeyChanged() {
   if (hotkey_dropdown_) {
     selected_hotkey_index_ = hotkey_dropdown_->GetSelectedIndex().value_or(0);
+    // The combobox model only offers kHotkeyOptions.size() entries, so this
+    // should already hold - but this was the one of the three index sites
+    // with no bounds check at all, and it feeds an unchecked lookup below.
+    if (selected_hotkey_index_ >= std::size(kHotkeyOptions)) {
+      selected_hotkey_index_ = 0;
+    }
     LogDebug(base::StringPrintf("Hotkey changed to index %zu: %s",
                                  selected_hotkey_index_,
                                  base::UTF16ToASCII(kHotkeyOptions[selected_hotkey_index_].label).c_str()));

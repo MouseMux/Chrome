@@ -1,0 +1,109 @@
+MouseMux Chrome Patches v17 - Build #56 - 2026-08-10
+=====================================================
+
+Chromium base: 151.0.7922.77  (upstream ff37cfca21) - Stable at time of writing
+Previous:      146.0.7650.0   (upstream 8a0719fc70) - shipped as 2.2.55
+Client version reported to the SDK: 2.2.56
+
+This release is a Chromium rebase. NO MouseMux features were added, removed or
+changed. All work was adapting the integration to Chromium API changes across
+five major versions.
+
+If something behaves differently from 2.2.55, that is a bug worth reporting -
+it was not an intended change.
+
+
+1. WHAT THE REBASE COST
+   One merge conflict, six compile fixes.
+
+   The conflict: upstream added RegisterInfobars() to PostBrowserStart() in
+   exactly the spot the MouseMux dialog hook occupies. Both were kept.
+
+   Everything else auto-merged, including chrome/browser/ui/BUILD.gn with 3366
+   lines of upstream churn between the two versions, and
+   desktop_window_tree_host_win.cc with 169 lines of churn underneath a
+   188-line MouseMux edit.
+
+   The reason that worked: the MouseMux edits to upstream files are purely
+   additive - 323 inserted lines, zero deletions. Additive patches survive
+   refactoring. Patches that rewrite existing logic do not. Worth preserving
+   as a property.
+
+
+2. THE SIX COMPILE FIXES
+
+   base::Value::Dict / base::Value::List no longer exist
+     146's base/values.h declared `using Dict = DictValue;` inside class
+     Value. 151 deletes those aliases; DictValue and ListValue are top-level
+     in namespace base. 8 occurrences renamed.
+
+   NetworkContext::CreateWebSocket changed shape three ways
+     - the SiteForCookies parameter was removed
+     - process_id is no longer int32 kBrowserProcessId. The mojom union is
+       TYPEMAPPED to network::OriginatingProcessId, so the call takes the C++
+       class from services/network/public/cpp/ - use
+       OriginatingProcessId::browser(), not a hand-built mojom union pointer.
+       Building the union compiles conceptually but does not type-check.
+     - a trailing, non-optional network_restrictions_id was added. A fresh
+       base::UnguessableToken::Create() is correct: any id absent from the
+       network context's restrictions map is allowed by
+       IsNetworkForNetworkRestrictionsIdAndUrlAllowed(), so it imposes no
+       restriction. Confirmed at runtime - the daemon connection establishes.
+
+   chrome/browser/ui/browser_list.h was removed
+     Browser enumeration moved to BrowserWindowInterface. BrowserList survives
+     in exactly one place in all of 151 - a test header - against 3645 uses of
+     BrowserWindowInterface. ComputeDialogBounds() now iterates
+     GetAllBrowserWindowInterfaces() and reads bounds off ui::BaseWindow.
+     This also removed three includes (browser.h, browser_list.h,
+     browser_window.h): the dialog only ever used Browser to read bounds, so
+     it now depends on a much narrower surface.
+
+   -Wunsafe-buffer-usage now covers ui/views and chrome/browser/ui
+     desktop_window_tree_host_win.cc: the WM_MOUSEMUX_* -> native message
+     lookup table became an explicit switch. The index was in range (the
+     enclosing condition bounds it) but the compiler cannot prove it.
+
+     mouse_mux_control_dialog.cc: kHotkeyOptions became std::array, whose
+     member operator[] the warning does not flag.
+
+   Note on that last one: of the three flagged index sites, two were already
+   bounds-checked - but OnHotkeyChanged had NO check at all and fed
+   selected_hotkey_index_, which OnKeyboardEvent then used. The combobox
+   cannot currently return an out-of-range index so it was unreachable, but it
+   was a real gap. It now clamps. The warning earned its keep.
+
+   NOT changed: mouse_mux_input_controller.cc. 1,937 lines, the entire input
+   injection core, compiled against 151 without a single edit. Every failure
+   was framework plumbing - values, network mojom, browser enumeration, buffer
+   safety.
+
+
+3. BUILD ENVIRONMENT
+   Chromium 151 requires Windows SDK 10.0.26100.7705 (146 used .4654). An
+   older SDK fails in ui/accessibility with unknown type IUIAutomationClientInfo
+   - those UI Automation interfaces do not exist in earlier headers.
+
+   Dawn bundles its own Go (go1.25.0) and hardcodes its path, ignoring PATH. A
+   machine-wide GOROOT pointing at a different Go makes every Go compile fail
+   with "compile: version X does not match go tool version Y", stopping the
+   build around 10k targets in. Only bites on a FRESH build - once the
+   generated Tint sources exist the generator does not re-run. fix_build_env.py
+   now sets GOROOT to the tree's own bundled Go.
+
+
+4. VERIFIED, AND NOT
+   Verified at runtime on 151:
+     - browser starts, control dialog appears
+     - control server binds 127.0.0.1:PORT, accepts a WebSocket upgrade,
+       parses JSON, mutates state and reports it back
+     - WebSocket to the MouseMux daemon on 41001 reaches ESTABLISHED
+     - launcher holds a seat and exits when its browser closes
+
+   NOT verified:
+     - input injection. Compiling and connecting is not the same as working.
+     - pen and touch, still never run on hardware (unchanged from 2.2.55;
+       injection is on, native pen/touch blocking is off).
+
+   The known-good fallback is 2.2.55 on Chromium 146, which is built, shipped
+   and field-proven.

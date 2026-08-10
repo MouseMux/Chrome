@@ -1,19 +1,55 @@
 # Chromium Base Version and Upgrade Guide
 
-**This patch set is built against Chromium `146.0.7650.0`.**
+**This patch set is built against Chromium `151.0.7922.77`** (upstream commit
+`ff37cfca21`), which was Stable at the time of writing.
 
 From `chrome/VERSION`:
 
 ```
-MAJOR=146
+MAJOR=151
 MINOR=0
-BUILD=7650
-PATCH=0
+BUILD=7922
+PATCH=77
 ```
 
 Read this before pulling a newer Chromium. The cost of an upgrade is not
 spread evenly across these files — most of them cannot conflict at all, and a
 short list can.
+
+## What the 146 → 151 upgrade actually cost
+
+Recorded because it is the only real evidence of how expensive a Chromium
+bump is for this patch set. Five major versions, and the answer was **one
+merge conflict and six compile fixes**.
+
+The rebase (`git rebase --onto`) produced **one** conflict across 15 modified
+files: upstream added `RegisterInfobars()` to `PostBrowserStart()` in exactly
+the spot the MouseMux dialog hook occupies. Both were kept. Everything else
+auto-merged, including `chrome/browser/ui/BUILD.gn` with 3366 lines of
+upstream churn and `desktop_window_tree_host_win.cc` with 169.
+
+The reason is worth internalising: **the MouseMux edits to upstream files are
+purely additive — 323 inserted lines, zero deletions.** Additive patches
+survive refactoring; patches that rewrite existing logic do not.
+
+Then six compile fixes, none in the input-injection core:
+
+| what broke | fix |
+| --- | --- |
+| `base::Value::Dict` / `::List` aliases deleted from `class Value` | use top-level `base::DictValue` / `base::ListValue` |
+| `CreateWebSocket` dropped its `SiteForCookies` parameter | remove the argument |
+| `CreateWebSocket` `process_id` is now a typemapped union | `network::OriginatingProcessId::browser()` from `services/network/public/cpp/`, **not** a hand-built mojom union pointer |
+| `CreateWebSocket` gained a required `network_restrictions_id` | a fresh `base::UnguessableToken::Create()` — any id absent from the context's restrictions map is allowed, so this imposes nothing |
+| `chrome/browser/ui/browser_list.h` removed | `GetAllBrowserWindowInterfaces()` + `ui::BaseWindow::GetBounds()` |
+| `-Wunsafe-buffer-usage` extended to `ui/views` and `chrome/browser/ui` | replace raw-array indexing with a `switch` and with `std::array` |
+
+`mouse_mux_input_controller.cc` — 1,937 lines, the whole injection core —
+needed **no changes at all**. Every failure was framework plumbing: values,
+network mojom, browser enumeration, buffer safety.
+
+Verified at runtime on 151: browser starts, control dialog appears, control
+server binds and answers JSON, and the WebSocket to the MouseMux daemon on
+41001 reaches ESTABLISHED. Input injection is **not** yet verified.
 
 ## Paths
 

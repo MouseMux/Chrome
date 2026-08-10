@@ -7,7 +7,7 @@ allowing multiple users to browse independently on the same Windows machine.
 ## Version Info
 - **Patch Version**: 2.2.46
 - **Date**: 2026-02-05
-- **Base Chromium**: 146.0.7650.0
+- **Base Chromium**: 151.0.7922.77
 
 ## Features
 - WebSocket connection to MouseMux

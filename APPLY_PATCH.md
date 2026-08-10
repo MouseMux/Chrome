@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-1. Fresh Chromium checkout at version 146.0.7650.0 (or compatible)
+1. Fresh Chromium checkout at version 151.0.7922.77 (or compatible)
 2. Working Chromium build environment (VS 2022, Windows SDK, etc.)
 3. Python 3.x in your PATH (or MSYS2 with mingw64)
 

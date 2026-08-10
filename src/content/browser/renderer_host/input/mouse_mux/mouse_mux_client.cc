@@ -14,12 +14,14 @@
 #include "base/logging.h"
 #include "base/process/process_handle.h"
 #include "base/strings/stringprintf.h"
+#include "base/unguessable_token.h"
 #include "base/values.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/content_browser_client.h"
 #include "content/public/common/content_client.h"
 #include "net/storage_access_api/status.h"
 #include "net/traffic_annotation/network_traffic_annotation.h"
+#include "services/network/public/cpp/originating_process_id.h"
 #include "services/network/public/mojom/client_security_state.mojom.h"
 #include "services/network/public/mojom/network_context.mojom.h"
 
@@ -38,9 +40,9 @@ constexpr size_t kMaxIncomingMessageSize = 64 * 1024;  // 64KB max message
 // SDK protocol this client was written against and is deliberately NOT bumped
 // alongside it: raising it would claim support for a protocol revision nobody
 // has verified against this code.
-constexpr char kClientVersion[] = "2.2.55";
+constexpr char kClientVersion[] = "2.2.56";
 constexpr char kSdkVersion[] = "2.2.35";
-constexpr char kBuildDate[] = "2026-08-09";
+constexpr char kBuildDate[] = "2026-08-10";
 
 // MouseMux message types (M2A = server to app).
 constexpr char kTypeMotion[] = "pointer.motion.notify.M2A";
@@ -173,15 +175,20 @@ void MouseMuxClient::Connect() {
   LogDebug("Got network context, creating WebSocket to " + service_url_.spec());
 #endif
 
+  // Signature changed in Chromium 151 (was 146):
+  //   - the SiteForCookies parameter was removed
+  //   - process_id is no longer a plain int32 (kBrowserProcessId).  The mojom
+  //     union is typemapped to network::OriginatingProcessId, so pass the
+  //     C++ type from services/network/public/cpp/, not a mojom union ptr.
+  //   - a trailing, non-optional network_restrictions_id was added
   network_context->CreateWebSocket(
       service_url_,
       /*protocols=*/{},
-      net::SiteForCookies(),
       net::StorageAccessApiStatus::kNone,
       net::IsolationInfo::CreateForInternalRequest(
           url::Origin::Create(service_url_)),
       /*additional_headers=*/{},
-      network::mojom::kBrowserProcessId,
+      network::OriginatingProcessId::browser(),
       url::Origin::Create(service_url_),
       network::mojom::ClientSecurityState::New(),
       network::mojom::kWebSocketOptionBlockAllCookies,
@@ -190,7 +197,14 @@ void MouseMuxClient::Connect() {
       /*url_loader_network_observer=*/mojo::NullRemote(),
       /*auth_handler=*/mojo::NullRemote(),
       /*header_client=*/mojo::NullRemote(),
-      /*throttling_profile_id=*/std::nullopt);
+      /*throttling_profile_id=*/std::nullopt,
+      // A fresh token is never present in the network context's restrictions
+      // map, and IsNetworkForNetworkRestrictionsIdAndUrlAllowed() allows any
+      // id it does not find - so this imposes no restrictions, which is what
+      // a browser-internal connection to the local MouseMux server wants.
+      // Passing an empty token would also pass that check, but callers are
+      // expected to supply a real one (see WebSocketConnectorImpl's CHECK).
+      /*network_restrictions_id=*/base::UnguessableToken::Create());
 }
 
 void MouseMuxClient::Disconnect() {
@@ -409,7 +423,7 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
     return;
   }
 
-  const base::Value::Dict& dict = parsed->GetDict();
+  const base::DictValue& dict = parsed->GetDict();
   const std::string* type = dict.FindString("type");
   if (!type) {
     MMTRACE("WS-IN/BAD", "no type field: %s", json_str.substr(0, 200).c_str());
@@ -615,7 +629,7 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
 #ifdef MOUSEMUX_DEBUG
     LogDebug("Received user list");
 #endif
-    const base::Value::List* users = dict.FindList("users");
+    const base::ListValue* users = dict.FindList("users");
     if (!users) {
       return;
     }
@@ -625,7 +639,7 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
       if (!user_value.is_dict()) {
         continue;
       }
-      const base::Value::Dict& user_dict = user_value.GetDict();
+      const base::DictValue& user_dict = user_value.GetDict();
 
       UserInfo info;
       std::optional<int> id = user_dict.FindInt("id");
@@ -639,13 +653,13 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
       }
 
       // Find mouse and keyboard hwids from devices array.
-      const base::Value::List* devices = user_dict.FindList("devices");
+      const base::ListValue* devices = user_dict.FindList("devices");
       if (devices) {
         for (const auto& device_value : *devices) {
           if (!device_value.is_dict()) {
             continue;
           }
-          const base::Value::Dict& device_dict = device_value.GetDict();
+          const base::DictValue& device_dict = device_value.GetDict();
           std::optional<int> dev_hwid = device_dict.FindInt("hwid");
           const std::string* dev_type = device_dict.FindString("type");
 #ifdef MOUSEMUX_DEBUG_TRACE

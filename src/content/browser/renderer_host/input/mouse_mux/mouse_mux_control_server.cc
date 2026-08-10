@@ -166,7 +166,7 @@ void MouseMuxControlServer::OnMessage(int connection_id, std::string data) {
     return;
   }
 
-  const base::Value::Dict& dict = parsed->GetDict();
+  const base::DictValue& dict = parsed->GetDict();
   const std::string* type = dict.FindString("type");
   if (!type) {
     SendResponse(connection_id, R"({"type":"error","msg":"missing type"})");
@@ -197,7 +197,7 @@ void MouseMuxControlServer::SendResponse(int connection_id,
 void MouseMuxControlServer::HandleStatus(int connection_id) {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
 
-  base::Value::Dict status;
+  base::DictValue status;
   status.Set("type", "status");
 
   bool connected = controller_->IsMouseMuxEnabled();
@@ -233,7 +233,7 @@ void MouseMuxControlServer::HandleSet(int connection_id,
     return;
   }
 
-  const base::Value::Dict& dict = parsed->GetDict();
+  const base::DictValue& dict = parsed->GetDict();
 
   // Handle "connected" — enable/disable MouseMux WebSocket connection.
   std::optional<bool> connected = dict.FindBool("connected");
