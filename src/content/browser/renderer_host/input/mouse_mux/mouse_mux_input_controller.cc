@@ -338,6 +338,84 @@ HANDLE ClaimSeatLock(int seat) {
   return lock;
 }
 
+#ifdef MOUSEMUX_KEYBOARD_LAYOUT
+
+// ---------------------------------------------------------------------------
+// Keyboard layout translation.
+//
+// The US-layout path maps a virtual key straight to a character through
+// Chromium's own tables.  Letters and digits survive that, because layouts
+// broadly agree on them, but punctuation does not, and a dedicated key like
+// ABNT2's c-cedilla or any dead-key accent cannot be produced at all.
+//
+// ToUnicodeEx asks the ACTUAL layout what a key produces, given the modifiers
+// held and the hardware scan code.  It is the same function the OS uses to
+// turn WM_KEYDOWN into WM_CHAR, so it agrees with what the keyboard is
+// painted with.
+// ---------------------------------------------------------------------------
+
+// Drains dead-key state out of the layout.
+//
+// ToUnicodeEx keeps composition state per THREAD, not per call: press an acute
+// accent and the layout remembers it, so the next call composes against it.
+// The browser has one thread, so one user's half-finished accent would
+// silently combine with another user's next keystroke.  Every translation
+// therefore starts from a known-empty buffer, and each device's own pending
+// accent is re-fed deliberately.
+void ClearLayoutDeadKeyState(HKL layout) {
+  BYTE state[256] = {0};
+  const UINT vk = VK_SPACE;
+  const UINT sc = ::MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, layout);
+  wchar_t buf[8];
+  // Bounded: a layout that never stops reporting dead keys would otherwise
+  // spin here forever.
+  for (int i = 0; i < 8; ++i) {
+    if (::ToUnicodeEx(vk, sc, state, buf, std::size(buf), 0, layout) >= 0) {
+      break;
+    }
+  }
+}
+
+// Builds the 256-byte key state ToUnicodeEx wants from ONE device's held keys.
+// Per device: a shared state would let one user's Shift capitalise another
+// user's typing, which is exactly the class of bug multi-owner had to fix.
+std::array<uint8_t, 256> BuildKeyState(const std::set<int>& held) {
+  std::array<uint8_t, 256> state{};
+  auto down = [&](int vk) { state[static_cast<size_t>(vk)] = 0x80; };
+
+  const bool shift = held.count(VK_SHIFT) || held.count(VK_LSHIFT) ||
+                     held.count(VK_RSHIFT);
+  const bool ctrl = held.count(VK_CONTROL) || held.count(VK_LCONTROL) ||
+                    held.count(VK_RCONTROL);
+  const bool alt =
+      held.count(VK_MENU) || held.count(VK_LMENU) || held.count(VK_RMENU);
+
+  if (shift) {
+    down(VK_SHIFT);
+  }
+  if (ctrl) {
+    down(VK_CONTROL);
+  }
+  if (alt) {
+    down(VK_MENU);
+  }
+  // AltGr is Ctrl+Alt on Windows, and it is how ABNT2 and most European
+  // layouts reach their third level.  Right Alt alone must therefore present
+  // as both.
+  if (held.count(VK_RMENU)) {
+    down(VK_CONTROL);
+    down(VK_MENU);
+  }
+  // Caps Lock is a machine-wide toggle with no per-device equivalent, so it is
+  // read from the system.  The low bit is the toggle, not the pressed bit.
+  if (::GetKeyState(VK_CAPITAL) & 1) {
+    state[VK_CAPITAL] = 0x01;
+  }
+  return state;
+}
+
+#endif  // MOUSEMUX_KEYBOARD_LAYOUT
+
 // The toplevel window a view lives in, or null.  Locking uses this rather than
 // the view itself because a cross-process navigation replaces the view while
 // the window stays put.
@@ -1419,7 +1497,7 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
       "KEY INJECT -> view=%p views_total=%zu",
       static_cast<void*>(view), registered_views_.size()));
 #endif
-  InjectKeyboardEvent(pair_hwid, view, vkey, is_down);
+  InjectKeyboardEvent(pair_hwid, view, vkey, scan, is_down);
 }
 
 void MouseMuxInputController::OnTimeoutWarning(int minutes) {
@@ -2308,6 +2386,7 @@ void MouseMuxInputController::InjectKeyboardEvent(
     int hwid,
     RenderWidgetHostViewAura* view,
     int vkey,
+    int scan,
     bool is_down) {
   if (!view) {
     LogDebug("InjectKeyboardEvent: view is null!");
@@ -2403,6 +2482,64 @@ void MouseMuxInputController::InjectKeyboardEvent(
   ui::KeyboardCode dummy_keycode;
   std::ignore = ui::DomCodeToUsLayoutDomKey(dom_code, ui_flags, &dom_key, &dummy_keycode);
 
+  // Characters this key produces under the real layout.  Empty means either a
+  // non-character key (arrows, F-keys) or a dead key still awaiting its base
+  // letter — both correctly insert nothing.
+  std::u16string layout_text;
+
+#ifdef MOUSEMUX_KEYBOARD_LAYOUT
+  // DomCode stays as derived above.  It describes a PHYSICAL key position,
+  // which does not change with layout, and deriving it from the vkey through
+  // the US table is what Chromium itself does for synthetic events.  Only the
+  // CHARACTER is layout-dependent, so only the character is re-derived here.
+  if (is_down) {
+    DeviceState& kb = StateFor(hwid);
+    // The thread's current layout.  One layout for everyone, which is right
+    // when the users share a machine and a keyboard type; per-device layouts
+    // would need the operator to say which is which.
+    const HKL layout = ::GetKeyboardLayout(0);
+    const std::array<uint8_t, 256> key_state = BuildKeyState(kb.pressed_keys);
+
+    ClearLayoutDeadKeyState(layout);
+
+    // Re-feed this device's pending accent so the layout composes against the
+    // right one — not against whatever another user last pressed.
+    if (kb.pending_dead_vkey) {
+      wchar_t discard[8];
+      ::ToUnicodeEx(kb.pending_dead_vkey, kb.pending_dead_scan,
+                    kb.pending_dead_key_state.data(), discard,
+                    std::size(discard), 0, layout);
+    }
+
+    // std::array, not a raw array: Chromium 151 applies -Wunsafe-buffer-usage
+    // here, and subscripting a raw array trips it even where the index is
+    // provably within what ToUnicodeEx reported.
+    std::array<wchar_t, 8> chars{};
+    const int rc =
+        ::ToUnicodeEx(vkey, scan, key_state.data(), chars.data(),
+                      static_cast<int>(chars.size()), 0, layout);
+
+    if (rc < 0) {
+      // A dead key: remember it and produce nothing yet.  The accent appears
+      // when the base letter follows.
+      kb.pending_dead_vkey = vkey;
+      kb.pending_dead_scan = scan;
+      kb.pending_dead_key_state = key_state;
+      ClearLayoutDeadKeyState(layout);
+    } else {
+      kb.pending_dead_vkey = 0;
+      for (int i = 0; i < rc; ++i) {
+        layout_text.push_back(static_cast<char16_t>(chars[static_cast<size_t>(i)]));
+      }
+      // Report what was actually produced rather than the US guess, so JS
+      // sees the character the user typed.
+      if (!layout_text.empty()) {
+        dom_key = ui::DomKey::FromCharacter(layout_text[0]);
+      }
+    }
+  }
+#endif  // MOUSEMUX_KEYBOARD_LAYOUT
+
   // On Windows, the normal keyboard flow is:
   //   1. WM_KEYDOWN → aura → OnKeyEvent → ForwardKeyboardEvent(kRawKeyDown)
   //   2. WM_CHAR    → InsertChar → ForwardKeyboardEvent(kChar) → text insertion
@@ -2445,8 +2582,7 @@ void MouseMuxInputController::InjectKeyboardEvent(
   // ui::KeyEvent with the character and call view->InsertChar() directly,
   // bypassing the native_keyboard_input_blocked_ check (which only blocks
   // events NOT marked with kFromDebugger).
-  if (is_down && dom_key.IsCharacter()) {
-    char16_t ch = static_cast<char16_t>(dom_key.ToCharacter());
+  if (is_down) {
     int char_flags = ui::EF_IS_SYNTHESIZED;
     if (modifiers & blink::WebInputEvent::kShiftKey)
       char_flags |= ui::EF_SHIFT_DOWN;
@@ -2455,16 +2591,30 @@ void MouseMuxInputController::InjectKeyboardEvent(
     if (modifiers & blink::WebInputEvent::kAltKey)
       char_flags |= ui::EF_ALT_DOWN;
 
-    ui::KeyEvent char_event = ui::KeyEvent::FromCharacter(
-        ch, static_cast<ui::KeyboardCode>(vkey), dom_code, char_flags);
-
-#ifdef MOUSEMUX_DEBUG
-    LogDebug(base::StringPrintf(
-        ">>> INJECT CHAR via InsertChar: vkey=0x%x char='%c' (%d)",
-        vkey, static_cast<char>(ch), static_cast<int>(ch)));
+    // What to insert.  The layout may produce more than one character from a
+    // single key — a composed accent, or a ligature — so this is a string,
+    // not a char.
+    std::u16string text;
+#ifdef MOUSEMUX_KEYBOARD_LAYOUT
+    text = layout_text;
+#else
+    if (dom_key.IsCharacter()) {
+      text.push_back(static_cast<char16_t>(dom_key.ToCharacter()));
+    }
 #endif
 
-    view->InsertChar(char_event);
+    for (char16_t ch : text) {
+      ui::KeyEvent char_event = ui::KeyEvent::FromCharacter(
+          ch, static_cast<ui::KeyboardCode>(vkey), dom_code, char_flags);
+
+#ifdef MOUSEMUX_DEBUG
+      LogDebug(base::StringPrintf(
+          ">>> INJECT CHAR via InsertChar: vkey=0x%x U+%04X",
+          vkey, static_cast<unsigned>(ch)));
+#endif
+
+      view->InsertChar(char_event);
+    }
   }
 }
 

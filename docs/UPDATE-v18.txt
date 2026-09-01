@@ -141,41 +141,78 @@ windows, typing simultaneously, two blinking carets, no crossover.
    do nothing. No profile is corrupted.
 
 
-5. COMPILE SWITCHES
+5. KEYBOARD LAYOUTS OTHER THAN US
 
-   MOUSEMUX_EXPERIMENT_MULTI_OWNER promoted to MOUSEMUX_MULTI_OWNER and moved
+   Injected characters came from Chromium's US-layout tables. Letters and
+   digits survived that because layouts broadly agree on them, but punctuation
+   did not, and a dedicated key like ABNT2's c-cedilla or any dead-key accent
+   could not be produced AT ALL. That affected every release up to 2.2.56 and
+   every non-US customer - not only the Brazilian case that surfaced it.
+
+   Characters now come from ToUnicodeEx against the layout actually in use -
+   the same call Windows makes to turn WM_KEYDOWN into WM_CHAR, so the result
+   agrees with what the keys are painted with. This finally uses the scan code
+   the SDK has been sending all along and only writing to the debug log.
+
+   DomCode is deliberately still derived from the US tables. It describes a
+   physical key POSITION, which does not vary by layout, and that is what
+   Chromium itself does for synthetic events. Only the character is
+   layout-dependent, so only the character was re-derived - changing both
+   would have made a failure impossible to attribute.
+
+   Dead-key composition is held PER DEVICE. ToUnicodeEx keeps its state per
+   thread and the browser has one thread, so one user's half-finished accent
+   would otherwise compose into another user's next keystroke. Each device
+   holds its pending accent along with the exact modifier state it was typed
+   with, because re-feeding it with different modifiers composes something
+   else. Every translation starts from a drained buffer.
+
+   AltGr (right Alt) presents as Ctrl+Alt, which is how ABNT2 and most
+   European layouts reach their third level. Caps Lock is read from the
+   system, having no per-device equivalent. InsertChar takes a string rather
+   than a char, since one key can produce more than one character.
+
+   One layout for all users, read from the browser thread. Per-device layouts
+   would need the operator to say which device is which, and nobody has asked.
+
+   Verified 2026-09-01 on Brazilian ABNT2: c-cedilla, and acute, tilde and
+   circumflex accents all composing correctly, with ordinary Latin typing and
+   Ctrl shortcuts unaffected.
+
+
+6. COMPILE SWITCHES
+
+   MOUSEMUX_EXPERIMENT_MULTI_OWNER promoted to MOUSEMUX_MULTI_OWNER, and
+   MOUSEMUX_EXPERIMENT_MULTI_LANGUAGE to MOUSEMUX_KEYBOARD_LAYOUT. Both moved
    to the shipped section. The convention in mouse_mux_config.h says an
-   experiment that is on is a contradiction - promote it or turn it off.
+   experiment that is on is a contradiction - promote it or turn it off - and
+   both are now verified on hardware.
 
    Shipped and on:  AURA_UI_CLICK_THROUGH, NATIVE_BLOCK, PEN_TOUCH_INJECT,
-                    MULTI_OWNER
-   Experiments off: PEN_TOUCH_BLOCK, MULTI_LANGUAGE, NATIVE_BLOCK_HARD,
-                    NC_HANDLING
+                    MULTI_OWNER, KEYBOARD_LAYOUT
+   Experiments off: PEN_TOUCH_BLOCK, NATIVE_BLOCK_HARD, NC_HANDLING
    Diagnostics off: DEBUG, DEBUG_TRACE
 
    Nothing writes input to disk in this build.
 
 
-6. VERIFIED, AND NOT
+7. VERIFIED, AND NOT
 
    Verified on hardware:
      - two users typing simultaneously in two windows, no crossover
      - both windows holding blinking carets at once
      - two <select> dropdowns open simultaneously
      - clicking the dialog no longer kills anyone's caret
+     - "+ Seat" launching a second browser without the helper
+     - lock-users-to-their-window
+     - Brazilian ABNT2: c-cedilla and acute/tilde/circumflex accents, with
+       ordinary Latin typing and Ctrl shortcuts unaffected
 
    NOT verified:
-     - "+ Seat" launching without the helper. Built and reasoned through, not
-       yet clicked.
-     - hard lock beyond the basic path
      - four users. Two were tested; nothing in the design is limited to two,
        but that is inference, not evidence.
      - pen and touch, still never run on hardware (unchanged since 2.2.53)
-
-   Known gap, pre-existing and unrelated to this work: keyboard injection maps
-   through US-layout tables, so a non-US keyboard produces wrong punctuation
-   and cannot produce dead-key accents at all. Tracked as
-   MOUSEMUX_EXPERIMENT_MULTI_LANGUAGE. It affects every release so far, not
-   just this one.
+     - layouts other than US and ABNT2. The mechanism is the layout's own
+       translation, so others should follow, but only two have been seen.
 
    The known-good fallback remains 2.2.55 on Chromium 146.

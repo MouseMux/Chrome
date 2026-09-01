@@ -82,6 +82,31 @@
 // Content layer only — not mirrored in the views file.
 #define MOUSEMUX_MULTI_OWNER
 
+// Keyboard layout translation.  Injected characters come from ToUnicodeEx
+// against the layout actually in use — the same call Windows makes to turn
+// WM_KEYDOWN into WM_CHAR — rather than from Chromium's US-layout tables.
+//
+// Without this, letters and digits land correctly because layouts broadly
+// agree on them, but punctuation does not, and a dedicated key like ABNT2's
+// c-cedilla or any dead-key accent cannot be produced AT ALL.  That affected
+// every release up to 2.2.56 and every non-US customer.
+//
+// DomCode is deliberately still derived from the US tables: it describes a
+// physical key POSITION, which does not vary by layout, and that is what
+// Chromium itself does for synthetic events.  Only the character is
+// layout-dependent.
+//
+// Dead-key composition is held per device.  ToUnicodeEx keeps its state per
+// THREAD and the browser has one thread, so without that, one user's
+// half-finished accent composes into another user's next keystroke.  AltGr
+// (right Alt) presents as Ctrl+Alt, which is how ABNT2 and most European
+// layouts reach their third level.
+//
+// Verified 2026-09-01 on a Brazilian ABNT2 layout: c-cedilla, and acute,
+// tilde and circumflex accents all composing correctly, with ordinary Latin
+// typing and Ctrl shortcuts unaffected.  Content layer only.
+#define MOUSEMUX_KEYBOARD_LAYOUT
+
 // ---------------------------------------------------------------------------
 // EXPERIMENTS — unverified or known-broken.  All OFF.
 // ---------------------------------------------------------------------------
@@ -96,21 +121,6 @@
 // test on is how you ship a build nobody can click out of.
 // Mirrored in the views file.
 // #define MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
-
-// Keyboard layout translation.  InjectKeyboardEvent currently derives the
-// character through ui::UsLayoutKeyboardCodeToDomCode and
-// ui::DomCodeToUsLayoutDomKey — hardcoded US.  Latin letters and digits land
-// correctly because the layouts agree there; punctuation does not, and neither
-// c-cedilla nor any dead-key accent (acute + a -> a-acute) can be produced.
-//
-// With this on the character comes from ToUnicodeEx against a real HKL, using
-// the vkey AND scan code the SDK already sends (both arrive in OnKeyboardKey,
-// and scan is currently only logged).  Dead-key composition state must be held
-// per device rather than left to the Win32 per-thread buffer, or two users
-// mid-accent corrupt each other.
-//
-// OFF: unproven, and untestable without a non-US keyboard.  Content layer only.
-// #define MOUSEMUX_EXPERIMENT_MULTI_LANGUAGE
 
 // Hard mode: on top of MOUSEMUX_NATIVE_BLOCK, also block mouse movement,
 // non-client clicks and keyboard.  WM_SYSKEY* is left through so Alt+F4 still

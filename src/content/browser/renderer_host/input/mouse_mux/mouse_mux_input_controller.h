@@ -10,6 +10,8 @@
 // This prevents cascade rebuilds when only the controller header changes.
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
 
+#include <array>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
@@ -318,9 +320,13 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Injects a keyboard event into the given view.  |hwid| is the MOUSE hwid of
   // the pair the keystroke belongs to, NOT the keyboard's own hwid: modifier
   // state is held per device pair, and the caller has already resolved it.
+  // |scan| is the hardware scan code the SDK reported.  Needed because
+  // translating a key through a real keyboard layout takes the scan code as
+  // well as the virtual key; the US-layout path ignored it.
   void InjectKeyboardEvent(int hwid,
                            RenderWidgetHostViewAura* view,
                            int vkey,
+                           int scan,
                            bool is_down);
 
   // Gets the keyboard hwid for the current owner (from user info).
@@ -391,6 +397,21 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // native Windows input.  Per device because capture is what allows several
     // owners to coexist, and the operator may hand it out one user at a time.
     bool captured = false;
+
+#ifdef MOUSEMUX_KEYBOARD_LAYOUT
+    // A dead key this device has pressed but not yet resolved — the acute in
+    // acute-then-a.  Held PER DEVICE deliberately: ToUnicodeEx keeps its
+    // composition state per thread, and the browser has one thread, so two
+    // users mid-accent would otherwise compose into each other.  Zero means
+    // nothing pending.
+    //
+    // The full key state is kept, not just the vkey, because re-feeding the
+    // dead key has to reproduce the exact modifiers it was typed with or the
+    // layout composes something different.
+    int pending_dead_vkey = 0;
+    int pending_dead_scan = 0;
+    std::array<uint8_t, 256> pending_dead_key_state{};
+#endif
 
     // The window this device is confined to while hard lock is on.  Claimed by
     // the device's first click and kept until the window closes.
