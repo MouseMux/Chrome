@@ -2801,6 +2801,23 @@ void RenderWidgetHostViewAura::OnWindowFocused(aura::Window* gained_focus,
     NOTREACHED();
   }
 
+#ifdef MOUSEMUX_MULTI_OWNER
+  // MouseMux: keep page focus while captured.  With several users in several
+  // windows, only one window can be the OS foreground one, so every
+  // activation change — the operator clicking the control dialog, another
+  // user's window coming forward — would blur the others and kill the caret
+  // of somebody who is still typing.  While captured, OS focus carries no
+  // information: nothing is producing native input, and injected events reach
+  // a view by hit-test rather than by focus.
+  //
+  // Capture-gated, so with capture off this does nothing and normal blur
+  // behaviour returns untouched.
+  if (base::FeatureList::IsEnabled(features::kMouseMuxIntegration) &&
+      MouseMuxInputController::GetInstance()->ShouldSuppressBlur(this)) {
+    return;
+  }
+#endif
+
   UpdateActiveState(false);
   host()->LostFocus();
 

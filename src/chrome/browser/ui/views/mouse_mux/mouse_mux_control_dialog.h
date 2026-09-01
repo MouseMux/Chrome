@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "base/memory/raw_ptr.h"
+#include "base/timer/timer.h"
 #include "ui/gfx/image/image_skia.h"
+#include "ui/gfx/native_ui_types.h"
 #include "ui/views/window/dialog_delegate.h"
 
 namespace views {
@@ -83,6 +85,7 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // Called when toggle buttons are changed.
   void OnNativeInputToggled();
   void OnMouseMuxToggled();
+  void OnHardLockToggled();
 
   // Called when Release Owner button is clicked.
   void OnReleaseOwnerClicked();
@@ -103,6 +106,23 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // Update capture button state based on owner and capture state.
   void UpdateCaptureButton();
 
+  // Rebuilds the per-owner rows from the controller's owner list.  Cheap
+  // enough to redo wholesale: there are at most a handful of owners, and
+  // rebuilding avoids diffing rows against devices coming and going.
+  void RebuildOwnerList();
+
+  // Per-owner row actions.  |hwid| identifies the owner; |window| is captured
+  // when the row is built, so a row acts on the window that owner was working
+  // in at that moment.
+  void OnOwnerCaptureClicked(int hwid);
+  void OnOwnerReleaseClicked(int hwid);
+  void OnOwnerCloseWindowClicked(gfx::AcceleratedWidget window);
+
+  // Hand out a window: same profile (a window of THIS Chrome, sharing cookies
+  // and logins) or a new seat (own process and profile, via launcher.exe).
+  void OnNewWindowClicked();
+  void OnNewSeatClicked();
+
   // Called when ownership changes.
   void OnOwnershipChanged(int hwid, const std::string& name);
 
@@ -122,10 +142,21 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   raw_ptr<views::ToggleButton> native_input_toggle_ = nullptr;
   raw_ptr<views::ToggleButton> mousemux_toggle_ = nullptr;
+  raw_ptr<views::ToggleButton> hard_lock_toggle_ = nullptr;
+  raw_ptr<views::Label> hard_lock_status_label_ = nullptr;
   raw_ptr<views::Label> native_input_status_label_ = nullptr;
   raw_ptr<views::Label> mousemux_status_label_ = nullptr;
   raw_ptr<views::MdTextButton> release_owner_button_ = nullptr;
   raw_ptr<views::MdTextButton> capture_button_ = nullptr;
+
+  // Container the per-owner rows are rebuilt into.
+  raw_ptr<views::View> owner_list_ = nullptr;
+
+  // Owners' window titles change as they browse, and nothing notifies us when
+  // a user clicks into a different window, so the list is refreshed on a
+  // timer as well as on ownership and capture callbacks.  Only runs while the
+  // dialog is visible.
+  base::RepeatingTimer owner_refresh_timer_;
 
   // Shown only while collapsed: the icon plus the one control left to click.
   raw_ptr<views::View> expand_row_ = nullptr;
@@ -147,6 +178,13 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   // Current capture state.
   bool is_captured_ = false;
+
+  // Which device opened the currently active context menu, and which device
+  // clicked most recently while no menu was open.  Chrome has ONE active menu
+  // per process, so without this any user's click closes any user's menu.
+  // -1 means unattributed.
+  int menu_owner_hwid_ = -1;
+  int pending_menu_hwid_ = -1;
 
   // Selected hotkey index (0 = Shift+Escape, etc.)
   size_t selected_hotkey_index_ = 0;

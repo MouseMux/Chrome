@@ -3,7 +3,7 @@
 This document details all modifications made to Chromium source files. For new files (the `mouse_mux/` directories), simply copy them into your Chromium checkout. For modified files, apply the changes described below.
 
 **Base Chromium Version**: 151.0.7922.77
-**Patch Version**: 2.2.56
+**Patch Version**: 2.2.57
 
 > **The authoritative file list is [`docs/CHROMIUM_VERSION.md`](docs/CHROMIUM_VERSION.md).**
 > It splits the patch into files that are new (safe to copy wholesale) and
@@ -11,8 +11,8 @@ This document details all modifications made to Chromium source files. For new f
 > bump), and says what each edit does. Sections further down this document
 > date from 2.2.46 and no longer list everything.
 >
-> Changelog for this version: [`docs/UPDATE-v17.txt`](docs/UPDATE-v17.txt).
-> Previous version (2.2.55, Chromium 146): [`docs/UPDATE-v16.txt`](docs/UPDATE-v16.txt).
+> Changelog for this version: [`docs/UPDATE-v18.txt`](docs/UPDATE-v18.txt).
+> Previous version (2.2.56, same Chromium): [`docs/UPDATE-v17.txt`](docs/UPDATE-v17.txt).
 
 ---
 
@@ -40,8 +40,12 @@ the top of it before flipping anything: `MOUSEMUX_EXPERIMENT_*` is off by
 definition, and `MOUSEMUX_DEBUG*` must stay off in any build that leaves the
 build machine.
 
-The launcher (`launcher/launcher.c`) is standalone C and is **not** part of the
-Chromium build. Build it with `launcher/build_launcher.py`.
+`launcher/launcher.c` is **no longer built or shipped** as of 2.2.57. The
+browser starts its own seats: it claims a seat mutex at startup, keyed off
+`--mousemux-control-port` (52000+N is seat N), and holds it until the process
+exits. The launcher existed only to hold that mutex on behalf of a browser it
+could not modify. It is kept in this repo as reference — its comments record
+why several earlier seat-tracking schemes were abandoned — but nothing uses it.
 
 Also copy `icon.ico` to the directory where chrome.exe will be located.
 
@@ -148,7 +152,8 @@ BASE_FEATURE(kMouseMuxIntegration,
 #include "content/common/features.h"
 ```
 
-**Location 2**: In `InitAsChild()`, after `UpdateArabicIndicDigitInputStateIfNecessary()` (around line 378)
+**Location 2**: In the **constructor**, inside the existing `#if BUILDFLAG(IS_WIN)`
+block after `UpdateArabicIndicDigitInputStateIfNecessary()` (around line 400)
 
 **Add**:
 ```cpp
@@ -158,7 +163,16 @@ BASE_FEATURE(kMouseMuxIntegration,
   }
 ```
 
-**Location 3**: In destructor, before `text_input_manager_` cleanup (around line 2788)
+> Earlier revisions of this document said `InitAsChild()`. That was wrong, and
+> the difference matters: `InitAsChild()` runs only for ordinary web content
+> views, whereas the constructor runs for **every** `RenderWidgetHostViewAura`
+> — including the popup views created by `InitAsPopup()` for `<select>`
+> dropdowns. Registering in the constructor is what puts those popups in
+> `registered_views_`, so `FindViewAtPoint()` can hit-test them and injected
+> clicks reach dropdown items. Moving this to `InitAsChild()` would silently
+> break clicking on `<select>` dropdowns.
+
+**Location 3**: In destructor, before `text_input_manager_` cleanup (around line 2937)
 
 **Add**:
 ```cpp

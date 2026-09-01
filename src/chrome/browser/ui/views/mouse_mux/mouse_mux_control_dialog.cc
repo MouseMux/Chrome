@@ -27,6 +27,11 @@
 // Chromium 151 removed chrome/browser/ui/browser_list.h.  Browser enumeration
 // now goes through BrowserWindowInterface; Browser and BrowserWindow are no
 // longer needed here at all, since the only use was reading window bounds.
+#include "base/files/file_path.h"
+#include "base/process/launch.h"
+#include "base/strings/utf_string_conversions.h"
+#include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/ui/browser_commands.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 #include "chrome/browser/ui/views/chrome_layout_provider.h"
@@ -106,7 +111,12 @@ class HotkeyComboboxModel : public ui::ComboboxModel {
   }
 };
 
-constexpr int kBuildNumber = 54;
+// Shown in the dialog footer.  MUST track the release version — 2.2.57 is
+// build #57 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
+// 2.2.56 releases, so the dialog reported a build three versions older than the
+// binary it was part of, which makes it impossible to tell by looking whether
+// someone is running what you think they are.
+constexpr int kBuildNumber = 57;
 
 // Product name, used for the window title.  The build number lives in the
 // footer with the build date rather than the title, which should read as a
@@ -122,7 +132,7 @@ constexpr char kProductName[] = "MouseMux Multi-Seat Chrome Control";
 
 // Title bar icon, loaded from icon.ico next to chrome.exe.  Shown to the left
 // of the dialog title.
-constexpr int kWindowIconSize = 16;
+constexpr int kWindowIconSize = 24;
 
 #ifdef MOUSEMUX_DEBUG
 constexpr int kDialogWidth = 600;
@@ -130,14 +140,18 @@ constexpr int kDialogHeight = 500;
 constexpr int kLogFlushThreshold = 5;
 const char kLogFilePath[] = MOUSEMUX_DEBUG_LOG_PATH;
 #else
-constexpr int kDialogWidth = 420;
-constexpr int kDialogHeight = 240;
+constexpr int kDialogWidth = 560;
+constexpr int kDialogHeight = 400;
 
 // Collapsed strip: no title bar, no close button, no build footer — just the
 // icon and one button, so it can be much smaller than the dialog.
 constexpr int kCollapsedWidth = 150;
 constexpr int kCollapsedHeight = 52;
-const char kBuildDate[] = "2026-08-04 TRACE";
+// Date only.  A "TRACE" suffix was hardcoded here on 2026-08-04 and left in,
+// so ordinary builds claimed to be trace builds that log input to disk.  The
+// trace warning belongs in kProductName above, where it is #ifdef-guarded and
+// cannot lie.  Do not put build flavour in this string.
+const char kBuildDate[] = "2026-09-01";
 #endif
 
 constexpr int kSpacing = 12;
@@ -194,6 +208,15 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
   SetBorder(views::CreateEmptyBorder(gfx::Insets(kSpacing)));
 
   SetupContents();
+  RebuildOwnerList();
+
+  // Owners' window titles change as they browse and nothing reports that, so
+  // poll.  One second is slow enough to be free and fast enough that the list
+  // is never visibly wrong.
+  owner_refresh_timer_.Start(
+      FROM_HERE, base::Seconds(1),
+      base::BindRepeating(&MouseMuxControlDialog::RebuildOwnerList,
+                          base::Unretained(this)));
 
   // Register callbacks with controller.
   auto* controller = content::MouseMuxInputController::GetInstance();
@@ -236,12 +259,41 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
 
   // Register menu dismiss callback so injected mouse-down can close
   // any active context menu (content layer can't access views::MenuController).
-  controller->SetMenuDismissCallback(base::BindRepeating([]() {
-    auto* menu = views::MenuController::GetActiveInstance();
-    if (menu) {
-      menu->Cancel(views::MenuController::ExitType::kAll);
-    }
-  }));
+  //
+  // MenuController::GetActiveInstance() is a PROCESS-WIDE singleton: there is
+  // one active menu for the whole browser, not one per window.  Cancelling it
+  // on every mouse-down from every device means user 2 clicking anywhere closes
+  // the dropdown user 1 just opened.  So attribute the menu to the device that
+  // opened it, and only let that device close it.
+  //
+  // Attribution is by inference — nothing tells us who opened a menu — but the
+  // inference is sound: a menu can only have been opened by the last click
+  // that happened while no menu was open.
+  //
+  // The deeper limit remains and cannot be fixed here: one active menu per
+  // process means two users cannot have two dropdowns open at once.
+  controller->SetMenuDismissCallback(base::BindRepeating(
+      [](int* menu_owner_hwid, int* pending_menu_hwid, int hwid) {
+        auto* menu = views::MenuController::GetActiveInstance();
+        if (!menu) {
+          // Nothing open.  If THIS click opens a menu, it belongs to this
+          // device.
+          *menu_owner_hwid = -1;
+          *pending_menu_hwid = hwid;
+          return;
+        }
+        if (*menu_owner_hwid == -1) {
+          // First click seen since this menu appeared: attribute it to
+          // whoever clicked last while nothing was open.
+          *menu_owner_hwid = *pending_menu_hwid;
+        }
+        if (*menu_owner_hwid == hwid) {
+          menu->Cancel(views::MenuController::ExitType::kAll);
+          *menu_owner_hwid = -1;
+        }
+        // Otherwise it is another user's menu — leave it alone.
+      },
+      &menu_owner_hwid_, &pending_menu_hwid_));
 
   // Title bar icon.  The larger in-dialog logo is loaded by SetupContents().
   window_icon_ = LoadAppIcon(kWindowIconSize);
@@ -564,6 +616,38 @@ void MouseMuxControlDialog::SetupContents() {
   native_input_status_label_ =
       native_row->AddChildView(std::make_unique<views::Label>(u"Off"));
 
+  // Hard lock row.  Two states only — off is "soft", which is not a mode but
+  // simply what routing by hit-test does — so a toggle rather than a picker.
+  auto* lock_row = AddChildView(std::make_unique<views::View>());
+  auto* lock_layout =
+      lock_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
+          kToggleSpacing));
+  lock_layout->set_main_axis_alignment(
+      views::BoxLayout::MainAxisAlignment::kStart);
+  lock_layout->set_cross_axis_alignment(
+      views::BoxLayout::CrossAxisAlignment::kCenter);
+
+  hard_lock_toggle_ =
+      lock_row->AddChildView(std::make_unique<views::ToggleButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnHardLockToggled,
+                              base::Unretained(this))));
+  hard_lock_toggle_->SetAccessibleName(u"Lock Users To Their Window");
+
+  auto* lock_label = lock_row->AddChildView(
+      std::make_unique<views::Label>(u"Lock Users To Their Window"));
+  lock_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  lock_label->SetTooltipText(
+      u"Off: a user who clicks another window moves there.\n"
+      u"On: clicks outside a user's own window are ignored, so each user is "
+      u"confined to one window. Cursors still move freely; only clicks are "
+      u"blocked. A user with no window claims the first one they click, and "
+      u"closing a window frees its user to claim another.");
+  lock_layout->SetFlexForView(lock_label, 1);
+
+  hard_lock_status_label_ =
+      lock_row->AddChildView(std::make_unique<views::Label>(u"Off"));
+
 #ifdef MOUSEMUX_DEBUG
   // Info label with server address.
   auto* info_label = AddChildView(std::make_unique<views::Label>(
@@ -572,71 +656,157 @@ void MouseMuxControlDialog::SetupContents() {
   info_label->SetHorizontalAlignment(gfx::ALIGN_CENTER);
 #endif
 
-  // Capture row: [Capture Mouse] button + [Hotkey dropdown] + [Release Owner] button
-  auto* capture_row = AddChildView(std::make_unique<views::View>());
-  auto* capture_layout =
-      capture_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+  // ---------------------------------------------------------------------
+  // Owner list — the control centre proper.  One row per user, showing which
+  // window they are working in, whether they are captured, and letting the
+  // operator act on that one user without disturbing the others.
+  //
+  // The bulk actions live in this header rather than in a row of their own.
+  // They act on the list directly below them, and floating them among the
+  // connection toggles made it look as though there were two unrelated ways to
+  // capture.  They are the same actions as the per-row buttons, applied to
+  // everyone.
+  //
+  // "Capture all" and "Drop all" are deliberately NOT one button: capture
+  // stops a device producing native input, while dropping removes ownership
+  // altogether.  Naming them alike would invite exactly that confusion.
+  // ---------------------------------------------------------------------
+  auto* owners_header_row = AddChildView(std::make_unique<views::View>());
+  auto* owners_header_layout =
+      owners_header_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
           views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
           kToggleSpacing));
-  capture_layout->set_main_axis_alignment(
-      views::BoxLayout::MainAxisAlignment::kStart);
-  capture_layout->set_cross_axis_alignment(
+  owners_header_layout->set_cross_axis_alignment(
       views::BoxLayout::CrossAxisAlignment::kCenter);
 
-  capture_button_ = capture_row->AddChildView(
+  auto* owners_header = owners_header_row->AddChildView(
+      std::make_unique<views::Label>(u"Owners",
+                                     views::style::CONTEXT_DIALOG_BODY_TEXT,
+                                     views::style::STYLE_PRIMARY));
+  owners_header->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  owners_header_layout->SetFlexForView(owners_header, 1);
+
+  capture_button_ = owners_header_row->AddChildView(
       std::make_unique<views::MdTextButton>(
           base::BindRepeating(&MouseMuxControlDialog::OnCaptureClicked,
                               base::Unretained(this)),
-          u"Capture Mouse"));
+          u"Capture all"));
   capture_button_->SetEnabled(false);  // Disabled until we have an owner.
-  capture_button_->SetMinSize(gfx::Size(0, 32));
+  capture_button_->SetMinSize(gfx::Size(96, 30));
+  capture_button_->SetTooltipText(
+      u"Stop every owner's device producing native Windows input. Required "
+      u"for several users to work at once. Capture one at a time from its "
+      u"row below.");
 
-  // Shrinks the dialog to a strip rather than hiding it, so there is always
-  // something on screen to click to get back.
-  auto* collapse_button = capture_row->AddChildView(
+  release_owner_button_ = owners_header_row->AddChildView(
       std::make_unique<views::MdTextButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnCollapseClicked,
+          base::BindRepeating(&MouseMuxControlDialog::OnReleaseOwnerClicked,
                               base::Unretained(this)),
-          u"Collapse"));
-  collapse_button->SetMinSize(gfx::Size(0, 32));
-  collapse_button->SetTooltipText(
-      u"Shrink this dialog out of the way. Click it again to restore.");
+          u"Drop all"));
+  release_owner_button_->SetEnabled(false);  // Disabled until we have an owner.
+  release_owner_button_->SetMinSize(gfx::Size(76, 30));
+  release_owner_button_->SetTooltipText(
+      u"Remove every owner. Their devices stop driving Chrome until they "
+      u"click to claim again. To drop just one, use its row below.");
 
-  // Hotkey dropdown label.
-  capture_row->AddChildView(std::make_unique<views::Label>(u"Release:"));
+  owner_list_ = AddChildView(std::make_unique<views::View>());
+  owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 2));
 
-  // Hotkey dropdown.
+  // Hand out a window.  Two buttons because they are genuinely different
+  // things: a window of THIS Chrome shares cookies and logins with the other
+  // users, a seat is its own process and profile and shares nothing.
+  auto* handout_row = AddChildView(std::make_unique<views::View>());
+  auto* handout_layout =
+      handout_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
+          kToggleSpacing));
+  handout_layout->set_main_axis_alignment(
+      views::BoxLayout::MainAxisAlignment::kStart);
+
+  // Short labels, and a min WIDTH as well as height.  The long forms
+  // ("+ Window (this profile)") squeezed to ellipsis as soon as the dialog was
+  // narrow, and a button whose label is elided tells the operator nothing.
+  // The distinction that matters lives in the tooltips.
+  auto* new_window_button = handout_row->AddChildView(
+      std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnNewWindowClicked,
+                              base::Unretained(this)),
+          u"+ Window"));
+  new_window_button->SetMinSize(gfx::Size(110, 32));
+  new_window_button->SetTooltipText(
+      u"Open another window of THIS Chrome, sharing cookies and logins with "
+      u"the other users. Have the next user click in it to claim it.");
+
+  auto* new_seat_button = handout_row->AddChildView(
+      std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnNewSeatClicked,
+                              base::Unretained(this)),
+          u"+ Seat"));
+  new_seat_button->SetMinSize(gfx::Size(110, 32));
+  new_seat_button->SetTooltipText(
+      u"Launch a separate Chrome with its OWN profile and its own dialog. "
+      u"Isolated: shares no logins with this one.");
+
+  // Absorbs slack so the two buttons keep their size and sit left rather than
+  // stretching across the dialog.
+  auto* handout_spacer =
+      handout_row->AddChildView(std::make_unique<views::View>());
+  handout_layout->SetFlexForView(handout_spacer, 1);
+
+  // Release hotkey.  A setting, configured once and rarely touched, so it
+  // belongs at the end rather than in prime position between two buttons —
+  // but it is also the escape hatch out of capture, so it stays visible
+  // rather than hiding behind a menu.
+  handout_row->AddChildView(std::make_unique<views::Label>(
+      u"Release hotkey:", views::style::CONTEXT_DIALOG_BODY_TEXT,
+      views::style::STYLE_SECONDARY));
+
   hotkey_model_ = std::make_unique<HotkeyComboboxModel>();
-  hotkey_dropdown_ = capture_row->AddChildView(
-      std::make_unique<views::Combobox>(hotkey_model_.get()));
+  hotkey_dropdown_ =
+      handout_row->AddChildView(std::make_unique<views::Combobox>(
+          hotkey_model_.get()));
   hotkey_dropdown_->SetCallback(
       base::BindRepeating(&MouseMuxControlDialog::OnHotkeyChanged,
                           base::Unretained(this)));
   hotkey_dropdown_->SetSelectedIndex(0);  // Default: Shift+Escape
-
-  // Spacer to push Release Owner button to the right.
-  auto* spacer = capture_row->AddChildView(std::make_unique<views::View>());
-  capture_layout->SetFlexForView(spacer, 1);
-
-  release_owner_button_ = capture_row->AddChildView(
-      std::make_unique<views::MdTextButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnReleaseOwnerClicked,
-                              base::Unretained(this)),
-          u"Release Owner"));
-  release_owner_button_->SetEnabled(false);  // Disabled until we have an owner.
-  release_owner_button_->SetMinSize(gfx::Size(0, 32));
+  hotkey_dropdown_->SetTooltipText(
+      u"Key combination that releases capture, for when injected input is not "
+      u"working and the mice cannot reach this dialog.");
 
 #ifndef MOUSEMUX_DEBUG
-  // Build date label in the button row at the lower left, light gray.
-  auto build_label = std::make_unique<views::Label>(
+  // Footer, in the frame's button row beside Close: build info and Collapse.
+  // Collapse is window management, so it belongs next to the other window
+  // control rather than among the operating controls above.
+  auto footer = std::make_unique<views::View>();
+  auto* footer_layout =
+      footer->SetLayoutManager(std::make_unique<views::BoxLayout>(
+          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
+          kToggleSpacing));
+  footer_layout->set_cross_axis_alignment(
+      views::BoxLayout::CrossAxisAlignment::kCenter);
+
+  auto* build_text = footer->AddChildView(std::make_unique<views::Label>(
       base::ASCIIToUTF16(
           base::StringPrintf("Build #%d - %s", kBuildNumber, kBuildDate)),
       views::style::CONTEXT_DIALOG_BODY_TEXT,
-      views::style::STYLE_DISABLED);
-  build_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+      views::style::STYLE_DISABLED));
+  build_text->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+
+  // Shrinks the dialog to a strip rather than hiding it, so there is always
+  // something on screen to click to get back.
+  auto* collapse_button =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnCollapseClicked,
+                              base::Unretained(this)),
+          u"Collapse"));
+  collapse_button->SetMinSize(gfx::Size(84, 30));
+  collapse_button->SetTooltipText(
+      u"Shrink this dialog out of the way. Click it again to restore.");
+
   // Kept so collapse can hide it — the extra view sits in the frame's button
   // row, which SetButtons(kNone) does not remove on its own.
-  build_label_ = SetExtraView(std::move(build_label));
+  build_label_ = SetExtraView(std::move(footer));
 #endif
 
 #ifdef MOUSEMUX_DEBUG
@@ -697,6 +867,16 @@ ui::ImageModel MouseMuxControlDialog::GetWindowIcon() {
   return ui::ImageModel::FromImageSkia(window_icon_);
 }
 
+
+void MouseMuxControlDialog::OnHardLockToggled() {
+  const bool on = hard_lock_toggle_ && hard_lock_toggle_->GetIsOn();
+  content::MouseMuxInputController::GetInstance()->SetHardLock(on);
+  if (hard_lock_status_label_) {
+    hard_lock_status_label_->SetText(on ? u"On" : u"Off");
+  }
+  LogDebug(std::string("Hard lock: ") + (on ? "ON" : "OFF"));
+  RebuildOwnerList();
+}
 
 void MouseMuxControlDialog::OnNativeInputToggled() {
   bool is_on = native_input_toggle_->GetIsOn();
@@ -764,6 +944,7 @@ void MouseMuxControlDialog::OnConnectionStateChanged(bool connected) {
 void MouseMuxControlDialog::OnCaptureStateChanged(bool captured) {
   is_captured_ = captured;
   UpdateCaptureButton();
+  RebuildOwnerList();
   UpdateTitle();
   LogDebug(std::string("Capture state changed: ") + (captured ? "CAPTURED" : "RELEASED"));
 }
@@ -861,6 +1042,156 @@ void MouseMuxControlDialog::OnHotkeyChanged() {
   }
 }
 
+void MouseMuxControlDialog::RebuildOwnerList() {
+  if (!owner_list_) {
+    return;
+  }
+  owner_list_->RemoveAllChildViews();
+
+  auto owners =
+      content::MouseMuxInputController::GetInstance()->GetOwners();
+
+  if (owners.empty()) {
+    auto* empty = owner_list_->AddChildView(std::make_unique<views::Label>(
+        u"No owners yet — have a user click in a window to claim it.",
+        views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_DISABLED));
+    empty->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    owner_list_->InvalidateLayout();
+    return;
+  }
+
+  for (const auto& owner : owners) {
+    auto* row = owner_list_->AddChildView(std::make_unique<views::View>());
+    auto* layout = row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+        views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), 6));
+    layout->set_cross_axis_alignment(
+        views::BoxLayout::CrossAxisAlignment::kCenter);
+
+    // Name, falling back to the hwid when the SDK user list has not named
+    // this device — an unnamed owner is still an owner and must be operable.
+    std::u16string label_text =
+        owner.name.empty()
+            ? base::ASCIIToUTF16(base::StringPrintf("device 0x%x", owner.hwid))
+            : base::UTF8ToUTF16(owner.name);
+    if (owner.is_primary) {
+      label_text += u" *";
+    }
+    auto* name_label = row->AddChildView(std::make_unique<views::Label>(
+        label_text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    name_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    if (owner.is_primary) {
+      name_label->SetTooltipText(
+          u"Primary owner — the one reported to the control server and the "
+          u"single-owner API.");
+    }
+
+    // Which window this user is working in.
+    std::u16string where =
+        owner.has_window
+            ? (owner.window_title.empty() ? u"(untitled window)"
+                                          : owner.window_title)
+            : u"— not in a window yet";
+    auto* where_label = row->AddChildView(std::make_unique<views::Label>(
+        where, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        owner.has_window ? views::style::STYLE_SECONDARY
+                         : views::style::STYLE_DISABLED));
+    where_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    where_label->SetElideBehavior(gfx::ELIDE_TAIL);
+    layout->SetFlexForView(where_label, 1);
+
+    auto* capture_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
+        base::BindRepeating(&MouseMuxControlDialog::OnOwnerCaptureClicked,
+                            base::Unretained(this), owner.hwid),
+        owner.captured ? u"Release" : u"Capture"));
+    capture_btn->SetMinSize(gfx::Size(76, 28));
+    capture_btn->SetTooltipText(
+        owner.captured
+            ? u"Give this user's mouse back to Windows."
+            : u"Stop this user's device producing native Windows input. "
+              u"Required for several users to work at once.");
+
+    auto* close_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
+        base::BindRepeating(&MouseMuxControlDialog::OnOwnerCloseWindowClicked,
+                            base::Unretained(this), owner.window),
+        u"Close win"));
+    close_btn->SetMinSize(gfx::Size(76, 28));
+    close_btn->SetEnabled(owner.has_window);
+    close_btn->SetTooltipText(u"Close the window this user is working in.");
+
+    auto* release_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
+        base::BindRepeating(&MouseMuxControlDialog::OnOwnerReleaseClicked,
+                            base::Unretained(this), owner.hwid),
+        u"Drop"));
+    release_btn->SetMinSize(gfx::Size(58, 28));
+    release_btn->SetTooltipText(
+        u"Remove this owner. Their device stops driving Chrome until they "
+        u"click to claim again.");
+  }
+  owner_list_->InvalidateLayout();
+}
+
+void MouseMuxControlDialog::OnOwnerCaptureClicked(int hwid) {
+  auto* controller = content::MouseMuxInputController::GetInstance();
+  // Read the current state rather than trusting the button's caption: the
+  // row may have been drawn before the control server changed things.
+  bool captured = false;
+  for (const auto& owner : controller->GetOwners()) {
+    if (owner.hwid == hwid) {
+      captured = owner.captured;
+      break;
+    }
+  }
+  if (captured) {
+    controller->ReleaseCaptureHwid(hwid);
+  } else {
+    controller->CaptureOwnerHwid(hwid);
+    // Capture steals OS focus to this dialog's window; put it back so the
+    // user can type straight away.
+    controller->FocusKeyboardTargetView();
+  }
+  RebuildOwnerList();
+}
+
+void MouseMuxControlDialog::OnOwnerReleaseClicked(int hwid) {
+  // ReleaseOwnerHwid releases capture for this device before dropping it.
+  content::MouseMuxInputController::GetInstance()->ReleaseOwnerHwid(hwid);
+  RebuildOwnerList();
+}
+
+void MouseMuxControlDialog::OnOwnerCloseWindowClicked(
+    gfx::AcceleratedWidget window) {
+  if (!window || !::IsWindow(window)) {
+    return;
+  }
+  // WM_CLOSE, not DestroyWindow: this asks Chrome to close the browser window
+  // through its own path, so beforeunload handlers and session state behave
+  // as they would if the user had clicked the X.
+  ::PostMessage(window, WM_CLOSE, 0, 0);
+}
+
+void MouseMuxControlDialog::OnNewWindowClicked() {
+  // Any existing browser gives us the profile; a window of THIS Chrome is the
+  // whole point, so the profile must match the one already running.
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if (Profile* profile = browser->GetProfile()) {
+      chrome::NewEmptyWindow(profile);
+      return;
+    }
+  }
+  LogDebug("New window: no existing browser to take a profile from");
+}
+
+void MouseMuxControlDialog::OnNewSeatClicked() {
+  // Chrome starts Chrome. launcher.exe existed only to hold a seat mutex for a
+  // browser it could not modify; the browser now holds its own.
+  if (!content::MouseMuxInputController::GetInstance()
+           ->LaunchAdditionalSeat()) {
+    LogDebug("New seat: failed to start (all seats taken, or launch failed)");
+  }
+}
+
 void MouseMuxControlDialog::UpdateCaptureButton() {
   if (capture_button_) {
     // Button enabled only when we have an owner.
@@ -904,6 +1235,7 @@ void MouseMuxControlDialog::OnOwnershipChanged(int hwid, const std::string& name
     release_owner_button_->SetEnabled(hwid != -1);
   }
   UpdateCaptureButton();
+  RebuildOwnerList();
 
   // Update title.
   UpdateTitle();
@@ -917,19 +1249,11 @@ void MouseMuxControlDialog::OnOwnershipChanged(int hwid, const std::string& name
 }
 
 void MouseMuxControlDialog::UpdateTitle() {
-  std::string title;
-  const char* capture_suffix = is_captured_ ? " [CAPTURED]" : "";
-  if (owner_hwid_ == -1) {
-    title = base::StringPrintf("%s (No Owner)", kProductName);
-  } else if (owner_name_.empty()) {
-    title = base::StringPrintf("%s - Owner: 0x%X%s", kProductName, owner_hwid_,
-                               capture_suffix);
-  } else {
-    title = base::StringPrintf("%s - Owner: %s (0x%X)%s", kProductName,
-                               owner_name_.c_str(), owner_hwid_,
-                               capture_suffix);
-  }
-  SetTitle(base::ASCIIToUTF16(title));
+  // The title no longer carries owner or capture state.  Both are per-user
+  // now, and a single title can only ever describe one of them — it would show
+  // the primary owner and quietly misrepresent everyone else.  The owner list
+  // says it properly, one row per user.
+  SetTitle(base::ASCIIToUTF16(std::string(kProductName)));
 
   // Force widget to update title.
   if (GetWidget()) {

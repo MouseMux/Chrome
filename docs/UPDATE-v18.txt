@@ -1,0 +1,181 @@
+MouseMux Chrome Patches v18 - Build #57 - 2026-09-01
+=====================================================
+
+Chromium base: 151.0.7922.77 (unchanged from 2.2.56)
+Client version reported to the SDK: 2.2.57
+
+Several MouseMux users can now work in ONE browser at the same time, each in
+their own window, without disturbing one another. This is the feature release
+that 2.2.56's rebase made room for.
+
+Verified on hardware 2026-09-01: two users, two mice, two keyboards, two
+windows, typing simultaneously, two blinking carets, no crossover.
+
+
+1. WHY THIS EXISTS
+
+   A support case. Four users, four mice and keyboards, four monitors, four
+   Chrome windows - from ONE Chrome profile, because they share a web
+   application and cannot have four separate logins.
+
+   Their symptom: user 1 holds a key and it repeats; user 2 clicks in their own
+   window; user 1's repeat stops dead and they must click again before they can
+   type. That is Windows having a single active window, and Chrome faithfully
+   blurring every window that is not it.
+
+   The existing multi-seat launcher already gave four independent users, but
+   each seat needs its own profile, because Chrome will not start a second
+   browser process against a profile already in use. One shared profile means
+   one process, and one process meant one owner. Hence this work.
+
+
+2. WHAT CHANGED - THE ENGINE
+
+   Per-device state. keyboard_target_view_, drag_target_view_,
+   current_button_state_ and pressed_keys_ were single members - correct while
+   exactly one device could drive Chrome. They are now a DeviceState struct
+   keyed by mouse hwid. A shared keyboard target sent everyone's typing to
+   whichever window was clicked last; shared button state put one user's held
+   button into another's drag; a shared pending-motion slot mixed two cursors'
+   coordinates.
+
+   Keyboard events resolve through keyboard_to_mouse_hwid_ to find the device
+   PAIR a keystroke belongs to. OnKeyboardKey previously accepted any keyboard
+   deliberately, because MouseMux's own hook guarantees only the captured
+   user's keys arrive - true with one owner, false the moment several are
+   captured at once.
+
+   Owner set. owners_ is authoritative. owner_hwid_ survives as the PRIMARY
+   owner so GetOwnerHwid(), the control server's "owner" field and existing
+   automation keep working unchanged.
+
+   Focus - the part that mattered. InjectKeyboardEvent called
+   SetForegroundWindow and view->Focus() on every keystroke. Harmless with one
+   owner; with four, four keystroke streams fighting over one foreground
+   window. Both OS calls are gone. Only host->Focus() remains - a renderer IPC,
+   not an OS call - applied to every registered view. Separate windows are
+   separate WebContents, so nothing arbitrates focus between them and each
+   renderer can be told independently that its page is focused.
+
+   Blur suppression. While captured, a window losing OS focus no longer blurs
+   its view. Nothing is producing native input, so OS focus carries no
+   information, and letting it blur killed the caret of a user still typing -
+   which happened every time the operator clicked the control dialog. Gated on
+   capture, so normal blur behaviour returns untouched when capture is off.
+
+   CAPTURE IS NOW A REQUIREMENT, not a convenience. Native input is what forces
+   Windows to have one active window, and one active window is what makes one
+   user's click extinguish another user's caret. All owners captured, or none
+   of this holds.
+
+
+3. WHAT CHANGED - THE DIALOG
+
+   It is a control centre now. One row per owner: device name, the window that
+   user is typing in, and per-row Capture, Close window and Drop. Bulk
+   "Capture all" and "Drop all" sit in the list header, where they act on the
+   thing directly below them.
+
+   Deliberately not merged into one button: capture stops a device producing
+   native input, dropping removes ownership. Different actions.
+
+   + Window adds a user to THIS browser, sharing cookies and logins. + Seat
+   launches an isolated browser with its own profile and its own dialog. They
+   are not two flavours of one thing, and the README now says so.
+
+   New toggle: "Lock Users To Their Window". Off, a user who clicks another
+   window moves there - which is not a mode, just what routing by hit-test
+   does. On, clicks outside a user's own window are dropped. Cursors still move
+   freely; only clicks are blocked, because a cursor stopping at an invisible
+   boundary reads as broken hardware.
+
+   Context menus. MenuController::GetActiveInstance() is a PROCESS-WIDE
+   singleton and the dismiss callback cancelled it on any mouse-down from any
+   device, so one user clicking closed another user's open menu. The menu is
+   now attributed to the device that opened it, and only that device can close
+   it. KNOWN LIMIT, not fixable here: one active menu per process means two
+   users cannot have two context menus open at once. <select> dropdowns are
+   unaffected - they are popup render views, not menus, and two users can have
+   two open simultaneously.
+
+   The title no longer shows owner or capture state. With several owners it
+   could only ever name one of them and misrepresent the rest.
+
+   Build label. kBuildNumber sat at 54 through the 2.2.55 and 2.2.56 releases,
+   so the dialog reported a build three versions older than the binary it was
+   part of. Worse, "TRACE" had been hardcoded into kBuildDate on 2026-08-04 and
+   left there, so ordinary builds claimed to write input to disk. Both fixed,
+   both now carrying comments saying what they must track.
+
+   Dialog icon 16 -> 24px.
+
+
+4. LAUNCHER REMOVED
+
+   launcher.exe and launch.bat are no longer shipped.
+
+   The launcher existed for one reason: to hold a seat mutex for the lifetime
+   of a browser it could not modify. We can modify the browser, so the browser
+   holds its own seat, and the kernel releases it on any exit including a hard
+   kill - precisely the property the launcher was built to obtain. launcher.c
+   records having tried this ("Having Chrome claim the mutex itself worked");
+   both its objections were about coordinating with a launcher, and there is
+   none now.
+
+   + Seat starts this same executable, picking the lowest free seat itself. The
+   naming matches launcher.c exactly - same FNV-1a hash of the install path,
+   same lock format, same base port and cascade - so an old launcher and a new
+   browser still see each other's seats during an upgrade.
+
+   The control port doubles as the seat number: 52000+N is seat N, claimed at
+   startup, held for the life of the process. A browser started outside that
+   range works normally and occupies no seat.
+
+   launcher/ remains in this repo as reference. It is no longer built or
+   shipped.
+
+   KNOWN RACE: picking a seat requires a probe that releases immediately, so
+   two launches within about a second could choose the same seat. The
+   consequence is benign - identical --user-data-dir means ProcessSingleton
+   hands the second launch to the first and it exits, so the click appears to
+   do nothing. No profile is corrupted.
+
+
+5. COMPILE SWITCHES
+
+   MOUSEMUX_EXPERIMENT_MULTI_OWNER promoted to MOUSEMUX_MULTI_OWNER and moved
+   to the shipped section. The convention in mouse_mux_config.h says an
+   experiment that is on is a contradiction - promote it or turn it off.
+
+   Shipped and on:  AURA_UI_CLICK_THROUGH, NATIVE_BLOCK, PEN_TOUCH_INJECT,
+                    MULTI_OWNER
+   Experiments off: PEN_TOUCH_BLOCK, MULTI_LANGUAGE, NATIVE_BLOCK_HARD,
+                    NC_HANDLING
+   Diagnostics off: DEBUG, DEBUG_TRACE
+
+   Nothing writes input to disk in this build.
+
+
+6. VERIFIED, AND NOT
+
+   Verified on hardware:
+     - two users typing simultaneously in two windows, no crossover
+     - both windows holding blinking carets at once
+     - two <select> dropdowns open simultaneously
+     - clicking the dialog no longer kills anyone's caret
+
+   NOT verified:
+     - "+ Seat" launching without the helper. Built and reasoned through, not
+       yet clicked.
+     - hard lock beyond the basic path
+     - four users. Two were tested; nothing in the design is limited to two,
+       but that is inference, not evidence.
+     - pen and touch, still never run on hardware (unchanged since 2.2.53)
+
+   Known gap, pre-existing and unrelated to this work: keyboard injection maps
+   through US-layout tables, so a non-US keyboard produces wrong punctuation
+   and cannot produce dead-key accents at all. Tracked as
+   MOUSEMUX_EXPERIMENT_MULTI_LANGUAGE. It affects every release so far, not
+   just this one.
+
+   The known-good fallback remains 2.2.55 on Chromium 146.

@@ -56,6 +56,32 @@
 // that does is MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK below.
 #define MOUSEMUX_PEN_TOUCH_INJECT
 
+// Multiple simultaneous owners: several device pairs driving one browser, each
+// in its own window, none able to disturb another.  Everything that used to be
+// a single member — keyboard target, drag target, button state, held keys,
+// pending motion — is per device, and each user's keystrokes follow their own
+// mouse.
+//
+// Two things this required, both non-obvious.  The OS-level focus calls in
+// InjectKeyboardEvent (SetForegroundWindow, view->Focus()) are gone: with one
+// owner they were harmless, with four they were four keystroke streams
+// fighting over one foreground window.  Only host->Focus() remains, a renderer
+// IPC rather than an OS call, applied to every window — separate windows are
+// separate WebContents, so nothing arbitrates focus between them and each
+// renderer can be told independently that its page is focused.  And while
+// captured, a window losing OS focus no longer blurs its view, because
+// otherwise the operator clicking this dialog extinguishes every user's caret.
+//
+// Capture is a hard requirement, not a nicety: native input is what forces
+// Windows to have one active window, and one active window is what makes one
+// user's click kill another user's caret.  All owners captured, or none of
+// this holds.
+//
+// Verified 2026-09-01 on hardware: two users, two mice, two keyboards, two
+// windows, typing simultaneously with two blinking carets and no crossover.
+// Content layer only — not mirrored in the views file.
+#define MOUSEMUX_MULTI_OWNER
+
 // ---------------------------------------------------------------------------
 // EXPERIMENTS — unverified or known-broken.  All OFF.
 // ---------------------------------------------------------------------------
@@ -70,6 +96,21 @@
 // test on is how you ship a build nobody can click out of.
 // Mirrored in the views file.
 // #define MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
+
+// Keyboard layout translation.  InjectKeyboardEvent currently derives the
+// character through ui::UsLayoutKeyboardCodeToDomCode and
+// ui::DomCodeToUsLayoutDomKey — hardcoded US.  Latin letters and digits land
+// correctly because the layouts agree there; punctuation does not, and neither
+// c-cedilla nor any dead-key accent (acute + a -> a-acute) can be produced.
+//
+// With this on the character comes from ToUnicodeEx against a real HKL, using
+// the vkey AND scan code the SDK already sends (both arrive in OnKeyboardKey,
+// and scan is currently only logged).  Dead-key composition state must be held
+// per device rather than left to the Win32 per-thread buffer, or two users
+// mid-accent corrupt each other.
+//
+// OFF: unproven, and untestable without a non-US keyboard.  Content layer only.
+// #define MOUSEMUX_EXPERIMENT_MULTI_LANGUAGE
 
 // Hard mode: on top of MOUSEMUX_NATIVE_BLOCK, also block mouse movement,
 // non-client clicks and keyboard.  WM_SYSKEY* is left through so Alt+F4 still

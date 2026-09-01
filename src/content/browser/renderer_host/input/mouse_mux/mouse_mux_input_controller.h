@@ -14,6 +14,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "base/functional/callback.h"
 #include "base/memory/raw_ptr.h"
@@ -23,6 +24,7 @@
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_client.h"
 #include "content/common/content_export.h"
 #include "third_party/blink/public/common/input/web_input_event.h"
+#include "ui/gfx/native_ui_types.h"
 
 namespace blink {
 // web_input_event.h declares WebInputEvent but not WebMouseEvent, which lives
@@ -60,7 +62,7 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Menu dismiss callback type. Called to dismiss any active context menu
   // before injecting a mouse down event. Implemented by the chrome layer
   // since content cannot depend on ui/views.
-  using MenuDismissCallback = base::RepeatingCallback<void()>;
+  using MenuDismissCallback = base::RepeatingCallback<void(int hwid)>;
 
   // Returns the singleton instance.
   static MouseMuxInputController* GetInstance();
@@ -120,8 +122,12 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Set owner by name (e.g. "user1:mouse1"). Returns false if not found.
   bool SetOwnerByName(const std::string& name);
 
-  // Release current ownership, allowing a new user to claim.
+  // Release ALL ownership, allowing new users to claim.
   void ReleaseOwnership();
+
+  // Release ONE owner, leaving the others working.  This is the dialog's
+  // per-row "drop"; ReleaseOwnership() is the "release all" control.
+  void ReleaseOwnerHwid(int hwid);
 
   // Capture the current owner's mouse (stops it from sending to Windows).
   // Returns true if capture request was sent, false if no owner.
@@ -131,8 +137,72 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Returns true if release request was sent, false if not captured.
   bool ReleaseCapture();
 
-  // Check if owner's mouse is currently captured.
-  bool IsCaptured() const { return is_captured_; }
+  // Check if capture is in effect.  With several owners this answers "is
+  // anyone captured", which is what a single indicator can usefully say —
+  // per-owner state is in GetOwners().
+  bool IsCaptured() const;
+
+  // Capture or release ONE owner, leaving the others alone.  This is what the
+  // dialog's per-owner control uses.  Returns false if the hwid is not an
+  // owner, or is already in the requested state.
+  bool CaptureOwnerHwid(int hwid);
+  bool ReleaseCaptureHwid(int hwid);
+
+  // One row of the dialog's owner list.  Everything the control centre needs
+  // to show a user and act on them, gathered here so the dialog never has to
+  // reach into controller internals — content cannot depend on ui/views, so
+  // this struct is the whole contract between them.
+  struct OwnerInfo {
+    int hwid = -1;
+    std::string name;             // from the SDK user list; may be empty
+    std::u16string window_title;  // toplevel window this user is working in
+    gfx::AcceleratedWidget window = gfx::kNullAcceleratedWidget;
+    bool captured = false;
+    bool is_primary = false;      // the one the single-owner API reports
+    bool has_window = false;      // false until they have clicked somewhere
+  };
+
+  // Every current owner, in hwid order so rows do not jump around between
+  // refreshes.
+  std::vector<OwnerInfo> GetOwners() const;
+
+  // Launches another seat: a separate browser process with its own profile,
+  // control port and dialog.  Picks the lowest free seat itself and starts
+  // this same executable, so no helper program is involved.
+  //
+  // A seat is a PEER, not something this browser manages — it connects to
+  // MouseMux itself and owns its own users.  Use it for isolation (separate
+  // logins, or containing a crash); to add a user to THIS browser, open a
+  // window instead.
+  bool LaunchAdditionalSeat();
+
+  // Hard lock: confine each user to the window they first clicked in.
+  //
+  // Off by default, which is "soft": a user who clicks another window simply
+  // moves there.  That is not a separate mode, it is just what routing by
+  // hit-test does, so there are only two states and this is a plain toggle.
+  //
+  // On, a click that lands outside a user's own window is dropped, giving four
+  // genuinely independent workstations.  A user with no window yet claims the
+  // first one they click, and closing a window frees its user to claim again,
+  // so nobody can be locked out with no way back.
+  void ClaimOwnSeat(int control_port);
+  void SetHardLock(bool enabled);
+  bool IsHardLock() const { return hard_lock_; }
+
+  // Whether |view| should keep renderer page focus even though aura says its
+  // window just lost focus.
+  //
+  // While captured, the OS foreground window is meaningless: every device
+  // producing input has been stopped at the server, so all input arrives by
+  // injection and reaches a view chosen by hit-test, not by OS focus.  Letting
+  // an activation change blur the view would kill the caret of a user who is
+  // still working — which happens every time the operator so much as clicks
+  // the control dialog.
+  //
+  // Deliberately conditioned on capture: with capture off, native input is
+  // live, OS focus means what it always meant, and normal blur must resume.
+  bool ShouldSuppressBlur(RenderWidgetHostViewAura* view) const;
 
   // Focus the keyboard target view's browser window so keyboard injection
   // reaches the renderer.  Called by the dialog after capture starts.
@@ -186,15 +256,18 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Checks if screen coordinates are over any Chrome view.
   bool IsPointOverChrome(float screen_x, float screen_y);
 
-  // Injects a mouse event into the given view.
-  void InjectMouseEvent(RenderWidgetHostViewAura* view,
+  // Injects a mouse event into the given view.  |hwid| is the MOUSE hwid the
+  // event came from and selects which device's state applies.
+  void InjectMouseEvent(int hwid,
+                        RenderWidgetHostViewAura* view,
                         blink::WebInputEvent::Type type,
                         float screen_x,
                         float screen_y,
                         int button_flags);
 
   // Injects mouse event to any available view (for owner who may be outside).
-  void InjectMouseEventToAnyView(blink::WebInputEvent::Type type,
+  void InjectMouseEventToAnyView(int hwid,
+                                 blink::WebInputEvent::Type type,
                                  float screen_x,
                                  float screen_y,
                                  int button_flags);
@@ -228,21 +301,25 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   std::map<int, PenState> pen_state_;
 
   // Stamps pointer_type — and for pen/touch the pressure, tilt and twist
-  // from pen_state_ — onto an event about to be injected, based on the
-  // owner's device subtype from the user list.  Applied to motion AND button
-  // events so contact and movement look like the same pointer to Blink.
-  void ApplyPointerProperties(blink::WebMouseEvent* event);
+  // from pen_state_ — onto an event about to be injected, based on |hwid|'s
+  // device subtype from the user list.  Applied to motion AND button events so
+  // contact and movement look like the same pointer to Blink.
+  void ApplyPointerProperties(int hwid, blink::WebMouseEvent* event);
 #endif
 
-  // Injects a wheel event into the given view.
-  void InjectWheelEvent(RenderWidgetHostViewAura* view,
+  // Injects a wheel event into the given view.  |hwid| is the MOUSE hwid.
+  void InjectWheelEvent(int hwid,
+                        RenderWidgetHostViewAura* view,
                         float screen_x,
                         float screen_y,
                         int delta,
                         bool horizontal = false);
 
-  // Injects a keyboard event into the given view.
-  void InjectKeyboardEvent(RenderWidgetHostViewAura* view,
+  // Injects a keyboard event into the given view.  |hwid| is the MOUSE hwid of
+  // the pair the keystroke belongs to, NOT the keyboard's own hwid: modifier
+  // state is held per device pair, and the caller has already resolved it.
+  void InjectKeyboardEvent(int hwid,
+                           RenderWidgetHostViewAura* view,
                            int vkey,
                            bool is_down);
 
@@ -264,20 +341,104 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Delivers the final throttled position once motion stops.  Without it the
   // last move before the cursor comes to rest is never injected, leaving
-  // hover state up to one throttle interval stale.
+  // hover state up to one throttle interval stale.  Flushes EVERY device that
+  // has motion pending, so one timer serves all of them.
   void FlushPendingMotion();
   base::OneShotTimer motion_flush_timer_;
 
   bool native_input_blocked_ = false;
+
+  // Confine each user to their own window.  See SetHardLock().
+  bool hard_lock_ = false;
   std::unique_ptr<MouseMuxClient> client_;
   std::set<raw_ptr<RenderWidgetHostViewAura>> registered_views_;
 
-  // Button state tracking.
-  int current_button_state_ = 0;
+  // Everything that belongs to ONE device pair.
+  //
+  // All of this used to be single global members, which was correct while
+  // exactly one device could drive Chrome.  With several owners each of them
+  // is per-device or users corrupt each other: a shared keyboard target sends
+  // everyone's typing to whichever window was clicked last, a shared button
+  // state makes one user's held button appear in another's drag, and a shared
+  // pending-motion slot mixes two cursors' coordinates.
+  //
+  // Keyed by MOUSE hwid, which is the identity of a device PAIR — keyboard
+  // events resolve through keyboard_to_mouse_hwid_ first.  A device with no
+  // entry yet is default-constructed on first use by StateFor().
+  struct DeviceState {
+    // The view that received this device's mousedown.  Subsequent
+    // mousemove-during-drag and mouseup must reach the SAME view or selection
+    // and drag break.
+    raw_ptr<RenderWidgetHostViewAura> drag_target_view = nullptr;
 
-  // Owner tracking: the hwid that has claimed ownership by clicking on Chrome.
-  // -1 means no owner yet.
+    // The view this device's keys go to: the one it last clicked in.
+    raw_ptr<RenderWidgetHostViewAura> keyboard_target_view = nullptr;
+
+    // Blink button mask for the buttons this device is holding.
+    int button_state = 0;
+
+    // Which keys this device is holding, for modifier composition.
+    std::set<int> pressed_keys;
+
+    // Motion throttling, per device: two users moving at once would otherwise
+    // overwrite each other's pending position.
+    base::TimeTicks last_motion_inject_time;
+    float pending_motion_x = 0;
+    float pending_motion_y = 0;
+    bool has_pending_motion = false;
+
+    // Whether this device is captured — the server has stopped it producing
+    // native Windows input.  Per device because capture is what allows several
+    // owners to coexist, and the operator may hand it out one user at a time.
+    bool captured = false;
+
+    // The window this device is confined to while hard lock is on.  Claimed by
+    // the device's first click and kept until the window closes.
+    //
+    // A WINDOW, not a view: RenderWidgetHostViewAura is recreated on a
+    // cross-process navigation, so a view pointer would go stale the moment
+    // the user followed a link, and the lock would silently release.
+    gfx::AcceleratedWidget locked_window = gfx::kNullAcceleratedWidget;
+  };
+
+  std::map<int, DeviceState> device_state_;
+
+  // Returns the state for a mouse hwid, creating it if this is the first
+  // event from that device.
+  DeviceState& StateFor(int mouse_hwid);
+
+  // Resolves a KEYBOARD hwid to the mouse hwid of its pair, which is the key
+  // device_state_ uses.  Returns -1 when the pairing is unknown.
+  int MouseHwidForKeyboard(int keyboard_hwid) const;
+
+  // Drops a view from every device's targets — on unregister the pointer is
+  // about to dangle, and it may be the target of several devices at once.
+  void ForgetViewEverywhere(RenderWidgetHostViewAura* view);
+
+  // Owner tracking.
+  //
+  // owners_ is authoritative: every device allowed to drive Chrome.  Without
+  // MOUSEMUX_MULTI_OWNER it never holds more than one entry, so
+  // behaviour is unchanged.
+  //
+  // owner_hwid_ is the PRIMARY owner — the first to claim, and the one the
+  // single-owner API still reports: GetOwnerHwid(), the dialog title, the
+  // control server's "owner" field.  It is always either -1 or a member of
+  // owners_.  Kept because the launcher and external automation depend on that
+  // API, and breaking it to add a feature they do not use would be rude.
+  std::set<int> owners_;
   int owner_hwid_ = -1;
+
+  // The gate every SDK event passes: may this device drive Chrome?
+  bool IsOwner(int hwid) const { return owners_.count(hwid) > 0; }
+  bool HasAnyOwner() const { return !owners_.empty(); }
+
+  // Adds an owner.  With the experiment off this REPLACES any existing owner,
+  // preserving single-owner semantics exactly.
+  void AddOwner(int hwid);
+
+  // Removes one owner, promoting another to primary if the primary left.
+  void RemoveOwner(int hwid);
 
   // Track last known position for each hwid.
   struct UserPosition {
@@ -289,11 +450,8 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Motion event counter for throttled logging.
   int motion_count_ = 0;
 
-  // Motion throttling - limit to ~60fps to avoid flooding UI thread.
-  base::TimeTicks last_motion_inject_time_;
-  float pending_motion_x_ = 0;
-  float pending_motion_y_ = 0;
-  bool has_pending_motion_ = false;
+  // Motion throttling (~60fps, to avoid flooding the UI thread) is per device
+  // now — see DeviceState.
 
   // Debug logging callback.
   DebugLogCallback debug_log_callback_;
@@ -330,20 +488,11 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Keyboard hwid to mouse hwid mapping (for looking up owner).
   std::map<int, int> keyboard_to_mouse_hwid_;
 
-  // Keyboard state tracking - which keys are currently pressed.
-  std::set<int> pressed_keys_;
-
   // Rate-limit user list refresh requests for unknown keyboards.
   base::TimeTicks last_user_list_request_;
 
-  // Drag target view — the view that received mousedown.  All subsequent
-  // mousemove-during-drag and mouseup events must go to this same view
-  // for selection/drag to work correctly.
-  raw_ptr<RenderWidgetHostViewAura> drag_target_view_ = nullptr;
-
-  // Keyboard target view — the view that last received a mousedown click.
-  // Keyboard events are routed to this view (the "focused" content area).
-  raw_ptr<RenderWidgetHostViewAura> keyboard_target_view_ = nullptr;
+  // Held keys, drag target and keyboard target are per device now — see
+  // DeviceState.
 
   // InputRouter pending-state tracking for stuck ACK detection.
   // When the InputRouter has had pending events for too long, we reset it.
