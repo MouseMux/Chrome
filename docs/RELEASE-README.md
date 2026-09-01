@@ -90,11 +90,24 @@ To exit capture mode, press the release hotkey (default: Shift+Escape).
 
 ---
 
-### Starting Chrome — command line
+### Starting Chrome
 
-Chrome is started directly. There is no wrapper: `launcher.exe` and `launch.bat`
-were removed in 2.2.57, because the browser now does both of the jobs they
-existed for.
+**The quick way:** double-click **`start-mousemux-chrome.bat`**. It opens this
+browser with its own profile, in the `user-data` folder beside it, and does not
+touch any Chrome you already have installed. Sign in once there and every user
+shares that session.
+
+Start MouseMux first — and if MouseMux needs a browser launched through it to
+open its input service, do that once and close it again before running this.
+
+That `.bat` is only a shortcut. It runs `chrome.exe` with switches you could
+type yourself, and takes no part in seat tracking. Anything that supplies its
+own command line can ignore it.
+
+`launcher.exe` was removed in 2.2.57: the browser now claims and holds its own
+seat, which is the only thing the launcher ever did.
+
+### Starting Chrome — command line
 
 Minimum needed to bring up a working browser:
 
@@ -266,8 +279,8 @@ For optimal performance, close unused tabs and browser instances when not needed
 ### Getting Started
 
 1. Ensure MouseMux is running — **MouseMux V3 (3.0.x series)**
-2. Start Chrome with `--enable-features=MouseMuxIntegration` (see
-   **Starting Chrome — command line** above)
+2. Run **`start-mousemux-chrome.bat`** — or start `chrome.exe` yourself with
+   `--enable-features=MouseMuxIntegration` (see **Starting Chrome** above)
 3. The MouseMux Control Dialog appears — turn on the **MouseMux** toggle
 4. Press **+ Window** once for each additional user
 5. Each user clicks in their own window to claim it — their name appears in the

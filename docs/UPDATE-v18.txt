@@ -112,7 +112,12 @@ windows, typing simultaneously, two blinking carets, no crossover.
 
 4. LAUNCHER REMOVED
 
-   launcher.exe and launch.bat are no longer shipped.
+   launcher.exe is no longer shipped. The old launch.bat is gone too, replaced
+   by start-mousemux-chrome.bat - a plain convenience shortcut for customers
+   who receive the zip and want something to double-click. It takes no part in
+   seat tracking: it starts chrome.exe with the same switches anyone could type
+   by hand, on seat 1. Deployments that supply their own command line do not
+   need it.
 
    The launcher existed for one reason: to hold a seat mutex for the lifetime
    of a browser it could not modify. We can modify the browser, so the browser
