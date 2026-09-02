@@ -34,8 +34,10 @@
 #include "chrome/browser/ui/browser_commands.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+#include "chrome/browser/ui/tabs/tab_strip_model.h"
 #include "chrome/browser/ui/views/chrome_layout_provider.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
+#include "content/public/browser/web_contents.h"
 #include "ui/base/base_window.h"
 #include "ui/display/screen.h"
 #include "ui/base/metadata/metadata_impl_macros.h"
@@ -111,12 +113,12 @@ class HotkeyComboboxModel : public ui::ComboboxModel {
   }
 };
 
-// Shown in the dialog footer.  MUST track the release version — 2.2.57 is
-// build #57 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
+// Shown in the dialog footer.  MUST track the release version — 2.2.58 is
+// build #58 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
 // 2.2.56 releases, so the dialog reported a build three versions older than the
 // binary it was part of, which makes it impossible to tell by looking whether
 // someone is running what you think they are.
-constexpr int kBuildNumber = 57;
+constexpr int kBuildNumber = 58;
 
 // Product name, used for the window title.  The build number lives in the
 // footer with the build date rather than the title, which should read as a
@@ -141,7 +143,11 @@ constexpr int kLogFlushThreshold = 5;
 const char kLogFilePath[] = MOUSEMUX_DEBUG_LOG_PATH;
 #else
 constexpr int kDialogWidth = 560;
-constexpr int kDialogHeight = 400;
+// One line taller than 2.2.57 for the keyboard note under the owner list.
+// The note hides itself when there is nothing to report, so the extra room is
+// only needed some of the time, but a dialog that changes height as users
+// type reads as broken.
+constexpr int kDialogHeight = 424;
 
 // Collapsed strip: no title bar, no close button, no build footer — just the
 // icon and one button, so it can be much smaller than the dialog.
@@ -151,7 +157,7 @@ constexpr int kCollapsedHeight = 52;
 // so ordinary builds claimed to be trace builds that log input to disk.  The
 // trace warning belongs in kProductName above, where it is #ifdef-guarded and
 // cannot lie.  Do not put build flavour in this string.
-const char kBuildDate[] = "2026-09-01";
+const char kBuildDate[] = "2026-09-02";
 #endif
 
 constexpr int kSpacing = 12;
@@ -713,6 +719,17 @@ void MouseMuxControlDialog::SetupContents() {
   owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
       views::BoxLayout::Orientation::kVertical, gfx::Insets(), 2));
 
+  // Where typing actually went, or why it went nowhere.  The rows above say
+  // where each user is WORKING; this says where their KEYS landed, and the
+  // two differ exactly when something is misconfigured -- which is the case
+  // nobody can otherwise diagnose from the outside.
+  keyboard_note_label_ = AddChildView(std::make_unique<views::Label>(
+      std::u16string(), views::style::CONTEXT_DIALOG_BODY_TEXT,
+      views::style::STYLE_SECONDARY));
+  keyboard_note_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  keyboard_note_label_->SetElideBehavior(gfx::ELIDE_TAIL);
+  keyboard_note_label_->SetVisible(false);
+
   // Hand out a window.  Two buttons because they are genuinely different
   // things: a window of THIS Chrome shares cookies and logins with the other
   // users, a seat is its own process and profile and shares nothing.
@@ -735,8 +752,9 @@ void MouseMuxControlDialog::SetupContents() {
           u"+ Window"));
   new_window_button->SetMinSize(gfx::Size(110, 32));
   new_window_button->SetTooltipText(
-      u"Open another window of THIS Chrome, sharing cookies and logins with "
-      u"the other users. Have the next user click in it to claim it.");
+      u"Copy the current tab into another window of THIS Chrome -- already "
+      u"signed in, sharing the same session as the other users. Have the "
+      u"next user click in it to claim it.");
 
   auto* new_seat_button = handout_row->AddChildView(
       std::make_unique<views::MdTextButton>(
@@ -1057,6 +1075,11 @@ void MouseMuxControlDialog::RebuildOwnerList() {
         views::style::CONTEXT_DIALOG_BODY_TEXT,
         views::style::STYLE_DISABLED));
     empty->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    // Nobody owns anything, so any routing note left over from the last
+    // session of use describes people who are no longer here.
+    if (keyboard_note_label_) {
+      keyboard_note_label_->SetVisible(false);
+    }
     owner_list_->InvalidateLayout();
     return;
   }
@@ -1101,6 +1124,38 @@ void MouseMuxControlDialog::RebuildOwnerList() {
     where_label->SetElideBehavior(gfx::ELIDE_TAIL);
     layout->SetFlexForView(where_label, 1);
 
+    // The keyboard MouseMux has attached to this user.  A user with a mouse
+    // and no keyboard still owns a window and looks perfectly healthy in
+    // every other column, but their typing cannot be told from anyone
+    // else's -- so it is called out here rather than left to be deduced.
+    std::u16string kb_text;
+    int kb_style = views::style::STYLE_SECONDARY;
+    if (owner.keyboard_hwid == 0) {
+      kb_text = u"no keyboard";
+      kb_style = views::style::STYLE_PRIMARY;
+    } else if (owner.keyboard_typed) {
+      kb_text = base::ASCIIToUTF16(
+                    base::StringPrintf("kb 0x%x", owner.keyboard_hwid)) +
+                u" \u2713";
+    } else {
+      kb_text = base::ASCIIToUTF16(
+          base::StringPrintf("kb 0x%x", owner.keyboard_hwid));
+    }
+    auto* kb_label = row->AddChildView(std::make_unique<views::Label>(
+        kb_text, views::style::CONTEXT_DIALOG_BODY_TEXT, kb_style));
+    kb_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    kb_label->SetTooltipText(
+        owner.keyboard_hwid == 0
+            ? u"MouseMux has no keyboard on this user. Give this user a "
+              u"mouse AND a keyboard in MouseMux -- until then their "
+              u"keystrokes cannot be told from anyone else's, and with "
+              u"several users they are ignored rather than typed into "
+              u"somebody else's window."
+            : (owner.keyboard_typed
+                   ? u"This user's keyboard, and it has typed."
+                   : u"This user's keyboard. Nothing has arrived from it "
+                     u"yet."));
+
     auto* capture_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
         base::BindRepeating(&MouseMuxControlDialog::OnOwnerCaptureClicked,
                             base::Unretained(this), owner.hwid),
@@ -1129,7 +1184,80 @@ void MouseMuxControlDialog::RebuildOwnerList() {
         u"Remove this owner. Their device stops driving Chrome until they "
         u"click to claim again.");
   }
+  UpdateKeyboardNote();
   owner_list_->InvalidateLayout();
+}
+
+void MouseMuxControlDialog::UpdateKeyboardNote() {
+  if (!keyboard_note_label_) {
+    return;
+  }
+  const auto owners =
+      content::MouseMuxInputController::GetInstance()->GetOwners();
+
+  // A missing pairing outranks anything else this line could say: it is the
+  // cause, and the routing underneath it would only be the symptom.
+  bool missing_keyboard = false;
+  for (const auto& owner : owners) {
+    if (owner.keyboard_hwid == 0) {
+      missing_keyboard = true;
+      break;
+    }
+  }
+  if (missing_keyboard) {
+    keyboard_note_label_->SetText(
+        u"\u26a0 A user above has no keyboard. In MouseMux, give every user "
+        u"a mouse AND a keyboard, or their typing cannot be routed.");
+    keyboard_note_label_->SetVisible(true);
+    return;
+  }
+
+  auto routes =
+      content::MouseMuxInputController::GetInstance()->GetKeyRoutes();
+  if (routes.empty()) {
+    keyboard_note_label_->SetVisible(false);
+    return;
+  }
+
+  // Name the destination by the user it belongs to, not by hwid: this line is
+  // read next to a list of names.
+  std::u16string text = u"Typing: ";
+  bool first = true;
+  for (const auto& route : routes) {
+    if (!first) {
+      text += u"  \u00b7  ";
+    }
+    first = false;
+
+    std::u16string who;
+    for (const auto& owner : owners) {
+      if (owner.keyboard_hwid == route.keyboard_hwid) {
+        who = owner.name.empty()
+                  ? base::ASCIIToUTF16(
+                        base::StringPrintf("0x%x", route.keyboard_hwid))
+                  : base::UTF8ToUTF16(owner.name);
+        break;
+      }
+    }
+    if (who.empty()) {
+      who = base::ASCIIToUTF16(
+          base::StringPrintf("kb 0x%x", route.keyboard_hwid));
+    }
+
+    text += who;
+    if (route.dropped) {
+      text += u" \u2192 ignored (keyboard not assigned to a user)";
+    } else {
+      text += u" \u2192 ";
+      text += route.window_title.empty() ? std::u16string(u"(untitled window)")
+                                         : route.window_title;
+    }
+    if (route.count > 1) {
+      text += base::ASCIIToUTF16(base::StringPrintf(" x%d", route.count));
+    }
+  }
+  keyboard_note_label_->SetText(text);
+  keyboard_note_label_->SetVisible(true);
 }
 
 void MouseMuxControlDialog::OnOwnerCaptureClicked(int hwid) {
@@ -1172,15 +1300,72 @@ void MouseMuxControlDialog::OnOwnerCloseWindowClicked(
 }
 
 void MouseMuxControlDialog::OnNewWindowClicked() {
-  // Any existing browser gives us the profile; a window of THIS Chrome is the
-  // whole point, so the profile must match the one already running.
+  // Hand out a window that is ALREADY SIGNED IN, by duplicating the current
+  // tab and moving the copy out -- not by opening a blank one.
+  //
+  // A blank window shares less than it appears to.  Cookies come from the
+  // profile, so most sites carry over, but session storage belongs to the
+  // TAB, and a web app that keeps its token there sees a new window as a new
+  // sign-in.  On a site that permits one session at a time -- which is the
+  // case this product exists for -- that new sign-in ends everybody else's.
+  //
+  // Duplicating clones the tab's session storage, exactly as Chrome's own
+  // "Duplicate tab" does, and moving the duplicate to a new window carries
+  // the live page across without a reload.  This is the manual dance
+  // (duplicate, then drag the tab out) in one click, and it is the only way
+  // to hand somebody a window that is genuinely already authenticated.
+  //
+  // The source is the FIRST browser window, deliberately, rather than the
+  // most recently active one: with everyone captured nothing is activating
+  // windows at all, so activation order is stale, while the first window is
+  // the one the operator signed in to before handing any out.
+  BrowserWindowInterface* source = nullptr;
   for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
-    if (Profile* profile = browser->GetProfile()) {
-      chrome::NewEmptyWindow(profile);
-      return;
+    if (browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+        browser->GetTabStripModel() &&
+        browser->GetTabStripModel()->active_index() != TabStripModel::kNoTab) {
+      source = browser;
+      break;
     }
   }
-  LogDebug("New window: no existing browser to take a profile from");
+  if (!source) {
+    // Nothing to copy from -- first run, or every window already closed.
+    for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+      if (Profile* profile = browser->GetProfile()) {
+        chrome::NewEmptyWindow(profile);
+        return;
+      }
+    }
+    LogDebug("New window: no existing browser to take a profile from");
+    return;
+  }
+
+  TabStripModel* model = source->GetTabStripModel();
+  const int index = model->active_index();
+  if (!chrome::CanDuplicateTabAt(source, index)) {
+    // Some tabs cannot be duplicated -- a crashed one, for instance.  A blank
+    // window is not what was asked for, but it is still a window.
+    chrome::NewEmptyWindow(source->GetProfile());
+    return;
+  }
+
+  content::WebContents* duplicate = chrome::DuplicateTabAt(source, index);
+  if (!duplicate) {
+    chrome::NewEmptyWindow(source->GetProfile());
+    return;
+  }
+
+  // Find the copy by identity rather than by assuming where it landed:
+  // pinning and tab groups both move it.
+  const int duplicate_index = model->GetIndexOfWebContents(duplicate);
+  if (duplicate_index == TabStripModel::kNoTab ||
+      !chrome::CanMoveTabsToNewWindow(source, {duplicate_index})) {
+    // The duplicate exists and is signed in where it is; leaving it as a tab
+    // loses nothing, and the operator can still drag it out by hand.
+    LogDebug("New window: duplicated tab could not be moved out");
+    return;
+  }
+  chrome::MoveTabsToNewWindow(source, {duplicate_index});
 }
 
 void MouseMuxControlDialog::OnNewSeatClicked() {

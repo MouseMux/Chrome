@@ -162,11 +162,42 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     bool captured = false;
     bool is_primary = false;      // the one the single-owner API reports
     bool has_window = false;      // false until they have clicked somewhere
+
+    // Which keyboard MouseMux has attached to this user, and whether anything
+    // has ever arrived from it.
+    //
+    // A user with a mouse but no keyboard is the single most common
+    // misconfiguration behind "everybody's typing lands in one window":
+    // MouseMux detects the keyboard and it types perfectly well, but until it
+    // is assigned to the same USER as the mouse there is nothing to route by.
+    // Nothing else in the product shows that, so it shows here.
+    int keyboard_hwid = 0;        // 0 = no keyboard on this user
+    bool keyboard_typed = false;  // a keystroke has arrived from it
   };
 
   // Every current owner, in hwid order so rows do not jump around between
   // refreshes.
   std::vector<OwnerInfo> GetOwners() const;
+
+  // Where recent keystrokes WENT — never what they were.  Nothing recorded
+  // here identifies a key, which is why it can stay on in release builds
+  // where per-key logging must not.
+  //
+  // It exists because a keyboard reaching the wrong window is otherwise
+  // invisible: the owner list says where each user is WORKING, and that is
+  // the same thing as where their typing lands only when the pairing is
+  // right.  When it is not, this is the difference between a bug report and
+  // a diagnosis.
+  struct KeyRoute {
+    int keyboard_hwid = 0;
+    int mouse_hwid = -1;          // -1 when the keyboard could not be paired
+    std::u16string window_title;  // empty when nothing was delivered
+    bool dropped = false;
+    int count = 1;                // identical consecutive routes, collapsed
+  };
+
+  // Most recent last.  Bounded by kMaxKeyRoutes.
+  std::vector<KeyRoute> GetKeyRoutes() const;
 
   // Launches another seat: a separate browser process with its own profile,
   // control port and dialog.  Picks the lowest free seat itself and starts
@@ -284,13 +315,30 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
                                    float screen_y,
                                    int button_flags);
 
+  // The toplevel Chrome window under the given screen point, chosen by Win32
+  // Z-order so the topmost one wins.  Null when the point is over nothing of
+  // ours.
+  //
+  // Split out from DispatchToAuraHost because the ANSWER is needed before the
+  // click is sent: the window a click lands in decides whether the hard lock
+  // allows it and which window that user's keyboard should follow, and both
+  // of those have to be settled first.
+  gfx::AcceleratedWidget FindAuraTargetWindow(float screen_x, float screen_y);
+
   // Dispatches a click through the aura event system when no web content view
   // is under the cursor, so Chrome UI (tabs, popups, etc.) can receive it.
-  void DispatchToAuraHost(blink::WebInputEvent::Type type,
+  void DispatchToAuraHost(gfx::AcceleratedWidget target,
+                          blink::WebInputEvent::Type type,
                           float screen_x,
                           float screen_y,
                           int button_flags);
 #endif
+
+  // A registered web content view living in |window|, or null.  Used to give
+  // a keyboard somewhere to go when its user clicked on Chrome's own UI
+  // rather than on a page.
+  RenderWidgetHostViewAura* WebViewInWindow(
+      gfx::AcceleratedWidget window) const;
 
 #ifdef MOUSEMUX_PEN_TOUCH_INJECT
   // Most recent pen/touch metadata per hwid, from pointer.pen.notify.M2A.
@@ -511,6 +559,19 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Rate-limit user list refresh requests for unknown keyboards.
   base::TimeTicks last_user_list_request_;
+
+  // Keyboard hwids that have delivered at least one keystroke.  Read by
+  // GetOwners() to tell "no keyboard assigned" from "assigned but silent" —
+  // different faults with different fixes, and indistinguishable without it.
+  std::set<int> keyboards_seen_;
+
+  // Keyboard routing history for the dialog — see KeyRoute.
+  static constexpr size_t kMaxKeyRoutes = 6;
+  std::vector<KeyRoute> key_routes_;
+  void RecordKeyRoute(int keyboard_hwid,
+                      int mouse_hwid,
+                      const std::u16string& window_title,
+                      bool dropped);
 
   // Held keys, drag target and keyboard target are per device now — see
   // DeviceState.

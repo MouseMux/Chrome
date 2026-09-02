@@ -111,6 +111,13 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // rebuilding avoids diffing rows against devices coming and going.
   void RebuildOwnerList();
 
+  // Fills in the line under the owner list — see keyboard_note_label_.
+  // Takes no owner list, and asks the controller for its own: this header
+  // deliberately does not include the controller's, so it cannot name
+  // OwnerInfo, and pulling that header in here would rebuild all of
+  // chrome/browser/ui on every controller edit.
+  void UpdateKeyboardNote();
+
   // Per-owner row actions.  |hwid| identifies the owner; |window| is captured
   // when the row is built, so a row acts on the window that owner was working
   // in at that moment.
@@ -118,8 +125,9 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   void OnOwnerReleaseClicked(int hwid);
   void OnOwnerCloseWindowClicked(gfx::AcceleratedWidget window);
 
-  // Hand out a window: same profile (a window of THIS Chrome, sharing cookies
-  // and logins) or a new seat (own process and profile, via launcher.exe).
+  // Hand out a window: a copy of the current tab in another window of THIS
+  // Chrome, already signed in and sharing the session, or a new seat — its
+  // own process and profile, started by this executable, sharing nothing.
   void OnNewWindowClicked();
   void OnNewSeatClicked();
 
@@ -151,6 +159,10 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   // Container the per-owner rows are rebuilt into.
   raw_ptr<views::View> owner_list_ = nullptr;
+
+  // One line under the owner list: either a warning that a user has no
+  // keyboard assigned in MouseMux, or where recent typing actually went.
+  raw_ptr<views::Label> keyboard_note_label_ = nullptr;
 
   // Owners' window titles change as they browse, and nothing notifies us when
   // a user clicks into a different window, so the list is refreshed on a

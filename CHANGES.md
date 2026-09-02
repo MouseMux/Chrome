@@ -3,7 +3,7 @@
 This document details all modifications made to Chromium source files. For new files (the `mouse_mux/` directories), simply copy them into your Chromium checkout. For modified files, apply the changes described below.
 
 **Base Chromium Version**: 151.0.7922.77
-**Patch Version**: 2.2.57
+**Patch Version**: 2.2.58
 
 > **The authoritative file list is [`docs/CHROMIUM_VERSION.md`](docs/CHROMIUM_VERSION.md).**
 > It splits the patch into files that are new (safe to copy wholesale) and
@@ -11,8 +11,8 @@ This document details all modifications made to Chromium source files. For new f
 > bump), and says what each edit does. Sections further down this document
 > date from 2.2.46 and no longer list everything.
 >
-> Changelog for this version: [`docs/UPDATE-v18.txt`](docs/UPDATE-v18.txt).
-> Previous version (2.2.56, same Chromium): [`docs/UPDATE-v17.txt`](docs/UPDATE-v17.txt).
+> Changelog for this version: [`docs/UPDATE-v19.txt`](docs/UPDATE-v19.txt).
+> Previous version (2.2.57, same Chromium): [`docs/UPDATE-v18.txt`](docs/UPDATE-v18.txt).
 
 ---
 

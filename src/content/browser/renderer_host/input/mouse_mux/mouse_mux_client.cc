@@ -40,7 +40,7 @@ constexpr size_t kMaxIncomingMessageSize = 64 * 1024;  // 64KB max message
 // SDK protocol this client was written against and is deliberately NOT bumped
 // alongside it: raising it would claim support for a protocol revision nobody
 // has verified against this code.
-constexpr char kClientVersion[] = "2.2.57";
+constexpr char kClientVersion[] = "2.2.58";
 constexpr char kSdkVersion[] = "2.2.35";
 constexpr char kBuildDate[] = "2026-08-31";
 

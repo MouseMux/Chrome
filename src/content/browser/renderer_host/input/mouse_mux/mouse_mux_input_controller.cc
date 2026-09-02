@@ -434,6 +434,21 @@ gfx::AcceleratedWidget ToplevelWindowOf(RenderWidgetHostViewAura* view) {
   return toplevel->GetHost()->GetAcceleratedWidget();
 }
 
+// The title of the window a view lives in, for the operator to read.  Empty
+// when the view has no window yet, which reads better in the dialog than a
+// placeholder would.
+std::u16string ToplevelTitleOf(RenderWidgetHostViewAura* view) {
+  if (!view) {
+    return std::u16string();
+  }
+  aura::Window* native = view->GetNativeView();
+  if (!native) {
+    return std::u16string();
+  }
+  aura::Window* toplevel = native->GetToplevelWindow();
+  return toplevel ? toplevel->GetTitle() : std::u16string();
+}
+
 }  // namespace
 
 void MouseMuxInputController::ClaimOwnSeat(int control_port) {
@@ -548,7 +563,10 @@ MouseMuxInputController::GetOwners() const {
     auto user_it = user_info_.find(hwid);
     if (user_it != user_info_.end()) {
       info.name = user_it->second.name;
+      info.keyboard_hwid = user_it->second.hwid_keyboard;
     }
+    info.keyboard_typed = info.keyboard_hwid != 0 &&
+                          keyboards_seen_.count(info.keyboard_hwid) > 0;
 
     auto state_it = device_state_.find(hwid);
     if (state_it != device_state_.end()) {
@@ -572,6 +590,45 @@ MouseMuxInputController::GetOwners() const {
     out.push_back(std::move(info));
   }
   return out;
+}
+
+RenderWidgetHostViewAura* MouseMuxInputController::WebViewInWindow(
+    gfx::AcceleratedWidget window) const {
+  if (!window) {
+    return nullptr;
+  }
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    if (view && ToplevelWindowOf(view) == window) {
+      return view;
+    }
+  }
+  return nullptr;
+}
+
+std::vector<MouseMuxInputController::KeyRoute>
+MouseMuxInputController::GetKeyRoutes() const {
+  return key_routes_;
+}
+
+void MouseMuxInputController::RecordKeyRoute(int keyboard_hwid,
+                                             int mouse_hwid,
+                                             const std::u16string& title,
+                                             bool dropped) {
+  // Collapse repeats.  A sentence of typing is ONE routing decision taken a
+  // hundred times, and a list that shows it a hundred times shows nothing —
+  // the count is the useful part, not the repetition.
+  if (!key_routes_.empty()) {
+    KeyRoute& last = key_routes_.back();
+    if (last.keyboard_hwid == keyboard_hwid && last.mouse_hwid == mouse_hwid &&
+        last.dropped == dropped && last.window_title == title) {
+      ++last.count;
+      return;
+    }
+  }
+  key_routes_.push_back({keyboard_hwid, mouse_hwid, title, dropped, 1});
+  if (key_routes_.size() > kMaxKeyRoutes) {
+    key_routes_.erase(key_routes_.begin());
+  }
 }
 
 bool MouseMuxInputController::CaptureOwner() {
@@ -1343,6 +1400,7 @@ void MouseMuxInputController::OnUserDisposed(int hwid_mouse, int hwid_keyboard) 
 
   // Remove from keyboard mapping.
   keyboard_to_mouse_hwid_.erase(hwid_keyboard);
+  keyboards_seen_.erase(hwid_keyboard);
 }
 
 void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
@@ -1377,12 +1435,66 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
   // Unknown pairing falls back to the owner, preserving the old behaviour for
   // a single user and for keyboards the user list has not described yet.
   int pair_hwid = MouseHwidForKeyboard(hwid);
+  bool deliverable = true;
   if (pair_hwid == -1) {
-    pair_hwid = owner_hwid_;
+    // No user in the SDK's list holds this keyboard.  In practice that means
+    // it was never assigned to a user in MouseMux: it is detected, it types,
+    // and it belongs to nobody.  No routing rule here can invent the pairing.
+    //
+    // Ask the server again — cheaply, and rarely — in case the operator has
+    // just fixed it.  user.changed normally tells us, but a mapping made
+    // before we connected, or one the server does not announce, would
+    // otherwise never be noticed while the browser stays up.
+    const base::TimeTicks now = base::TimeTicks::Now();
+    if (client_ && (last_user_list_request_.is_null() ||
+                    now - last_user_list_request_ > base::Seconds(5))) {
+      last_user_list_request_ = now;
+      client_->RequestUserList();
+    }
+
+    if (owners_.size() > 1) {
+      // Several owners, and nothing says which one typed.  Handing the
+      // keystroke to the primary owner was right when there was one owner and
+      // therefore one possible destination; with several it types into a
+      // COLLEAGUE'S window, which destroys their work rather than merely
+      // losing a keystroke.  Refuse to guess, and let the dialog say so.
+      //
+      // The keystroke is still tracked below under the keyboard's own hwid —
+      // device hwids are unique across mice and keyboards, so it cannot
+      // collide with a pair's state — so held keys stay consistent and the
+      // release hotkey, which is the way out of capture, keeps working from
+      // any keyboard including this one.
+      pair_hwid = hwid;
+      deliverable = false;
+    } else {
+      pair_hwid = owner_hwid_;
+    }
 #ifdef MOUSEMUX_DEBUG
     LogDebug(base::StringPrintf(
-        "KEY UNPAIRED: kb_hwid=0x%x not in user list, falling back to "
-        "owner=0x%x", hwid, owner_hwid_));
+        "KEY UNPAIRED: kb_hwid=0x%x not in user list, %s", hwid,
+        deliverable ? "falling back to owner" : "dropped (several owners)"));
+#endif
+  }
+  keyboards_seen_.insert(hwid);
+
+  // A keyboard whose user does not own a window does not drive Chrome.
+  //
+  // Mouse events have always been gated on ownership; keyboard events never
+  // were, and deliberately so: with one owner, MouseMux's own hook meant only
+  // the captured user's keys could reach us, so there was nothing to gate.
+  // Capture several users at once and every keyboard arrives, including ones
+  // belonging to people who have not claimed a window — and those have
+  // nowhere of their own to go.
+  //
+  // Only with several owners.  With one, an unowned keyboard typing into the
+  // single window is the long-standing single-user behaviour and still what
+  // somebody sitting down at the machine expects.
+  if (deliverable && owners_.size() > 1 && !IsOwner(pair_hwid)) {
+    deliverable = false;
+#ifdef MOUSEMUX_DEBUG
+    LogDebug(base::StringPrintf(
+        "KEY NOT AN OWNER: kb_hwid=0x%x pairs to 0x%x, which owns no window",
+        hwid, pair_hwid));
 #endif
   }
 
@@ -1466,6 +1578,16 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
     }
   }
 
+  // A keystroke that could not be attributed goes no further.  It has been
+  // tracked and offered to the hotkey; delivering it anywhere now would be a
+  // guess at whose window it belongs in.
+  if (!deliverable) {
+    if (is_down) {
+      RecordKeyRoute(hwid, -1, std::u16string(), true);
+    }
+    return;
+  }
+
   // Inject the keyboard event.
   if (registered_views_.empty()) {
     LogDebug("KEY INJECT FAILED: No views registered!");
@@ -1479,9 +1601,19 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
   if (kb_state.keyboard_target_view &&
       registered_views_.count(kb_state.keyboard_target_view)) {
     view = kb_state.keyboard_target_view;
+  } else if (owners_.size() > 1) {
+    // This device has not claimed a window yet, and with several users there
+    // is no harmless guess: the first showing view belongs to one of the
+    // others, so falling back to it types this user's keys into a colleague's
+    // page.  Their row in the dialog says "not in a window yet"; a click
+    // fixes it.
+    if (is_down) {
+      RecordKeyRoute(hwid, pair_hwid, std::u16string(), true);
+    }
+    return;
   } else {
-    // No target yet — this device has not clicked anywhere. Fall back to the
-    // first showing view, then any view, as before.
+    // Single user: the old fallback, which is safe because there is only one
+    // place the keystroke could go.  First showing view, then any view.
     for (RenderWidgetHostViewAura* v : registered_views_) {
       if (v && v->IsShowing()) {
         view = v;
@@ -1497,6 +1629,9 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
       "KEY INJECT -> view=%p views_total=%zu",
       static_cast<void*>(view), registered_views_.size()));
 #endif
+  if (is_down) {
+    RecordKeyRoute(hwid, pair_hwid, ToplevelTitleOf(view), false);
+  }
   InjectKeyboardEvent(pair_hwid, view, vkey, scan, is_down);
 }
 
@@ -1929,7 +2064,44 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
     // the aura event system so Chrome UI (tabs, toolbar, etc.) can respond.
     if (type == blink::WebInputEvent::Type::kMouseDown ||
         type == blink::WebInputEvent::Type::kMouseUp) {
-      DispatchToAuraHost(type, screen_x, screen_y, button_flags);
+      const gfx::AcceleratedWidget target =
+          FindAuraTargetWindow(screen_x, screen_y);
+      if (!target) {
+        return;
+      }
+
+      // The hard lock has to hold here too.  A click on another user's tab
+      // strip, toolbar or bookmark bar is still a click in their window, and
+      // this path — anything that is not page content — was the one way
+      // round it.
+      if (hard_lock_) {
+        if (state.locked_window && !::IsWindow(state.locked_window)) {
+          state.locked_window = gfx::kNullAcceleratedWidget;
+        }
+        if (!state.locked_window) {
+          state.locked_window = target;
+        } else if (target != state.locked_window) {
+          MMTRACE("CTRL/HardLock",
+                  "DROPPED hwid=%d clicked outside its window (chrome UI)",
+                  hwid);
+          return;
+        }
+      }
+
+      // Clicking a tab, the toolbar or a blank strip of a window is how
+      // people pick a window up, and until now it did not tell that user's
+      // KEYBOARD anything: only clicks that landed on page content set a
+      // keyboard target.  So a user whose first click was on Chrome's own UI
+      // had no target at all, and their typing fell through to whichever
+      // view happened to be first in the list — which, with several users,
+      // is somebody else's window.
+      if (type == blink::WebInputEvent::Type::kMouseDown) {
+        if (RenderWidgetHostViewAura* web_view = WebViewInWindow(target)) {
+          state.keyboard_target_view = web_view;
+        }
+      }
+
+      DispatchToAuraHost(target, type, screen_x, screen_y, button_flags);
     }
 #else
     if (type == blink::WebInputEvent::Type::kMouseDown ||
@@ -2076,7 +2248,59 @@ bool MouseMuxInputController::TryDispatchToOverlayWindow(
   return true;
 }
 
+gfx::AcceleratedWidget MouseMuxInputController::FindAuraTargetWindow(
+    float screen_x,
+    float screen_y) {
+  // Enumerate ALL aura WindowTreeHosts and collect visible ones at the point.
+  aura::Env* env = aura::Env::GetInstance();
+  if (!env) {
+    DiagLog("FindAuraTargetWindow: no aura::Env");
+    return gfx::kNullAcceleratedWidget;
+  }
+
+  gfx::Point screen_pt(static_cast<int>(screen_x), static_cast<int>(screen_y));
+  const auto& hosts = env->window_tree_hosts();
+
+  // Collect candidate HWNDs that contain the point and are visible.
+  std::map<HWND, aura::WindowTreeHost*> candidates;
+  for (aura::WindowTreeHost* host : hosts) {
+    if (!host) continue;
+    HWND hwnd = host->GetAcceleratedWidget();
+    if (!hwnd || !::IsWindowVisible(hwnd)) continue;
+#ifdef MOUSEMUX_EXPERIMENT_NC_HANDLING
+    // Use GetWindowRect (full window including title bar) not
+    // GetBoundsInPixels (client area only) so title bar clicks match.
+    RECT win_rect;
+    if (!::GetWindowRect(hwnd, &win_rect)) continue;
+    POINT pt = {screen_pt.x(), screen_pt.y()};
+    if (!::PtInRect(&win_rect, pt)) continue;
+#else
+    gfx::Rect bounds = host->GetBoundsInPixels();
+    if (!bounds.Contains(screen_pt)) continue;
+#endif
+    candidates[hwnd] = host;
+  }
+
+  if (candidates.empty()) {
+    DiagLog("FindAuraTargetWindow: NO HOST MATCHED");
+    return gfx::kNullAcceleratedWidget;
+  }
+
+  // Walk Win32 Z-order (top to bottom) to find the topmost candidate.
+  HWND current = ::GetTopWindow(nullptr);
+  while (current) {
+    if (candidates.count(current)) {
+      return current;
+    }
+    current = ::GetNextWindow(current, GW_HWNDNEXT);
+  }
+
+  // Fallback — pick any candidate.
+  return candidates.begin()->first;
+}
+
 void MouseMuxInputController::DispatchToAuraHost(
+    gfx::AcceleratedWidget target,
     blink::WebInputEvent::Type type,
     float screen_x,
     float screen_y,
@@ -2105,59 +2329,8 @@ void MouseMuxInputController::DispatchToAuraHost(
   }
   if (!msg) return;
 
-  // Enumerate ALL aura WindowTreeHosts and collect visible ones at the point.
-  aura::Env* env = aura::Env::GetInstance();
-  if (!env) {
-    DiagLog("DispatchToAuraHost: no aura::Env");
-    return;
-  }
-
-  gfx::Point screen_pt(static_cast<int>(screen_x), static_cast<int>(screen_y));
-
-  const auto& hosts = env->window_tree_hosts();
-  DiagLog(base::StringPrintf(
-      "DispatchToAuraHost: screen(%.0f,%.0f) msg=0x%x hosts=%zu",
-      screen_x, screen_y, msg, hosts.size()));
-
-  // Collect candidate HWNDs that contain the point and are visible.
-  std::map<HWND, aura::WindowTreeHost*> candidates;
-  for (aura::WindowTreeHost* host : hosts) {
-    if (!host) continue;
-    HWND hwnd = host->GetAcceleratedWidget();
-    if (!hwnd || !::IsWindowVisible(hwnd)) continue;
-#ifdef MOUSEMUX_EXPERIMENT_NC_HANDLING
-    // Use GetWindowRect (full window including title bar) not
-    // GetBoundsInPixels (client area only) so title bar clicks match.
-    RECT win_rect;
-    if (!::GetWindowRect(hwnd, &win_rect)) continue;
-    POINT pt = {screen_pt.x(), screen_pt.y()};
-    if (!::PtInRect(&win_rect, pt)) continue;
-#else
-    gfx::Rect bounds = host->GetBoundsInPixels();
-    if (!bounds.Contains(screen_pt)) continue;
-#endif
-    candidates[hwnd] = host;
-  }
-
-  if (candidates.empty()) {
-    DiagLog("DispatchToAuraHost: NO HOST MATCHED");
-    return;
-  }
-
-  // Walk Win32 Z-order (top to bottom) to find the topmost candidate.
-  HWND target_hwnd = nullptr;
-  HWND current = ::GetTopWindow(nullptr);
-  while (current) {
-    if (candidates.count(current)) {
-      target_hwnd = current;
-      break;
-    }
-    current = ::GetNextWindow(current, GW_HWNDNEXT);
-  }
-  if (!target_hwnd) {
-    // Fallback — pick any candidate.
-    target_hwnd = candidates.begin()->first;
-  }
+  HWND target_hwnd = target;
+  if (!target_hwnd) return;
 
   POINT client_pt = {static_cast<LONG>(screen_x), static_cast<LONG>(screen_y)};
   ::ScreenToClient(target_hwnd, &client_pt);
