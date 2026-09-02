@@ -58,6 +58,7 @@ constexpr char kTypeUserCreate[] = "user.create.notify.M2A";
 constexpr char kTypeUserDispose[] = "user.dispose.notify.M2A";
 constexpr char kTypeUserChanged[] = "user.changed.notify.M2A";
 constexpr char kTypeKeyboardKey[] = "keyboard.key.notify.M2A";
+constexpr char kTypeServerInfo[] = "server.info.notify.M2A";
 constexpr char kTypePing[] = "server.ping.notify.M2A";
 constexpr char kTypeServerShutdown[] = "server.shutdown.notify.M2A";
 constexpr char kTypeTimeoutWarning[] = "server.timeout.warning.notify.M2A";
@@ -593,6 +594,24 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
                               horizontal);
       }
     }
+    return;
+  }
+
+  // The server introduces itself on connect.  Stored rather than acted on:
+  // the dialog shows the version so a support conversation can start from
+  // what is actually running instead of what somebody remembers installing.
+  if (*type == kTypeServerInfo) {
+    if (const std::string* v = dict.FindString("version")) {
+      server_version_ = *v;
+    }
+    if (const std::string* p = dict.FindString("protocol_version")) {
+      server_protocol_version_ = *p;
+    }
+    if (const std::string* n = dict.FindString("notice")) {
+      server_notice_ = *n;
+    }
+    LogDebug("Server: MouseMux " + server_version_ + " (protocol " +
+             server_protocol_version_ + ")");
     return;
   }
 

@@ -173,13 +173,44 @@ void MouseMuxInputController::ForgetViewEverywhere(
     RenderWidgetHostViewAura* view) {
   // A view can be the target of several devices at once, so this must clear
   // ALL of them rather than stopping at the first match.
+  //
+  // Two different events arrive here looking identical: a tab closing, and a
+  // whole window closing.  They deserve opposite treatment - the first should
+  // leave that person working in their window, the second should hand their
+  // seat back - and the only thing that tells them apart is whether any web
+  // view is left in the window they claimed.
+  std::vector<int> orphaned;
   for (auto& [hwid, state] : device_state_) {
     if (state.drag_target_view == view) {
       state.drag_target_view = nullptr;
     }
-    if (state.keyboard_target_view == view) {
-      state.keyboard_target_view = nullptr;
+    if (state.keyboard_target_view != view) {
+      continue;
     }
+    state.keyboard_target_view = nullptr;
+
+    if (RenderWidgetHostViewAura* survivor =
+            OtherWebViewInWindow(state.claimed_window, view)) {
+      // A tab went, the window stayed: keep this user where they are, on
+      // whatever is left of it.
+      state.keyboard_target_view = survivor;
+      continue;
+    }
+    orphaned.push_back(hwid);
+  }
+
+  // Released after the loop: releasing an owner mutates owners_ and notifies
+  // the dialog, neither of which is safe while walking device_state_.
+  for (int hwid : orphaned) {
+    if (!IsOwner(hwid)) {
+      continue;
+    }
+    LogDebug(base::StringPrintf(
+        "Window closed - releasing owner 0x%x", hwid));
+    ReleaseOwnerHwid(hwid);
+    DeviceState& state = StateFor(hwid);
+    state.claimed_window = gfx::kNullAcceleratedWidget;
+    state.locked_window = gfx::kNullAcceleratedWidget;
   }
 }
 
@@ -434,6 +465,44 @@ gfx::AcceleratedWidget ToplevelWindowOf(RenderWidgetHostViewAura* view) {
   return toplevel->GetHost()->GetAcceleratedWidget();
 }
 
+// Which monitor a window is on, as WINDOWS numbers them - the number in
+// Display Settings, which is the only one an operator can act on.
+//
+// The obvious approach, indexing into display::Screen::GetAllDisplays(), gives
+// a position in an arbitrarily ordered list: it reported "Screen 2" for a
+// window plainly sitting on screen 1.  The device name Windows attaches to the
+// monitor ("\\.\\DISPLAY2") carries the real number.
+//
+// Returns 0 when there is only one monitor, which is when the number is noise
+// rather than information.
+int ScreenNumberOf(gfx::AcceleratedWidget window) {
+  if (!window || !::IsWindow(window) || ::GetSystemMetrics(SM_CMONITORS) < 2) {
+    return 0;
+  }
+  HMONITOR monitor = ::MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  if (!monitor) {
+    return 0;
+  }
+  MONITORINFOEXW info = {};
+  info.cbSize = sizeof(info);
+  if (!::GetMonitorInfoW(monitor, &info)) {
+    return 0;
+  }
+  // "\\.\\DISPLAY3" -> 3.  Read from the end: the digits are the only part
+  // that varies, and the prefix is not worth parsing.
+  std::wstring device(info.szDevice);
+  size_t digits = device.find_last_not_of(L"0123456789");
+  if (digits == std::wstring::npos || digits + 1 >= device.size()) {
+    return 0;
+  }
+  int number = 0;
+  if (!base::StringToInt(base::WideToUTF8(device.substr(digits + 1)),
+                         &number)) {
+    return 0;
+  }
+  return number;
+}
+
 // The title of the window a view lives in, for the operator to read.  Empty
 // when the view has no window yet, which reads better in the dialog than a
 // placeholder would.
@@ -446,7 +515,39 @@ std::u16string ToplevelTitleOf(RenderWidgetHostViewAura* view) {
     return std::u16string();
   }
   aura::Window* toplevel = native->GetToplevelWindow();
-  return toplevel ? toplevel->GetTitle() : std::u16string();
+  if (!toplevel) {
+    return std::u16string();
+  }
+
+  std::u16string title = toplevel->GetTitle();
+  if (!title.empty()) {
+    return title;
+  }
+
+  // Browser windows leave the aura title empty - Chrome puts the page name on
+  // the native window instead - so every row read "(untitled window)" and the
+  // column that should say which page a user is on said nothing.  The Win32
+  // caption is what the taskbar shows, and it is never empty.
+  aura::WindowTreeHost* host = toplevel->GetHost();
+  if (!host) {
+    return title;
+  }
+  HWND hwnd = host->GetAcceleratedWidget();
+  if (!hwnd || !::IsWindow(hwnd)) {
+    return title;
+  }
+  const int length = ::GetWindowTextLengthW(hwnd);
+  if (length <= 0) {
+    return title;
+  }
+  std::wstring caption(static_cast<size_t>(length) + 1, L'\0');
+  const int copied = ::GetWindowTextW(hwnd, caption.data(),
+                                      static_cast<int>(caption.size()));
+  if (copied <= 0) {
+    return title;
+  }
+  caption.resize(static_cast<size_t>(copied));
+  return base::WideToUTF16(caption);
 }
 
 }  // namespace
@@ -578,11 +679,16 @@ MouseMuxInputController::GetOwners() const {
       if (view && registered_views_.count(view)) {
         if (aura::Window* native = view->GetNativeView()) {
           if (aura::Window* toplevel = native->GetToplevelWindow()) {
-            info.window_title = toplevel->GetTitle();
+            // Through the helper, which falls back to the Win32 caption: a
+            // browser window's aura title is empty, and reading it directly
+            // here is why every row still said "(untitled window)" after the
+            // fallback was written.  One title function, not two.
+            info.window_title = ToplevelTitleOf(view);
             info.has_window = true;
             if (aura::WindowTreeHost* host = toplevel->GetHost()) {
               info.window = host->GetAcceleratedWidget();
             }
+            info.screen_index = ScreenNumberOf(info.window);
           }
         }
       }
@@ -590,6 +696,23 @@ MouseMuxInputController::GetOwners() const {
     out.push_back(std::move(info));
   }
   return out;
+}
+
+RenderWidgetHostViewAura* MouseMuxInputController::OtherWebViewInWindow(
+    gfx::AcceleratedWidget window,
+    RenderWidgetHostViewAura* except) const {
+  if (!window || !::IsWindow(window)) {
+    return nullptr;
+  }
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    if (!view || view == except) {
+      continue;
+    }
+    if (ToplevelWindowOf(view) == window) {
+      return view;
+    }
+  }
+  return nullptr;
 }
 
 RenderWidgetHostViewAura* MouseMuxInputController::WebViewInWindow(
@@ -881,6 +1004,19 @@ void MouseMuxInputController::SetMouseMuxEnabled(bool enabled) {
 
 bool MouseMuxInputController::IsMouseMuxEnabled() const {
   return client_ && client_->IsConnected();
+}
+
+void MouseMuxInputController::SetDiagnosticsCallback(
+    DiagnosticsCallback callback) {
+  diagnostics_callback_ = std::move(callback);
+}
+
+std::string MouseMuxInputController::GetDialogDiagnostics() const {
+  return diagnostics_callback_ ? diagnostics_callback_.Run() : std::string();
+}
+
+std::string MouseMuxInputController::GetServerVersion() const {
+  return client_ ? client_->server_version() : std::string();
 }
 
 void MouseMuxInputController::RegisterView(RenderWidgetHostViewAura* view) {
@@ -2098,6 +2234,7 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
       if (type == blink::WebInputEvent::Type::kMouseDown) {
         if (RenderWidgetHostViewAura* web_view = WebViewInWindow(target)) {
           state.keyboard_target_view = web_view;
+          state.claimed_window = target;
         }
       }
 
@@ -2142,6 +2279,7 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
     state.drag_target_view = view;
     // This device's keyboard follows its own click — not every device's.
     state.keyboard_target_view = view;
+    state.claimed_window = ToplevelWindowOf(view);
   } else if (type == blink::WebInputEvent::Type::kMouseUp &&
              state.button_state == 0) {
     state.drag_target_view = nullptr;

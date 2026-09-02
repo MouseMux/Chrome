@@ -147,6 +147,21 @@ class CONTENT_EXPORT MouseMuxClient
   // Request user list from server.
   void RequestUserList();
 
+  // What the server said about itself when we connected.
+  //
+  // MouseMux sends server.info.notify.M2A immediately on connect, ahead of the
+  // login ACK, carrying its own version and the protocol version it speaks.
+  // We had been discarding it, which left the dialog unable to say WHICH
+  // MouseMux it was talking to - the first question in any support case.
+  //
+  // Empty until that message arrives, a few milliseconds after the connection
+  // opens, so read it again rather than once.
+  const std::string& server_version() const { return server_version_; }
+  const std::string& server_protocol_version() const {
+    return server_protocol_version_;
+  }
+  const std::string& server_notice() const { return server_notice_; }
+
   // Capture a pointer device (prevents it from sending to Windows).
   void SendCaptureRequest(int hwid);
 
@@ -191,6 +206,11 @@ class CONTENT_EXPORT MouseMuxClient
   void OnMojoPipeDisconnect();
   void ClosePipe();
   void ParseAndDispatchMessage(const std::vector<uint8_t>& data);
+
+  // Reported by the server on connect - see server_version().
+  std::string server_version_;
+  std::string server_protocol_version_;
+  std::string server_notice_;
   void LogDebug(const std::string& message);
 
   State state_ = State::kInitialized;

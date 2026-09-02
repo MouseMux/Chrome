@@ -204,6 +204,10 @@ void MouseMuxControlServer::HandleStatus(int connection_id) {
   status.Set("connected", connected);
   status.Set("blocked", controller_->IsNativeInputBlocked());
   status.Set("captured", controller_->IsCaptured());
+  const std::string diagnostics = controller_->GetDialogDiagnostics();
+  if (!diagnostics.empty()) {
+    status.Set("dialog", diagnostics);
+  }
   status.Set("visible", controller_->IsDialogVisible());
 
   int owner_hwid = controller_->GetOwnerHwid();

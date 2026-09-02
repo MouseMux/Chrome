@@ -5,8 +5,8 @@ Chromium base: 151.0.7922.77 (unchanged from 2.2.57)
 Client version reported to the SDK: 2.2.58
 
 A field report on 2.2.57 from a customer running two users found two things
-wrong, both of them real. This release is those two fixes and the diagnostics
-that should have been there to catch the first one.
+wrong, both of them real. Fixing them turned into a rebuild of the control
+dialog, because the diagnosis needed information the dialog had never shown.
 
 
 1. KEYBOARDS REACHING THE WRONG WINDOW
@@ -17,11 +17,10 @@ that should have been there to catch the first one.
    Two independent causes, either of which produces exactly that.
 
    THE PAIRING MAY NOT EXIST. Every keystroke arrives carrying a KEYBOARD
-   hwid, and all per-user state is keyed by MOUSE hwid, so the first thing
-   OnKeyboardKey does is translate one to the other through
-   keyboard_to_mouse_hwid_ - built from the SDK user list, from users that
-   hold both a pointer and a keyboard. A user with a pointer alone produces no
-   entry, and the lookup fails.
+   hwid, and all per-user state is keyed by MOUSE hwid, so OnKeyboardKey
+   translates one to the other through keyboard_to_mouse_hwid_ - built from
+   the SDK user list, from users that hold both a pointer and a keyboard. A
+   user with a pointer alone produces no entry, and the lookup fails.
 
    The old fallback handed those keystrokes to owner_hwid_, the primary owner.
    That was correct while one device could drive Chrome: one owner, one
@@ -41,56 +40,26 @@ that should have been there to catch the first one.
 
    An unpaired keystroke also re-requests the user list, at most once every
    five seconds, so a pairing made in MouseMux while the browser is running is
-   picked up rather than waiting for a restart. That finally uses
-   last_user_list_request_, which had been declared and never referenced.
+   picked up rather than waiting for a restart.
 
    THE CLAIM MAY NOT HAVE REACHED THE KEYBOARD. A click only set
-   keyboard_target_view if it landed on page content. FindViewAtPoint finds
-   web views; a click on a tab, the address bar, the toolbar or a bookmark
-   goes down the aura path and returns before the line that follows a click
-   with the keyboard.
-
-   So a user whose first click landed on Chrome's own interface owned a window
-   as far as the mouse was concerned and had no keyboard target at all - and
-   fell through to "first showing view", which is a std::set iteration order,
-   which is the earliest window, which is the first user again. Same symptom,
-   entirely different mechanism, and the more likely of the two for anyone
-   whose MouseMux configuration is correct.
+   keyboard_target_view if it landed on page content. A click on a tab, the
+   address bar or a bookmark goes down the aura path and returned before the
+   line that follows a click with the keyboard - so a user whose first click
+   was on Chrome's own interface owned a window as far as the mouse was
+   concerned and had no keyboard target at all. Their typing fell through to
+   "first showing view", which is the earliest window, which is the first user
+   again.
 
    DispatchToAuraHost is now split: FindAuraTargetWindow() decides which
-   toplevel window the click is in, DispatchToAuraHost() posts to it. The
-   answer is needed before the click is sent, because two things depend on it.
-   A mousedown there now claims that window for the device's keyboard, so
-   clicking a tab picks a window up exactly as clicking the page does.
-
-   And the hard lock applies on that path too. A click on another user's tab
-   strip or toolbar is still a click in their window; this path was the way
-   around the lock.
-
-   The remaining unclaimed-keyboard fallback - a device that has genuinely not
-   clicked anywhere - now drops with several owners rather than choosing
-   somebody's window for them. Their row already says "not in a window yet".
+   toplevel window the click is in, DispatchToAuraHost() posts to it. A
+   mousedown there claims that window for the device's keyboard, so clicking a
+   tab picks a window up exactly as clicking the page does. The hard lock
+   applies on that path too - a click on another user's tab strip is still a
+   click in their window, and this path was the way around the lock.
 
 
-2. DIAGNOSTICS, BECAUSE THE FIRST OF THOSE WAS INVISIBLE
-
-   Neither cause can be seen from outside the browser, and the owner list made
-   it worse by looking healthy: it showed where each user was WORKING, which
-   is the same thing as where their typing lands only when the routing is
-   right.
-
-   Each owner row now shows the keyboard MouseMux has attached to that user -
-   "no keyboard" when there is none, a tick once it has typed - and one line
-   under the list shows where recent keystrokes actually went, window by
-   window, or that they were ignored and why.
-
-   Routing decisions only. No key codes, nothing that identifies a keystroke,
-   which is why it stays on in release builds where per-key logging must not.
-   Six entries, identical consecutive routes collapsed with a count, because a
-   sentence of typing is one decision taken a hundred times.
-
-
-3. "+ WINDOW" NOW HANDS OUT A SIGNED-IN WINDOW
+2. "+ WINDOW" NOW HANDS OUT A SIGNED-IN WINDOW
 
    Reported as: sign in, press + Window, and the new window is signed out.
    Signing in there ends the first session, on a site that permits one.
@@ -106,46 +75,122 @@ that should have been there to catch the first one.
    namespace, and moving the tab carries the live WebContents across without a
    reload.
 
-   Source is the first normal browser window, deliberately, not the most
-   recently active one: under capture nothing is activating windows, so
-   activation order is stale, while the first window is the one the operator
-   signed in to. The copy is located by identity rather than by index, since
-   pinning and tab groups move it. A tab that cannot be duplicated - a crashed
-   one - still gets a blank window rather than nothing.
-
    CONSEQUENCE: sign in BEFORE handing windows out. A copy can only carry a
    session that already exists, and every handed-out window opens on whatever
-   page the first window is showing. The README and the getting-started steps
-   now say so.
-
-   The copy reloads the page rather than photographing it, so state held only
-   in the page's memory is not carried across. The session is.
+   page the first window is showing.
 
 
-4. DOCUMENTATION
+3. THE DIALOG
 
-   README rewritten in three places that were describing the product as it was
-   two versions ago.
+   Neither fault above was visible from outside the browser, and the owner
+   list made it worse by looking healthy: it showed where each user was
+   WORKING, which is the same thing as where their typing lands only when the
+   routing is right.
 
-   "Windows and seats" replaces "Adding users, and adding seats" and leads
-   with the question that actually decides it - should these people share a
-   login - then explains what + Window copies and why signing in comes first.
+   Each row now carries a status dot (green captured, amber claimed but not
+   captured, red no keyboard), the keyboard MouseMux has attached to that
+   user, and which SCREEN they are on - by the number Windows uses, read from
+   the monitor's device name, because indexing into the display list gives an
+   arbitrary order that reported "Screen 2" for a window on screen 1. A line
+   under the list shows where recent keystrokes actually landed. Routing
+   decisions only, no key codes, so it stays on in release builds.
 
-   "Technical Details" claimed each user gets isolated cookies and history.
-   That is what SEATS do and the opposite of what windows do, so it was
-   actively misleading anyone choosing between them. Rewritten around device
-   pairs, why capture is required, and a shared/not-shared table.
+   Three panes - connection, users, options - because the dialog covers three
+   unrelated subjects and ran them together in one column of identical
+   toggles. Connection is a status line, a green indicator and one button.
+   Capture became a per-row checkbox, which is a state rather than an action
+   and frees "Release" to mean what it should: hand the window back. The old
+   "Drop" is that Release; the big capture-everything button is gone.
 
-   "Privacy and session management" had the same inversion and now says
-   plainly that windows of one browser are not private from each other by
-   design.
+   + Window and + Seat moved into the users heading. They used to share a row
+   with the hotkey dropdown, which took the width and left both buttons
+   elided; a minimum size cannot save a row whose total minimum exceeds the
+   dialog.
+
+   Everything greys out while disconnected, since none of it can do anything.
+   Closing the dialog now closes the seat - the windows it hands out have no
+   controls of their own, so leaving it closed with users captured strands
+   everybody - and the button says Quit rather than Close.
+
+   A Help window: white, scrollable, its own frame, covering every control and
+   the order to do things in. It is exempt from native input blocking like the
+   control dialog, or it would open and refuse every click including its own.
+
+   Reports the MouseMux version it is connected to. The server has always sent
+   server.info.notify.M2A on connect, carrying its version and protocol
+   version; we were discarding it.
 
 
-5. NOT FIXED, AND KNOWN
+4. THE LIST, AT SCALE
 
-   - Mouse wheel: a report that the wheel does not scroll. Not reproduced and
-     not diagnosed; nothing in this release touches the wheel path.
-   - Four users still untested. Two work.
-   - Pen and touch still never run on hardware.
+   The user list scrolls, and rows are updated in place rather than rebuilt.
+
+   Both come from the same bug. The list was a plain view given whatever
+   vertical space was left over, and when that was not enough BoxLayout did
+   not overflow - it squeezed the last child. With two users the second row
+   was SIX pixels tall: its labels were clipped away by the row's own bounds,
+   while its checkbox and buttons, which are layer-backed for their ink drops,
+   carried on being composited. Half a row appeared, and the half that
+   vanished was the half naming the user.
+
+   That took four attempts to find, three of them aimed at painting, because
+   from the outside it looked like a repaint problem - moving the window fixed
+   it. The dialog now reports its own view tree through the control server
+   (bounds, visibility, text, per cell), which turned it into one query.
+
+   A scroll view cannot squeeze anybody, so rows always get their height and
+   the list scrolls past about seven. And since the refresh runs every second,
+   rebuilding the rows only when the SET of users changes matters at
+   sixteen or twenty-four people: a title changing as somebody browses used to
+   rewrite every view in the list. It now writes into the labels already
+   there, which also means the tooltip under the operator's pointer survives.
+
+   Controller callbacks post the rebuild rather than running it inline. A
+   rebuild on the injected-input stack drew only part of what it built; the
+   same rebuild as its own task drew correctly every time.
+
+
+5. COMPILE SWITCHES
+
+   Unchanged from 2.2.57.
+
+   Shipped and on:  AURA_UI_CLICK_THROUGH, NATIVE_BLOCK, PEN_TOUCH_INJECT,
+                    MULTI_OWNER, KEYBOARD_LAYOUT
+   Experiments off: PEN_TOUCH_BLOCK, NATIVE_BLOCK_HARD, NC_HANDLING
+   Diagnostics off: DEBUG, DEBUG_TRACE
+
+   Nothing writes input to disk in this build. The view-tree diagnostics go
+   over the control server on request and contain no input.
+
+
+6. UPSTREAM FILES TOUCHED
+
+   ui/views/window/dialog_delegate.h now befriends MouseMuxHelpDialog as well
+   as MouseMuxControlDialog. DialogDelegateView's constructor is friends-only
+   and WidgetDelegateView's has the same pattern, so a second dialog of ours
+   has no other way to exist. That list carries a "DO NOT ADD TO THIS LIST"
+   comment upstream; we are now two entries into it, and both need
+   re-applying on a Chromium bump.
+
+   ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc gained a
+   second exempt window handle, for the help window.
+
+
+7. VERIFIED, AND NOT
+
+   Verified on hardware:
+     - two users, two mice, two keyboards, typing simultaneously
+     - a claim filling its row immediately, which is what half of this
+       release was about
+     - screen numbers matching Windows' own numbering
+     - the window title column showing the page each user is on
+
+   NOT verified:
+     - more than two users. The list is built for sixteen to twenty-four and
+       nothing in the routing is limited to two, but that is inference.
+     - pen and touch, still never run on hardware (unchanged since 2.2.53)
+     - the mouse wheel, reported as not scrolling and not yet diagnosed;
+       nothing in this release touches the wheel path
+     - layouts other than US and ABNT2
 
    The known-good fallback remains 2.2.55 on Chromium 146.

@@ -170,6 +170,7 @@ class AccountSelectionModalView;
 
 namespace mouse_mux {
 class MouseMuxControlDialog;
+class MouseMuxHelpDialog;
 }
 
 namespace views {
@@ -842,6 +843,7 @@ class VIEWS_EXPORT DialogDelegateView : public DialogDelegate, public View {
   friend class ::web_app::LaunchAppUserChoiceDialogView;
   friend class ::webid::AccountSelectionModalView;
   friend class ::mouse_mux::MouseMuxControlDialog;
+  friend class ::mouse_mux::MouseMuxHelpDialog;
 
   DialogDelegateView();
 

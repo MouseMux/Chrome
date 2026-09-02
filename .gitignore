@@ -1,0 +1,4 @@
+# The release package folder is kept local: it holds the shipped images and
+# the MouseMux app manifest, which are large binaries and product assets
+# rather than source. See docs/RELEASE-PACKAGE.md.
+package/

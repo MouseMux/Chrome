@@ -133,6 +133,9 @@ static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
 namespace content {
 bool g_mousemux_native_input_blocked = false;
 HWND g_mousemux_dialog_hwnd = nullptr;  // Exempt from native blocking.
+// The help window, likewise: it is one of ours, the operator drives it with a
+// real mouse, and a help window nobody can click is worse than no help window.
+HWND g_mousemux_help_hwnd = nullptr;
 }  // namespace content
 #endif
 
@@ -1468,7 +1471,8 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
   // When native input is blocked, drop native mouse button messages so
   // only SDK custom messages (WM_MOUSEMUX_*) reach the views UI.
   if (content::g_mousemux_native_input_blocked &&
-      GetAcceleratedWidget() != content::g_mousemux_dialog_hwnd) {
+      GetAcceleratedWidget() != content::g_mousemux_dialog_hwnd &&
+      GetAcceleratedWidget() != content::g_mousemux_help_hwnd) {
     switch (message) {
       // Client-area mouse buttons.
       case WM_LBUTTONDOWN: case WM_LBUTTONUP:

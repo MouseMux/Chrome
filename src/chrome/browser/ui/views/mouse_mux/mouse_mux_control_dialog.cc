@@ -31,6 +31,8 @@
 #include "base/process/launch.h"
 #include "base/strings/utf_string_conversions.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/lifetime/application_lifetime.h"
+#include "chrome/browser/lifetime/browser_shutdown.h"
 #include "chrome/browser/ui/browser_commands.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
@@ -43,12 +45,18 @@
 #include "ui/base/metadata/metadata_impl_macros.h"
 #include "ui/base/mojom/dialog_button.mojom.h"
 #include "ui/gfx/font_list.h"
+#include "ui/color/color_id.h"
+#include "ui/compositor/compositor.h"
+#include "ui/views/background.h"
 #include "ui/views/border.h"
 #include "ui/views/controls/button/md_text_button.h"
+#include "ui/views/controls/button/checkbox.h"
 #include "ui/views/controls/button/toggle_button.h"
 #include "ui/views/controls/combobox/combobox.h"
 #include "ui/views/controls/image_view.h"
 #include "ui/views/controls/label.h"
+#include "ui/views/controls/label.h"
+#include "ui/views/controls/scroll_view.h"
 #include "ui/views/window/non_client_view.h"
 #ifdef MOUSEMUX_DEBUG
 #include "ui/views/controls/textarea/textarea.h"
@@ -56,6 +64,8 @@
 #include "ui/aura/window.h"
 #include "ui/aura/window_tree_host.h"
 #include "ui/views/controls/menu/menu_controller.h"
+#include "ui/views/layout/table_layout.h"
+#include "ui/views/view_utils.h"
 #include "ui/views/layout/box_layout.h"
 #include "ui/views/widget/widget.h"
 #include "ui/base/models/combobox_model.h"
@@ -63,6 +73,7 @@
 #ifdef MOUSEMUX_NATIVE_BLOCK
 namespace content {
 extern HWND g_mousemux_dialog_hwnd;
+extern HWND g_mousemux_help_hwnd;
 }
 #endif
 
@@ -142,12 +153,20 @@ constexpr int kDialogHeight = 500;
 constexpr int kLogFlushThreshold = 5;
 const char kLogFilePath[] = MOUSEMUX_DEBUG_LOG_PATH;
 #else
-constexpr int kDialogWidth = 560;
-// One line taller than 2.2.57 for the keyboard note under the owner list.
-// The note hides itself when there is nothing to report, so the extra room is
-// only needed some of the time, but a dialog that changes height as users
-// type reads as broken.
-constexpr int kDialogHeight = 424;
+// Wider than it was: the screen-and-page column is the one an operator
+// actually reads, and at 560 the fixed columns and three row controls left it
+// about 120px, so it elided to "(un...".
+constexpr int kDialogWidth = 660;
+// Measured, not guessed: the contents view comes out about 84px shorter than
+// this, because the frame's button row is taken out of it.  At 424 everything
+// was already at its minimum height with nothing left over, which is how the
+// user list ended up 42px tall holding two rows.
+constexpr int kDialogHeight = 520;
+
+// How much of the list is shown before it scrolls.  Four users fit; a fifth
+// scrolls rather than squeezing everybody.
+constexpr int kListMinHeight = 40;
+constexpr int kListMaxHeight = 240;
 
 // Collapsed strip: no title bar, no close button, no build footer — just the
 // icon and one button, so it can be much smaller than the dialog.
@@ -162,6 +181,37 @@ const char kBuildDate[] = "2026-09-02";
 
 constexpr int kSpacing = 12;
 constexpr int kToggleSpacing = 8;
+
+// One button height in the whole dialog.  Five different heights were most of
+// what made this look like several dialogs stacked on top of each other, and
+// with the big action button gone there is nothing left that earns its own.
+constexpr int kRowButtonHeight = 28;
+
+// Panes.  The dialog covers three unrelated things - the connection, the
+// people, and settings that apply to everybody - and running them together in
+// one column was most of why it read as a list of switches with no shape.  A
+// hairline box around each says where one subject ends and the next begins
+// without adding chrome that competes with the content.
+constexpr int kPaneRadius = 6;
+
+// The help window.  Wide enough for a readable line, tall enough to show a
+// section and a bit of the next, which is what tells a reader to scroll.
+constexpr int kHelpWidth = 520;
+constexpr int kHelpHeight = 460;
+constexpr int kPanePadding = 10;
+
+// Row status dot.  Green: captured and working.  Amber: an owner, but not
+// captured, so the rest of the machinery does not hold for them.  Red:
+// something is wrong that they cannot see themselves - no keyboard assigned.
+constexpr SkColor kDotOk = SkColorSetRGB(0x1E, 0x8E, 0x3E);
+constexpr SkColor kDotIdle = SkColorSetRGB(0xF2, 0x99, 0x00);
+constexpr SkColor kDotBad = SkColorSetRGB(0xD9, 0x30, 0x25);
+
+// The connection indicator, in the same green as a working user so the two
+// read as one language.  Grey rather than red when disconnected: not being
+// connected yet is a starting state, not a fault.
+constexpr SkColor kLedOff = SkColorSetRGB(0x9A, 0xA0, 0xA6);
+
 
 }  // namespace
 
@@ -191,7 +241,335 @@ gfx::ImageSkia LoadAppIcon(int size) {
   return gfx::ImageSkia::CreateFromBitmap(bitmap, 1.0f);
 }
 
+// What a row displays, in one place.
+//
+// The row is built once and then updated in place for the rest of its life, so
+// every one of these has two callers.  Written as free functions rather than
+// duplicated in both: the two drifting apart would show as a row that says one
+// thing when it appears and another a second later.
+namespace row_text {
+
+SkColor DotColor(const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.keyboard_hwid == 0) {
+    return kDotBad;
+  }
+  return owner.captured ? kDotOk : kDotIdle;
+}
+
+std::u16string DotTip(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.keyboard_hwid == 0) {
+    return u"No keyboard assigned to this user in MouseMux. Their typing "
+           u"cannot be told from anyone else's.";
+  }
+  return owner.captured
+             ? std::u16string(u"Captured and working.")
+             : std::u16string(u"Claimed a window, but not captured. Tick "
+                              u"Capture on this row.");
+}
+
+std::u16string Name(const content::MouseMuxInputController::OwnerInfo& owner) {
+  // An unnamed owner is still an owner and must be operable.
+  return owner.name.empty()
+             ? base::ASCIIToUTF16(
+                   base::StringPrintf("device 0x%x", owner.hwid))
+             : base::UTF8ToUTF16(owner.name);
+}
+
+std::u16string Keyboard(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.keyboard_hwid == 0) {
+    return u"no keyboard";
+  }
+  std::u16string text = base::ASCIIToUTF16(
+      base::StringPrintf("kb 0x%x", owner.keyboard_hwid));
+  if (owner.keyboard_typed) {
+    text += u" \u2713";
+  }
+  return text;
+}
+
+int KeyboardStyle(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  return owner.keyboard_hwid == 0 ? views::style::STYLE_PRIMARY
+                                  : views::style::STYLE_SECONDARY;
+}
+
+std::u16string KeyboardTip(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.keyboard_hwid == 0) {
+    return u"MouseMux has no keyboard on this user. Give this user a mouse "
+           u"AND a keyboard in MouseMux \u2014 until then their keystrokes "
+           u"cannot be told from anyone else's, and with several users they "
+           u"are ignored rather than typed into somebody else's window.";
+  }
+  return owner.keyboard_typed
+             ? std::u16string(u"This user's keyboard, and it has typed.")
+             : std::u16string(u"This user's keyboard. Nothing has arrived "
+                              u"from it yet.");
+}
+
+// The screen leads, because on a desk of several monitors that is how an
+// operator identifies a person, and because a window title changes as they
+// browse while a screen does not.
+std::u16string Where(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (!owner.has_window) {
+    return u"\u2014 not in a window yet";
+  }
+  std::u16string where;
+  if (owner.screen_index > 0) {
+    where = u"Screen ";
+    where += base::ASCIIToUTF16(
+        base::StringPrintf("%d", owner.screen_index));
+    where += u" \u00b7 ";
+  }
+  where += owner.window_title.empty() ? std::u16string(u"(untitled window)")
+                                      : owner.window_title;
+  return where;
+}
+
+int WhereStyle(const content::MouseMuxInputController::OwnerInfo& owner) {
+  return owner.has_window ? views::style::STYLE_SECONDARY
+                          : views::style::STYLE_DISABLED;
+}
+
+}  // namespace row_text
+
+// Wraps a pane in a hairline rounded box.  Border only, no fill: a filled
+// panel on a dialog background reads as a control you can press.
+void MakePane(views::View* pane) {
+  pane->SetBorder(views::CreatePaddedBorder(
+      views::CreateRoundedRectBorder(1, kPaneRadius, ui::kColorSeparator),
+      gfx::Insets(kPanePadding)));
+}
+
 }  // namespace
+
+// The help window.
+//
+// Deliberately its own window rather than more rows in the dialog, and
+// deliberately plain: it is read once, by somebody who is stuck, and then
+// closed.  White ground with explicit dark text, so it stays legible whatever
+// the system theme does - a help sheet that inverts with the OS theme is one
+// more thing to be confused by.
+class MouseMuxHelpDialog : public views::DialogDelegateView {
+ public:
+  MouseMuxHelpDialog() {
+    SetTitle(u"MouseMux Multi-Seat Chrome - Help");
+    SetButtons(static_cast<int>(ui::mojom::DialogButton::kCancel));
+    SetButtonLabel(ui::mojom::DialogButton::kCancel, u"Close");
+    SetModalType(ui::mojom::ModalType::kNone);
+
+    // A window in its own right: system title bar, so it drags and closes the
+    // way every other window does.  Chromium's custom dialog frame draws no
+    // title bar at all, which left this openable and then stuck wherever it
+    // appeared.
+    set_use_custom_frame(false);
+    SetShowTitle(true);
+    SetShowCloseButton(true);
+    SetCanResize(true);
+
+    SetBackground(views::CreateSolidBackground(SK_ColorWHITE));
+    SetLayoutManager(std::make_unique<views::BoxLayout>(
+        views::BoxLayout::Orientation::kVertical, gfx::Insets(), 0));
+
+    auto body = std::make_unique<views::View>();
+    auto* body_layout = body->SetLayoutManager(
+        std::make_unique<views::BoxLayout>(
+            views::BoxLayout::Orientation::kVertical,
+            gfx::Insets::VH(4, 12), 2));
+    body_layout->set_cross_axis_alignment(
+        views::BoxLayout::CrossAxisAlignment::kStretch);
+
+    AddSection(body.get(), u"Getting started");
+    AddStep(body.get(), u"1.", u"Press Connect. Everything else stays greyed "
+                                u"out until MouseMux is connected.");
+    AddStep(body.get(), u"2.", u"Sign in to the site everyone will share, in "
+                                u"this first window. Do this BEFORE handing "
+                                u"windows out.");
+    AddStep(body.get(), u"3.", u"Press + Window once per extra person. Each "
+                                u"new window is a copy of the current tab, "
+                                u"already signed in.");
+    AddStep(body.get(), u"4.", u"Move one window to each screen.");
+    AddStep(body.get(), u"5.", u"Each person clicks once in their own window "
+                                u"with their own mouse. They appear in the "
+                                u"Users list.");
+    AddStep(body.get(), u"6.", u"Tick Capture on every row. This is required, "
+                                u"not optional - see below.");
+
+    AddSection(body.get(), u"Why Capture is required");
+    AddBody(body.get(),
+            u"Windows has one active window at a time, and Chrome believes "
+            u"it: whichever window is active is told it has the keyboard, and "
+            u"every other window is told it does not, which is why a caret "
+            u"disappears and typing stops. Capture stops each device "
+            u"producing ordinary Windows input, so that never happens. With "
+            u"anyone left uncaptured, their clicks still interrupt everybody "
+            u"else.");
+
+    AddSection(body.get(), u"A row in the Users list");
+    AddItem(body.get(), u"Green dot", u"Captured and working.");
+    AddItem(body.get(), u"Amber dot",
+            u"Owns a window but is not captured yet.");
+    AddItem(body.get(), u"Red dot",
+            u"No keyboard assigned to this user in MouseMux. Fix it there: "
+            u"a user needs BOTH a mouse and a keyboard, or their typing "
+            u"cannot be told from anyone else's.");
+    AddItem(body.get(), u"kb 0x.. \u2713",
+            u"The keyboard MouseMux has attached to this user. The tick means "
+            u"something has actually arrived from it.");
+    AddItem(body.get(), u"Screen 2 \u00b7 title",
+            u"Which screen they are on, and the page they are looking at.");
+    AddItem(body.get(), u"Capture",
+            u"Stops this one device producing ordinary Windows input.");
+    AddItem(body.get(), u"Release",
+            u"Hands their window back. They stop driving Chrome until "
+            u"somebody clicks to claim it again.");
+    AddItem(body.get(), u"\u2715",
+            u"Closes the window this person is working in. Closing a window "
+            u"releases its user automatically.");
+
+    AddSection(body.get(), u"Handing out windows");
+    AddItem(body.get(), u"+ Window",
+            u"Another window of THIS browser, copied from the current tab, so "
+            u"it is already signed in and shares one session with everybody "
+            u"else. This is the normal way to add a person.");
+    AddItem(body.get(), u"+ Seat",
+            u"A separate browser with its OWN profile and its own dialog. "
+            u"Shares no logins with this one. Use it when people must each "
+            u"sign in as themselves.");
+
+    AddSection(body.get(), u"Options");
+    AddItem(body.get(), u"Keep each user in their own window",
+            u"Clicks outside a person's own window are ignored. Cursors still "
+            u"move everywhere; only clicks are blocked. Usually what you want "
+            u"with several people side by side.");
+    AddItem(body.get(), u"Block native mouse input",
+            u"A blunt fallback for when capture is not available. It applies "
+            u"to every device at once: Windows mouse messages carry no device "
+            u"identity, so this cannot be done per person. Capture, on each "
+            u"row, is the per-person version.");
+    AddItem(body.get(), u"Release hotkey",
+            u"Releases capture from the keyboard, for when injected input is "
+            u"not working and the mice cannot reach this dialog. The way out "
+            u"if anything goes wrong.");
+    AddItem(body.get(), u"Release all", u"Hands every window back at once.");
+
+    AddSection(body.get(), u"Collapse and Quit");
+    AddItem(body.get(), u"Collapse",
+            u"Shrinks this dialog to a small strip when it is in the way. "
+            u"Click Expand to bring it back.");
+    AddItem(body.get(), u"Quit",
+            u"Closes this dialog AND every window of this browser. Use "
+            u"Collapse if you only want it out of the way.");
+
+    AddSection(body.get(), u"If typing goes to the wrong window");
+    AddBody(body.get(),
+            u"Look at the line under the user list: it shows where recent "
+            u"keystrokes actually landed. Then check the dots. A red dot "
+            u"means that person has no keyboard assigned in MouseMux, which "
+            u"is the usual cause. An amber dot means they are not captured, "
+            u"and an uncaptured keyboard also types into whichever window "
+            u"Windows thinks is active.");
+
+    auto* scroll = AddChildView(std::make_unique<views::ScrollView>());
+    scroll->SetContents(std::move(body));
+    scroll->SetBackgroundColor(SK_ColorWHITE);
+    scroll->ClipHeightTo(0, kHelpHeight);
+  }
+
+  MouseMuxHelpDialog(const MouseMuxHelpDialog&) = delete;
+  MouseMuxHelpDialog& operator=(const MouseMuxHelpDialog&) = delete;
+  ~MouseMuxHelpDialog() override = default;
+
+  gfx::Size CalculatePreferredSize(
+      const views::SizeBounds& available_size) const override {
+    return gfx::Size(kHelpWidth, kHelpHeight);
+  }
+
+ private:
+  // Explicit colours throughout: the ground is forced white, so leaving the
+  // text to the theme gives white on white the moment anybody runs dark mode.
+  static constexpr SkColor kInk = SkColorSetRGB(0x20, 0x21, 0x24);
+  static constexpr SkColor kInkSoft = SkColorSetRGB(0x5F, 0x63, 0x68);
+
+  static void AddSection(views::View* parent, const std::u16string& text) {
+    auto* label = parent->AddChildView(std::make_unique<views::Label>(
+        text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    label->SetEnabledColor(kInk);
+    label->SetFontList(label->font_list().Derive(
+        1, gfx::Font::NORMAL, gfx::Font::Weight::BOLD));
+    label->SetBorder(views::CreateEmptyBorder(gfx::Insets::TLBR(12, 0, 2, 0)));
+  }
+
+  static void AddBody(views::View* parent, const std::u16string& text) {
+    auto* label = parent->AddChildView(std::make_unique<views::Label>(
+        text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    label->SetEnabledColor(kInkSoft);
+    label->SetMultiLine(true);
+    label->SetMaximumWidth(kHelpWidth - 48);
+  }
+
+  // A term and its explanation, which is what most of this page is.
+  static void AddItem(views::View* parent,
+                      const std::u16string& term,
+                      const std::u16string& text) {
+    auto* row = parent->AddChildView(std::make_unique<views::View>());
+    row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+        views::BoxLayout::Orientation::kVertical,
+        gfx::Insets::TLBR(4, 0, 0, 0), 0));
+
+    auto* term_label = row->AddChildView(std::make_unique<views::Label>(
+        term, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    term_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    term_label->SetEnabledColor(kInk);
+    term_label->SetFontList(term_label->font_list().Derive(
+        0, gfx::Font::NORMAL, gfx::Font::Weight::BOLD));
+
+    auto* body_label = row->AddChildView(std::make_unique<views::Label>(
+        text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    body_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    body_label->SetEnabledColor(kInkSoft);
+    body_label->SetMultiLine(true);
+    body_label->SetMaximumWidth(kHelpWidth - 48);
+  }
+
+  // A numbered step, laid out so the numbers line up down the left.
+  static void AddStep(views::View* parent,
+                      const std::u16string& number,
+                      const std::u16string& text) {
+    auto* row = parent->AddChildView(std::make_unique<views::View>());
+    auto* row_layout = row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+        views::BoxLayout::Orientation::kHorizontal,
+        gfx::Insets::TLBR(3, 0, 0, 0), 8));
+    row_layout->set_cross_axis_alignment(
+        views::BoxLayout::CrossAxisAlignment::kStart);
+
+    auto* num = row->AddChildView(std::make_unique<views::Label>(
+        number, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    num->SetEnabledColor(kInk);
+    num->SetHorizontalAlignment(gfx::ALIGN_RIGHT);
+    num->SetPreferredSize(gfx::Size(18, 0));
+
+    auto* label = row->AddChildView(std::make_unique<views::Label>(
+        text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    label->SetEnabledColor(kInkSoft);
+    label->SetMultiLine(true);
+    label->SetMaximumWidth(kHelpWidth - 66);
+    row_layout->SetFlexForView(label, 1);
+  }
+};
+
 
 // Static instance pointer.
 MouseMuxControlDialog* MouseMuxControlDialog::instance_ = nullptr;
@@ -207,7 +585,13 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
 
   // Just a Close button - settings are applied immediately via toggles.
   SetButtons(static_cast<int>(ui::mojom::DialogButton::kCancel));
-  SetButtonLabel(ui::mojom::DialogButton::kCancel, u"Close");
+  // Not "Close": this button ends the seat, browser windows and all.
+  // Collapse is what you want when the dialog is merely in the way.
+  SetButtonLabel(ui::mojom::DialogButton::kCancel, u"Quit");
+  // Not the prominent style.  As the dialog's cancel button it was drawn in
+  // filled blue - the loudest thing in the window - which is the wrong
+  // emphasis for the one control that closes everybody's windows.
+  SetButtonStyle(ui::mojom::DialogButton::kCancel, ui::ButtonStyle::kTonal);
 
   SetModalType(ui::mojom::ModalType::kNone);
   set_draggable(true);
@@ -247,6 +631,12 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
   controller->SetCaptureChangedCallback(
       base::BindRepeating(&MouseMuxControlDialog::OnCaptureStateChanged,
                           base::Unretained(this)));
+
+  // Report the view tree to the control server, so the state of a dialog
+  // that has drawn wrongly can be read from outside instead of guessed at.
+  controller->SetDiagnosticsCallback(base::BindRepeating(
+      [](MouseMuxControlDialog* dialog) { return dialog->ViewDiagnostics(); },
+      base::Unretained(this)));
 
   // Register visibility callback so the control server can show/hide us.
   controller->SetVisibilityChangedCallback(
@@ -557,7 +947,7 @@ void MouseMuxControlDialog::SetupContents() {
           base::BindRepeating(&MouseMuxControlDialog::OnCollapseClicked,
                               base::Unretained(this)),
           u"Expand"));
-  expand_button->SetMinSize(gfx::Size(0, 28));
+  expand_button->SetMinSize(gfx::Size(0, kRowButtonHeight));
   expand_row_->SetVisible(false);
 
 #ifdef MOUSEMUX_DEBUG
@@ -570,114 +960,59 @@ void MouseMuxControlDialog::SetupContents() {
   title_label->SetHorizontalAlignment(gfx::ALIGN_CENTER);
 #endif
 
-  // MouseMux toggle row.  First, because connecting is the prerequisite for
-  // everything below it — nothing else in this dialog does anything until the
-  // connection is up.
-  auto* mousemux_row = AddChildView(std::make_unique<views::View>());
-  auto* mousemux_layout =
-      mousemux_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+  // ---------------------------------------------------------------------
+  // Pane 1 - the connection.
+  //
+  // A status line and one button, not a toggle: connecting is a different
+  // kind of thing from the preferences below it, and three identical toggles
+  // meaning three unrelated things was most of why this dialog read as a wall
+  // of switches.
+  // ---------------------------------------------------------------------
+  auto* connection_pane = AddChildView(std::make_unique<views::View>());
+  MakePane(connection_pane);
+  auto* connection_layout =
+      connection_pane->SetLayoutManager(std::make_unique<views::BoxLayout>(
           views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
           kToggleSpacing));
-  mousemux_layout->set_main_axis_alignment(
-      views::BoxLayout::MainAxisAlignment::kStart);
-  mousemux_layout->set_cross_axis_alignment(
+  connection_layout->set_cross_axis_alignment(
       views::BoxLayout::CrossAxisAlignment::kCenter);
 
-  mousemux_toggle_ =
-      mousemux_row->AddChildView(std::make_unique<views::ToggleButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnMouseMuxToggled,
-                              base::Unretained(this))));
-  mousemux_toggle_->SetAccessibleName(u"Connect to MouseMux");
+  connection_led_ = connection_pane->AddChildView(
+      std::make_unique<views::Label>(u"\u25CF",
+                                     views::style::CONTEXT_DIALOG_BODY_TEXT,
+                                     views::style::STYLE_PRIMARY));
+  connection_led_->SetEnabledColor(kLedOff);
 
-  auto* mousemux_label = mousemux_row->AddChildView(
-      std::make_unique<views::Label>(u"Connect to MouseMux"));
-  mousemux_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  mousemux_layout->SetFlexForView(mousemux_label, 1);
+  mousemux_status_label_ = connection_pane->AddChildView(
+      std::make_unique<views::Label>(u"Not connected to MouseMux",
+                                     views::style::CONTEXT_DIALOG_BODY_TEXT,
+                                     views::style::STYLE_PRIMARY));
+  mousemux_status_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  mousemux_status_label_->SetElideBehavior(gfx::ELIDE_TAIL);
+  connection_layout->SetFlexForView(mousemux_status_label_, 1);
 
-  mousemux_status_label_ =
-      mousemux_row->AddChildView(std::make_unique<views::Label>(u"Disconnected"));
-
-  // Native input toggle row.
-  auto* native_row = AddChildView(std::make_unique<views::View>());
-  auto* native_layout =
-      native_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
-          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
-          kToggleSpacing));
-  native_layout->set_main_axis_alignment(
-      views::BoxLayout::MainAxisAlignment::kStart);
-  native_layout->set_cross_axis_alignment(
-      views::BoxLayout::CrossAxisAlignment::kCenter);
-
-  native_input_toggle_ =
-      native_row->AddChildView(std::make_unique<views::ToggleButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnNativeInputToggled,
-                              base::Unretained(this))));
-  native_input_toggle_->SetAccessibleName(u"Disable Native Mouse Input");
-
-  auto* native_label = native_row->AddChildView(
-      std::make_unique<views::Label>(u"Disable Native Mouse Input"));
-  native_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  native_layout->SetFlexForView(native_label, 1);
-
-  native_input_status_label_ =
-      native_row->AddChildView(std::make_unique<views::Label>(u"Off"));
-
-  // Hard lock row.  Two states only — off is "soft", which is not a mode but
-  // simply what routing by hit-test does — so a toggle rather than a picker.
-  auto* lock_row = AddChildView(std::make_unique<views::View>());
-  auto* lock_layout =
-      lock_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
-          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
-          kToggleSpacing));
-  lock_layout->set_main_axis_alignment(
-      views::BoxLayout::MainAxisAlignment::kStart);
-  lock_layout->set_cross_axis_alignment(
-      views::BoxLayout::CrossAxisAlignment::kCenter);
-
-  hard_lock_toggle_ =
-      lock_row->AddChildView(std::make_unique<views::ToggleButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnHardLockToggled,
-                              base::Unretained(this))));
-  hard_lock_toggle_->SetAccessibleName(u"Lock Users To Their Window");
-
-  auto* lock_label = lock_row->AddChildView(
-      std::make_unique<views::Label>(u"Lock Users To Their Window"));
-  lock_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  lock_label->SetTooltipText(
-      u"Off: a user who clicks another window moves there.\n"
-      u"On: clicks outside a user's own window are ignored, so each user is "
-      u"confined to one window. Cursors still move freely; only clicks are "
-      u"blocked. A user with no window claims the first one they click, and "
-      u"closing a window frees its user to claim another.");
-  lock_layout->SetFlexForView(lock_label, 1);
-
-  hard_lock_status_label_ =
-      lock_row->AddChildView(std::make_unique<views::Label>(u"Off"));
-
-#ifdef MOUSEMUX_DEBUG
-  // Info label with server address.
-  auto* info_label = AddChildView(std::make_unique<views::Label>(
-      u"Toggle settings take effect immediately. Server: ws://localhost:41001",
-      views::style::CONTEXT_DIALOG_BODY_TEXT, views::style::STYLE_SECONDARY));
-  info_label->SetHorizontalAlignment(gfx::ALIGN_CENTER);
-#endif
+  connect_button_ =
+      connection_pane->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnConnectClicked,
+                              base::Unretained(this)),
+          u"Connect"));
+  connect_button_->SetMinSize(gfx::Size(96, kRowButtonHeight));
+  connect_button_->SetTooltipText(
+      u"Open or close the connection to the MouseMux input service. "
+      u"Everything else in this dialog depends on it.");
 
   // ---------------------------------------------------------------------
-  // Owner list — the control centre proper.  One row per user, showing which
-  // window they are working in, whether they are captured, and letting the
-  // operator act on that one user without disturbing the others.
-  //
-  // The bulk actions live in this header rather than in a row of their own.
-  // They act on the list directly below them, and floating them among the
-  // connection toggles made it look as though there were two unrelated ways to
-  // capture.  They are the same actions as the per-row buttons, applied to
-  // everyone.
-  //
-  // "Capture all" and "Drop all" are deliberately NOT one button: capture
-  // stops a device producing native input, while dropping removes ownership
-  // altogether.  Naming them alike would invite exactly that confusion.
+  // Pane 2 - the people.
   // ---------------------------------------------------------------------
-  auto* owners_header_row = AddChildView(std::make_unique<views::View>());
+  auto* users_pane = AddChildView(std::make_unique<views::View>());
+  MakePane(users_pane);
+  auto* users_pane_layout =
+      users_pane->SetLayoutManager(std::make_unique<views::BoxLayout>(
+          views::BoxLayout::Orientation::kVertical, gfx::Insets(), 6));
+  layout->SetFlexForView(users_pane, 1);
+
+  auto* owners_header_row =
+      users_pane->AddChildView(std::make_unique<views::View>());
   auto* owners_header_layout =
       owners_header_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
           views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
@@ -685,104 +1020,129 @@ void MouseMuxControlDialog::SetupContents() {
   owners_header_layout->set_cross_axis_alignment(
       views::BoxLayout::CrossAxisAlignment::kCenter);
 
-  auto* owners_header = owners_header_row->AddChildView(
-      std::make_unique<views::Label>(u"Owners",
+  users_header_label_ = owners_header_row->AddChildView(
+      std::make_unique<views::Label>(u"Users",
                                      views::style::CONTEXT_DIALOG_BODY_TEXT,
                                      views::style::STYLE_PRIMARY));
-  owners_header->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  owners_header_layout->SetFlexForView(owners_header, 1);
+  users_header_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  owners_header_layout->SetFlexForView(users_header_label_, 1);
 
-  capture_button_ = owners_header_row->AddChildView(
-      std::make_unique<views::MdTextButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnCaptureClicked,
-                              base::Unretained(this)),
-          u"Capture all"));
-  capture_button_->SetEnabled(false);  // Disabled until we have an owner.
-  capture_button_->SetMinSize(gfx::Size(96, 30));
-  capture_button_->SetTooltipText(
-      u"Stop every owner's device producing native Windows input. Required "
-      u"for several users to work at once. Capture one at a time from its "
-      u"row below.");
-
-  release_owner_button_ = owners_header_row->AddChildView(
-      std::make_unique<views::MdTextButton>(
-          base::BindRepeating(&MouseMuxControlDialog::OnReleaseOwnerClicked,
-                              base::Unretained(this)),
-          u"Drop all"));
-  release_owner_button_->SetEnabled(false);  // Disabled until we have an owner.
-  release_owner_button_->SetMinSize(gfx::Size(76, 30));
-  release_owner_button_->SetTooltipText(
-      u"Remove every owner. Their devices stop driving Chrome until they "
-      u"click to claim again. To drop just one, use its row below.");
-
-  owner_list_ = AddChildView(std::make_unique<views::View>());
-  owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
-      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 2));
-
-  // Where typing actually went, or why it went nowhere.  The rows above say
-  // where each user is WORKING; this says where their KEYS landed, and the
-  // two differ exactly when something is misconfigured -- which is the case
-  // nobody can otherwise diagnose from the outside.
-  keyboard_note_label_ = AddChildView(std::make_unique<views::Label>(
-      std::u16string(), views::style::CONTEXT_DIALOG_BODY_TEXT,
-      views::style::STYLE_SECONDARY));
-  keyboard_note_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  keyboard_note_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-  keyboard_note_label_->SetVisible(false);
-
-  // Hand out a window.  Two buttons because they are genuinely different
-  // things: a window of THIS Chrome shares cookies and logins with the other
-  // users, a seat is its own process and profile and shares nothing.
-  auto* handout_row = AddChildView(std::make_unique<views::View>());
-  auto* handout_layout =
-      handout_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
-          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
-          kToggleSpacing));
-  handout_layout->set_main_axis_alignment(
-      views::BoxLayout::MainAxisAlignment::kStart);
-
-  // Short labels, and a min WIDTH as well as height.  The long forms
-  // ("+ Window (this profile)") squeezed to ellipsis as soon as the dialog was
-  // narrow, and a button whose label is elided tells the operator nothing.
-  // The distinction that matters lives in the tooltips.
-  auto* new_window_button = handout_row->AddChildView(
+  // The two ways to hand out a window sit in the users heading, because that
+  // is what they do - they add a user.  They used to share a row with the
+  // hotkey dropdown, where the dropdown took the width and left both buttons
+  // elided; a minimum size cannot save a row whose total minimum exceeds the
+  // dialog, so that row is gone rather than tuned.
+  new_window_button_ = owners_header_row->AddChildView(
       std::make_unique<views::MdTextButton>(
           base::BindRepeating(&MouseMuxControlDialog::OnNewWindowClicked,
                               base::Unretained(this)),
           u"+ Window"));
-  new_window_button->SetMinSize(gfx::Size(110, 32));
-  new_window_button->SetTooltipText(
-      u"Copy the current tab into another window of THIS Chrome -- already "
+  new_window_button_->SetMinSize(gfx::Size(104, kRowButtonHeight));
+  new_window_button_->SetTooltipText(
+      u"Copy the current tab into another window of THIS Chrome - already "
       u"signed in, sharing the same session as the other users. Have the "
       u"next user click in it to claim it.");
 
-  auto* new_seat_button = handout_row->AddChildView(
+  new_seat_button_ = owners_header_row->AddChildView(
       std::make_unique<views::MdTextButton>(
           base::BindRepeating(&MouseMuxControlDialog::OnNewSeatClicked,
                               base::Unretained(this)),
           u"+ Seat"));
-  new_seat_button->SetMinSize(gfx::Size(110, 32));
-  new_seat_button->SetTooltipText(
+  new_seat_button_->SetMinSize(gfx::Size(88, kRowButtonHeight));
+  new_seat_button_->SetTooltipText(
       u"Launch a separate Chrome with its OWN profile and its own dialog. "
       u"Isolated: shares no logins with this one.");
 
-  // Absorbs slack so the two buttons keep their size and sit left rather than
-  // stretching across the dialog.
-  auto* handout_spacer =
-      handout_row->AddChildView(std::make_unique<views::View>());
-  handout_layout->SetFlexForView(handout_spacer, 1);
+  // The list scrolls rather than shrinking.
+  //
+  // It used to be a plain view given whatever vertical space was left over,
+  // and when that was not enough BoxLayout did not overflow - it squeezed the
+  // last child.  With two users that made the second row SIX pixels tall: its
+  // labels were clipped away by the row's own bounds while its checkbox and
+  // buttons, which are layer-backed for their ink drops, carried on being
+  // composited.  Half a row appeared, and the half that vanished was the half
+  // that says who the user is.
+  //
+  // A scroll view cannot do that.  The rows always get their full height, and
+  // when there are more than fit, the list scrolls.
+  auto* owner_scroll =
+      users_pane->AddChildView(std::make_unique<views::ScrollView>());
+  owner_scroll->SetBackgroundColor(ui::kColorSubtleEmphasisBackground);
+  owner_scroll->SetDrawOverflowIndicator(false);
+  owner_scroll->ClipHeightTo(kListMinHeight, kListMaxHeight);
+  users_pane_layout->SetFlexForView(owner_scroll, 1);
 
-  // Release hotkey.  A setting, configured once and rarely touched, so it
-  // belongs at the end rather than in prime position between two buttons —
-  // but it is also the escape hatch out of capture, so it stays visible
-  // rather than hiding behind a menu.
-  handout_row->AddChildView(std::make_unique<views::Label>(
+  owner_list_ = owner_scroll->SetContents(std::make_unique<views::View>());
+  owner_list_->SetBackground(views::CreateRoundedRectBackground(
+      ui::kColorSubtleEmphasisBackground, kPaneRadius));
+  owner_list_->SetBorder(views::CreateEmptyBorder(gfx::Insets(4)));
+  owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 2));
+
+  // Where typing actually went.  The rows above say where each user is
+  // WORKING; this says where their KEYS landed, and the two differ exactly
+  // when something is misconfigured - which is the case nobody can otherwise
+  // diagnose from the outside.
+  keyboard_note_label_ =
+      users_pane->AddChildView(std::make_unique<views::Label>(
+          std::u16string(), views::style::CONTEXT_DIALOG_BODY_TEXT,
+          views::style::STYLE_SECONDARY));
+  keyboard_note_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  keyboard_note_label_->SetElideBehavior(gfx::ELIDE_TAIL);
+  keyboard_note_label_->SetVisible(false);
+
+  // ---------------------------------------------------------------------
+  // Pane 3 - options that apply to everybody.
+  // ---------------------------------------------------------------------
+  auto* options_pane = AddChildView(std::make_unique<views::View>());
+  MakePane(options_pane);
+  options_pane->SetLayoutManager(std::make_unique<views::BoxLayout>(
+      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 6));
+
+  hard_lock_checkbox_ = options_pane->AddChildView(
+      std::make_unique<views::Checkbox>(
+          u"Keep each user in their own window",
+          base::BindRepeating(&MouseMuxControlDialog::OnHardLockToggled,
+                              base::Unretained(this))));
+  hard_lock_checkbox_->SetTooltipText(
+      u"Off: a user who clicks another window moves there.\n"
+      u"On: clicks outside a user's own window are ignored, so each user is "
+      u"confined to one window. Cursors still move freely; only clicks are "
+      u"blocked. A user with no window claims the first one they click, and "
+      u"closing a window frees its user to claim another.");
+
+  // Native blocking is global on purpose, and cannot sensibly be otherwise:
+  // it drops Windows mouse messages, and those carry no device identity -
+  // which is the entire reason MouseMux exists.  The per-user equivalent is
+  // Capture, on each row, which stops one device producing native input at
+  // the server where the device IS known.
+  native_input_checkbox_ =
+      options_pane->AddChildView(std::make_unique<views::Checkbox>(
+          u"Block native mouse input (all devices)",
+          base::BindRepeating(&MouseMuxControlDialog::OnNativeInputToggled,
+                              base::Unretained(this))));
+  native_input_checkbox_->SetTooltipText(
+      u"A blunt fallback for when capture is not available. Windows mouse "
+      u"messages carry no device identity, so this cannot be done per user - "
+      u"capture, on each user's row, is the per-user version of it.");
+
+  // Settings row: the hotkey, and the way out of everything.
+  auto* settings_row =
+      options_pane->AddChildView(std::make_unique<views::View>());
+  auto* settings_layout =
+      settings_row->SetLayoutManager(std::make_unique<views::BoxLayout>(
+          views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
+          kToggleSpacing));
+  settings_layout->set_cross_axis_alignment(
+      views::BoxLayout::CrossAxisAlignment::kCenter);
+
+  settings_row->AddChildView(std::make_unique<views::Label>(
       u"Release hotkey:", views::style::CONTEXT_DIALOG_BODY_TEXT,
       views::style::STYLE_SECONDARY));
 
   hotkey_model_ = std::make_unique<HotkeyComboboxModel>();
   hotkey_dropdown_ =
-      handout_row->AddChildView(std::make_unique<views::Combobox>(
+      settings_row->AddChildView(std::make_unique<views::Combobox>(
           hotkey_model_.get()));
   hotkey_dropdown_->SetCallback(
       base::BindRepeating(&MouseMuxControlDialog::OnHotkeyChanged,
@@ -791,6 +1151,20 @@ void MouseMuxControlDialog::SetupContents() {
   hotkey_dropdown_->SetTooltipText(
       u"Key combination that releases capture, for when injected input is not "
       u"working and the mice cannot reach this dialog.");
+
+  auto* settings_spacer =
+      settings_row->AddChildView(std::make_unique<views::View>());
+  settings_layout->SetFlexForView(settings_spacer, 1);
+
+  release_all_button_ =
+      settings_row->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnReleaseOwnerClicked,
+                              base::Unretained(this)),
+          u"Release all"));
+  release_all_button_->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  release_all_button_->SetTooltipText(
+      u"Hand every window back. Their devices stop driving Chrome until "
+      u"somebody clicks to claim again.");
 
 #ifndef MOUSEMUX_DEBUG
   // Footer, in the frame's button row beside Close: build info and Collapse.
@@ -813,12 +1187,21 @@ void MouseMuxControlDialog::SetupContents() {
 
   // Shrinks the dialog to a strip rather than hiding it, so there is always
   // something on screen to click to get back.
+  auto* help_button =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnHelpClicked,
+                              base::Unretained(this)),
+          u"Help"));
+  help_button->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  help_button->SetTooltipText(
+      u"What every control does, and the order to do things in.");
+
   auto* collapse_button =
       footer->AddChildView(std::make_unique<views::MdTextButton>(
           base::BindRepeating(&MouseMuxControlDialog::OnCollapseClicked,
                               base::Unretained(this)),
           u"Collapse"));
-  collapse_button->SetMinSize(gfx::Size(84, 30));
+  collapse_button->SetMinSize(gfx::Size(84, kRowButtonHeight));
   collapse_button->SetTooltipText(
       u"Shrink this dialog out of the way. Click it again to restore.");
 
@@ -842,11 +1225,9 @@ void MouseMuxControlDialog::SetupContents() {
 
   // Make the textarea expand to fill available space.
   layout->SetFlexForView(debug_log_, 1);
-#else
-  // Spacer absorbs extra vertical space so rows don't get squeezed.
-  auto* vertical_spacer = AddChildView(std::make_unique<views::View>());
-  layout->SetFlexForView(vertical_spacer, 1);
 #endif
+  // No trailing spacer: the users pane takes the slack, so the list grows
+  // with the window and the options pane stays put at the bottom.
 }
 
 gfx::Size MouseMuxControlDialog::CalculatePreferredSize(
@@ -887,19 +1268,14 @@ ui::ImageModel MouseMuxControlDialog::GetWindowIcon() {
 
 
 void MouseMuxControlDialog::OnHardLockToggled() {
-  const bool on = hard_lock_toggle_ && hard_lock_toggle_->GetIsOn();
+  const bool on = hard_lock_checkbox_ && hard_lock_checkbox_->GetChecked();
   content::MouseMuxInputController::GetInstance()->SetHardLock(on);
-  if (hard_lock_status_label_) {
-    hard_lock_status_label_->SetText(on ? u"On" : u"Off");
-  }
   LogDebug(std::string("Hard lock: ") + (on ? "ON" : "OFF"));
   RebuildOwnerList();
 }
 
 void MouseMuxControlDialog::OnNativeInputToggled() {
-  bool is_on = native_input_toggle_->GetIsOn();
-  native_input_status_label_->SetText(is_on ? u"Blocking" : u"Off");
-
+  bool is_on = native_input_checkbox_ && native_input_checkbox_->GetChecked();
   LogDebug(std::string("Native input blocking: ") + (is_on ? "ENABLED" : "DISABLED"));
 
   // Apply immediately to controller.
@@ -908,63 +1284,179 @@ void MouseMuxControlDialog::OnNativeInputToggled() {
 }
 
 void MouseMuxControlDialog::OnNativeBlockingChanged(bool blocked) {
-  if (native_input_toggle_ && native_input_toggle_->GetIsOn() != blocked) {
-    native_input_toggle_->SetIsOn(blocked);
-    if (native_input_status_label_) {
-      native_input_status_label_->SetText(blocked ? u"Blocking" : u"Off");
-    }
+  if (native_input_checkbox_ &&
+      native_input_checkbox_->GetChecked() != blocked) {
+    native_input_checkbox_->SetChecked(blocked);
   }
 }
 
-void MouseMuxControlDialog::OnMouseMuxToggled() {
-  bool is_on = mousemux_toggle_->GetIsOn();
-  mousemux_status_label_->SetText(is_on ? u"Connecting..." : u"Disconnected");
-
-  LogDebug(std::string("MouseMux connection: ") + (is_on ? "CONNECTING" : "DISCONNECTING"));
-
-  // Apply immediately to controller.
+void MouseMuxControlDialog::OnConnectClicked() {
   auto* controller = content::MouseMuxInputController::GetInstance();
-  controller->SetMouseMuxEnabled(is_on);
+  const bool connect = !controller->IsMouseMuxEnabled();
+  if (mousemux_status_label_) {
+    mousemux_status_label_->SetText(connect ? u"Connecting to MouseMux..."
+                                            : u"Not connected to MouseMux");
+  }
+  LogDebug(std::string("MouseMux connection: ") +
+           (connect ? "CONNECTING" : "DISCONNECTING"));
+  controller->SetMouseMuxEnabled(connect);
+  UpdateStatusLine();
+}
+
+void MouseMuxControlDialog::UpdateStatusLine() {
+  auto* controller = content::MouseMuxInputController::GetInstance();
+  const bool connected = controller->IsMouseMuxEnabled();
+
+  if (mousemux_status_label_) {
+    std::u16string text = u"Not connected to MouseMux";
+    if (connected) {
+      // Name the version we are actually talking to.  "Which MouseMux are you
+      // running" is the first question of every support case, and the server
+      // tells us on connect, so nobody should have to go and look.
+      const std::string version = controller->GetServerVersion();
+      text = version.empty()
+                 ? std::u16string(u"Connected to MouseMux")
+                 : base::UTF8ToUTF16("Connected to MouseMux " + version);
+    }
+    mousemux_status_label_->SetText(text);
+  }
+
+  if (connection_led_) {
+    connection_led_->SetEnabledColor(connected ? kDotOk : kLedOff);
+    connection_led_->SetTooltipText(
+        connected ? u"Connected to the MouseMux input service."
+                  : u"Not connected. Nothing else in this dialog works until "
+                    u"it is.");
+  }
+
+  if (connect_button_) {
+    connect_button_->SetText(connected ? u"Disconnect" : u"Connect");
+  }
+
+  if (users_header_label_) {
+    const size_t count = controller->GetOwners().size();
+    users_header_label_->SetText(
+        count == 0 ? std::u16string(u"Users")
+                   : base::ASCIIToUTF16(
+                         base::StringPrintf("Users (%zu)", count)));
+  }
+
+  UpdateEnabledState();
+}
+
+void MouseMuxControlDialog::UpdateEnabledState() {
+  // Nothing in here does anything without the connection: handing out a
+  // window nobody can claim, or arming a lock with no users to lock, is a
+  // control that answers a click by doing nothing at all.  Greying them out
+  // says which one thing to press instead.
+  //
+  // Connect is exempt, obviously, and so are Collapse and the window's close
+  // button, which belong to the window rather than to MouseMux.
+  const bool on =
+      content::MouseMuxInputController::GetInstance()->IsMouseMuxEnabled();
+
+  if (new_window_button_) {
+    new_window_button_->SetEnabled(on);
+  }
+  if (new_seat_button_) {
+    new_seat_button_->SetEnabled(on);
+  }
+  if (release_all_button_) {
+    release_all_button_->SetEnabled(on);
+  }
+  if (hard_lock_checkbox_) {
+    hard_lock_checkbox_->SetEnabled(on);
+  }
+  if (native_input_checkbox_) {
+    native_input_checkbox_->SetEnabled(on);
+  }
+  if (hotkey_dropdown_) {
+    hotkey_dropdown_->SetEnabled(on);
+  }
+}
+
+void MouseMuxControlDialog::WindowClosing() {
+  // Closing this dialog ends the seat.
+  //
+  // The windows it hands out have no controls of their own for any of this:
+  // once several people are captured, the dialog is the only way to release
+  // them, and leaving it closed with users still captured strands everybody
+  // with input going somewhere they cannot see.  So the browser goes with it,
+  // which is also what "close" means for a single-purpose application.
+  //
+  // Safe during shutdown: if the browser is already going away, there is
+  // nothing left to close and this does nothing.
+  // Already shutting down: the dialog is closing BECAUSE the browser is, and
+  // asking for another exit from inside one is how you get re-entrancy.
+  if (browser_shutdown::IsTryingToQuit()) {
+    return;
+  }
+  LogDebug("Dialog closed - closing this browser");
+  chrome::AttemptUserExit();
+}
+
+void MouseMuxControlDialog::OnOwnerCaptureToggled(int hwid,
+                                                  views::Checkbox* box) {
+  auto* controller = content::MouseMuxInputController::GetInstance();
+  const bool want = box && box->GetChecked();
+  if (want) {
+    controller->CaptureOwnerHwid(hwid);
+    // Capture gave this dialog OS focus by way of the click that started it;
+    // hand it back, or the first thing that user types goes nowhere.
+    controller->FocusKeyboardTargetView();
+  } else {
+    controller->ReleaseCaptureHwid(hwid);
+  }
+  RebuildOwnerList();
 }
 
 void MouseMuxControlDialog::OnConnectionStateChanged(bool connected) {
   if (mousemux_status_label_) {
-    mousemux_status_label_->SetText(connected ? u"Connected" : u"Disconnected");
-  }
-  // Sync toggle to match actual state (e.g. control server changed it).
-  if (connected && mousemux_toggle_ && !mousemux_toggle_->GetIsOn()) {
-    mousemux_toggle_->SetIsOn(true);
+    mousemux_status_label_->SetText(connected
+                                        ? u"Connected to MouseMux"
+                                        : u"Not connected to MouseMux");
   }
   if (!connected) {
-    // Reset the toggle back to off so the user can retry.
-    if (mousemux_toggle_ && mousemux_toggle_->GetIsOn()) {
-      mousemux_toggle_->SetIsOn(false);
-    }
     // Clear all stale UI state — controller already reset its side.
     owner_hwid_ = -1;
     owner_name_.clear();
     is_captured_ = false;
-    UpdateCaptureButton();
     UpdateTitle();
-    if (release_owner_button_) {
-      release_owner_button_->SetEnabled(false);
-    }
     // Controller unblocked native input on disconnect — sync the toggle.
-    if (native_input_toggle_ && native_input_toggle_->GetIsOn()) {
-      native_input_toggle_->SetIsOn(false);
-    }
-    if (native_input_status_label_) {
-      native_input_status_label_->SetText(u"Off");
+    if (native_input_checkbox_ && native_input_checkbox_->GetChecked()) {
+      native_input_checkbox_->SetChecked(false);
     }
   }
+  UpdateStatusLine();
+  ScheduleRebuild();
 }
 
 void MouseMuxControlDialog::OnCaptureStateChanged(bool captured) {
   is_captured_ = captured;
-  UpdateCaptureButton();
-  RebuildOwnerList();
+  UpdateStatusLine();
+  ScheduleRebuild();
   UpdateTitle();
   LogDebug(std::string("Capture state changed: ") + (captured ? "CAPTURED" : "RELEASED"));
+}
+
+void MouseMuxControlDialog::OnHelpClicked() {
+  // Parented to this dialog so it travels with the seat it explains, and
+  // non-modal so the operator can follow the instructions while reading them.
+  views::Widget* help = views::DialogDelegate::CreateDialogWidget(
+      std::make_unique<MouseMuxHelpDialog>(),
+      /*context=*/gfx::NativeWindow(),
+      GetWidget() ? GetWidget()->GetNativeView() : gfx::NativeView());
+
+#ifdef MOUSEMUX_NATIVE_BLOCK
+  // Exempt from native input blocking, like the control dialog: this window is
+  // ours and the operator drives it with a real mouse.
+  if (help && help->GetNativeWindow() && help->GetNativeWindow()->GetHost()) {
+    content::g_mousemux_help_hwnd =
+        help->GetNativeWindow()->GetHost()->GetAcceleratedWidget();
+  }
+#endif
+
+  help->Show();
 }
 
 void MouseMuxControlDialog::OnCollapseClicked() {
@@ -981,6 +1473,13 @@ void MouseMuxControlDialog::SetCollapsed(bool collapsed) {
   // click — that is what keeps collapse recoverable without automation.
   for (views::View* child : children()) {
     child->SetVisible(child == expand_row_ ? collapsed : !collapsed);
+  }
+
+  // The keyboard note decides its own visibility and must not be shown again
+  // just because everything else was; it is hidden when it has nothing to
+  // say.  RebuildOwnerList settles that.
+  if (!collapsed) {
+    RebuildOwnerList();
   }
 
   // The Close button and the extra (build info) view belong to the dialog
@@ -1029,22 +1528,6 @@ void MouseMuxControlDialog::OnVisibilityChanged(bool visible) {
   LogDebug(visible ? "Dialog shown" : "Dialog hidden");
 }
 
-void MouseMuxControlDialog::OnCaptureClicked() {
-  auto* controller = content::MouseMuxInputController::GetInstance();
-  if (is_captured_) {
-    LogDebug("Release Capture button clicked");
-    controller->ReleaseCapture();
-  } else {
-    LogDebug("Capture Mouse button clicked");
-    controller->CaptureOwner();
-
-    // After capturing, give focus back to the browser window so keyboard
-    // events reach the web content.  Clicking this button gave the dialog
-    // OS focus, which blocks keyboard injection from reaching the renderer.
-    controller->FocusKeyboardTargetView();
-  }
-}
-
 void MouseMuxControlDialog::OnHotkeyChanged() {
   if (hotkey_dropdown_) {
     selected_hotkey_index_ = hotkey_dropdown_->GetSelectedIndex().value_or(0);
@@ -1060,132 +1543,303 @@ void MouseMuxControlDialog::OnHotkeyChanged() {
   }
 }
 
+std::string MouseMuxControlDialog::OwnerMembership() const {
+  std::string key;
+  for (const auto& owner :
+       content::MouseMuxInputController::GetInstance()->GetOwners()) {
+    key += base::StringPrintf("%x;", owner.hwid);
+  }
+  return key;
+}
+
+std::string MouseMuxControlDialog::OwnerSignature() const {
+  std::string sig;
+  for (const auto& owner :
+       content::MouseMuxInputController::GetInstance()->GetOwners()) {
+    sig += base::StringPrintf(
+        "%x|%s|%x|%d|%d|%d|%d|%s;", owner.hwid, owner.name.c_str(),
+        owner.keyboard_hwid, owner.keyboard_typed ? 1 : 0,
+        owner.captured ? 1 : 0, owner.has_window ? 1 : 0, owner.screen_index,
+        base::UTF16ToUTF8(owner.window_title).c_str());
+  }
+  return sig;
+}
+
 void MouseMuxControlDialog::RebuildOwnerList() {
   if (!owner_list_) {
     return;
   }
-  owner_list_->RemoveAllChildViews();
 
-  auto owners =
+  const auto owners =
       content::MouseMuxInputController::GetInstance()->GetOwners();
+  const std::string membership = OwnerMembership();
+  const std::string signature = OwnerSignature();
+
+  // Same people, same everything: there is nothing to write.  Still re-assert
+  // the frame, because a rebuild that failed to reach the screen must not be
+  // left uncorrected until something else happens to redraw.
+  if (membership == owner_membership_ && signature == owner_signature_ &&
+      owner_rows_.size() == owners.size()) {
+    UpdateKeyboardNote();
+    UpdateStatusLine();
+    EnsurePainted();
+    return;
+  }
+
+  // Same people, something else changed: write into the labels that are
+  // already there.  This is the common case by a wide margin - every title
+  // change as anybody browses lands here - and it destroys no views, so the
+  // tooltip under the operator's pointer survives.
+  if (membership == owner_membership_ && owner_rows_.size() == owners.size()) {
+    for (size_t i = 0; i < owners.size(); ++i) {
+      const auto& owner = owners[i];
+      OwnerRow& row = owner_rows_[i];
+      if (row.dot) {
+        row.dot->SetEnabledColor(row_text::DotColor(owner));
+        row.dot->SetTooltipText(row_text::DotTip(owner));
+      }
+      if (row.name) {
+        row.name->SetText(row_text::Name(owner));
+      }
+      if (row.keyboard) {
+        row.keyboard->SetText(row_text::Keyboard(owner));
+        row.keyboard->SetTextStyle(row_text::KeyboardStyle(owner));
+        row.keyboard->SetTooltipText(row_text::KeyboardTip(owner));
+      }
+      if (row.where) {
+        row.where->SetText(row_text::Where(owner));
+        row.where->SetTextStyle(row_text::WhereStyle(owner));
+      }
+      if (row.capture && row.capture->GetChecked() != owner.captured) {
+        row.capture->SetChecked(owner.captured);
+      }
+      if (row.close) {
+        row.close->SetEnabled(owner.has_window);
+      }
+    }
+    owner_signature_ = signature;
+    UpdateKeyboardNote();
+    UpdateStatusLine();
+    EnsurePainted();
+    return;
+  }
+
+  // The set of users changed: build the rows.
+  owner_rows_.clear();
+  owner_list_->RemoveAllChildViews();
+  owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
+      views::BoxLayout::Orientation::kVertical, gfx::Insets(), 0));
+  owner_membership_ = membership;
+  owner_signature_ = signature;
 
   if (owners.empty()) {
     auto* empty = owner_list_->AddChildView(std::make_unique<views::Label>(
-        u"No owners yet — have a user click in a window to claim it.",
+        u"No users yet \u2014 have each person click in their own window.",
         views::style::CONTEXT_DIALOG_BODY_TEXT,
         views::style::STYLE_DISABLED));
     empty->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    empty->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(6, 6)));
     // Nobody owns anything, so any routing note left over from the last
     // session of use describes people who are no longer here.
     if (keyboard_note_label_) {
       keyboard_note_label_->SetVisible(false);
     }
-    owner_list_->InvalidateLayout();
+    UpdateStatusLine();
+    EnsurePainted();
     return;
   }
 
+  bool alternate = false;
   for (const auto& owner : owners) {
+    OwnerRow entry;
+    entry.hwid = owner.hwid;
+
+    // One row per user, banded and separated, so the list reads as a list of
+    // records rather than as more rows of dialog.  The columns share a table
+    // so they line up down the list: every row used to be an independent box,
+    // and a long name moved that row's title somewhere a short name did not.
     auto* row = owner_list_->AddChildView(std::make_unique<views::View>());
-    auto* layout = row->SetLayoutManager(std::make_unique<views::BoxLayout>(
-        views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), 6));
-    layout->set_cross_axis_alignment(
-        views::BoxLayout::CrossAxisAlignment::kCenter);
-
-    // Name, falling back to the hwid when the SDK user list has not named
-    // this device — an unnamed owner is still an owner and must be operable.
-    std::u16string label_text =
-        owner.name.empty()
-            ? base::ASCIIToUTF16(base::StringPrintf("device 0x%x", owner.hwid))
-            : base::UTF8ToUTF16(owner.name);
-    if (owner.is_primary) {
-      label_text += u" *";
+    if (alternate) {
+      row->SetBackground(views::CreateRoundedRectBackground(
+          ui::kColorSysNeutralContainer, 4));
     }
-    auto* name_label = row->AddChildView(std::make_unique<views::Label>(
-        label_text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+    alternate = !alternate;
+
+    auto* table = row->SetLayoutManager(std::make_unique<views::TableLayout>());
+    table->AddColumn(views::LayoutAlignment::kCenter,
+                     views::LayoutAlignment::kCenter, 0,
+                     views::TableLayout::ColumnSize::kFixed, 14, 14)
+        .AddPaddingColumn(0, 6)
+        .AddColumn(views::LayoutAlignment::kStart,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kFixed, 78, 78)
+        .AddPaddingColumn(0, 8)
+        .AddColumn(views::LayoutAlignment::kStart,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kFixed, 88, 88)
+        .AddPaddingColumn(0, 8)
+        .AddColumn(views::LayoutAlignment::kStretch,
+                   views::LayoutAlignment::kCenter, 1.0f,
+                   views::TableLayout::ColumnSize::kFixed, 0, 0)
+        .AddPaddingColumn(0, 8)
+        .AddColumn(views::LayoutAlignment::kStart,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
+        .AddPaddingColumn(0, 4)
+        .AddColumn(views::LayoutAlignment::kEnd,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
+        .AddPaddingColumn(0, 2)
+        .AddColumn(views::LayoutAlignment::kEnd,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
+        .AddRows(1, 0, kRowButtonHeight);
+
+    // Status, as one glyph.  Green: captured, which is the only state in
+    // which several users actually work.  Amber: an owner, but not captured,
+    // so Windows is still moving focus behind our back.  Red: no keyboard,
+    // which nobody can see from their own seat.
+    entry.dot = row->AddChildView(std::make_unique<views::Label>(
+        u"\u25CF", views::style::CONTEXT_DIALOG_BODY_TEXT,
         views::style::STYLE_PRIMARY));
-    name_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    entry.dot->SetEnabledColor(row_text::DotColor(owner));
+    entry.dot->SetTooltipText(row_text::DotTip(owner));
+
+    entry.name = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Name(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    entry.name->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    entry.name->SetElideBehavior(gfx::ELIDE_TAIL);
     if (owner.is_primary) {
-      name_label->SetTooltipText(
-          u"Primary owner — the one reported to the control server and the "
-          u"single-owner API.");
+      entry.name->SetTooltipText(
+          u"Primary owner \u2014 the one reported to the control server and "
+          u"the single-owner API.");
     }
 
-    // Which window this user is working in.
-    std::u16string where =
-        owner.has_window
-            ? (owner.window_title.empty() ? u"(untitled window)"
-                                          : owner.window_title)
-            : u"— not in a window yet";
-    auto* where_label = row->AddChildView(std::make_unique<views::Label>(
-        where, views::style::CONTEXT_DIALOG_BODY_TEXT,
-        owner.has_window ? views::style::STYLE_SECONDARY
-                         : views::style::STYLE_DISABLED));
-    where_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-    where_label->SetElideBehavior(gfx::ELIDE_TAIL);
-    layout->SetFlexForView(where_label, 1);
+    entry.keyboard = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Keyboard(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        row_text::KeyboardStyle(owner)));
+    entry.keyboard->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    entry.keyboard->SetElideBehavior(gfx::ELIDE_TAIL);
+    entry.keyboard->SetTooltipText(row_text::KeyboardTip(owner));
 
-    // The keyboard MouseMux has attached to this user.  A user with a mouse
-    // and no keyboard still owns a window and looks perfectly healthy in
-    // every other column, but their typing cannot be told from anyone
-    // else's -- so it is called out here rather than left to be deduced.
-    std::u16string kb_text;
-    int kb_style = views::style::STYLE_SECONDARY;
-    if (owner.keyboard_hwid == 0) {
-      kb_text = u"no keyboard";
-      kb_style = views::style::STYLE_PRIMARY;
-    } else if (owner.keyboard_typed) {
-      kb_text = base::ASCIIToUTF16(
-                    base::StringPrintf("kb 0x%x", owner.keyboard_hwid)) +
-                u" \u2713";
-    } else {
-      kb_text = base::ASCIIToUTF16(
-          base::StringPrintf("kb 0x%x", owner.keyboard_hwid));
-    }
-    auto* kb_label = row->AddChildView(std::make_unique<views::Label>(
-        kb_text, views::style::CONTEXT_DIALOG_BODY_TEXT, kb_style));
-    kb_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-    kb_label->SetTooltipText(
-        owner.keyboard_hwid == 0
-            ? u"MouseMux has no keyboard on this user. Give this user a "
-              u"mouse AND a keyboard in MouseMux -- until then their "
-              u"keystrokes cannot be told from anyone else's, and with "
-              u"several users they are ignored rather than typed into "
-              u"somebody else's window."
-            : (owner.keyboard_typed
-                   ? u"This user's keyboard, and it has typed."
-                   : u"This user's keyboard. Nothing has arrived from it "
-                     u"yet."));
+    entry.where = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Where(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        row_text::WhereStyle(owner)));
+    entry.where->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    entry.where->SetElideBehavior(gfx::ELIDE_TAIL);
 
-    auto* capture_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
-        base::BindRepeating(&MouseMuxControlDialog::OnOwnerCaptureClicked,
-                            base::Unretained(this), owner.hwid),
-        owner.captured ? u"Release" : u"Capture"));
-    capture_btn->SetMinSize(gfx::Size(76, 28));
-    capture_btn->SetTooltipText(
-        owner.captured
-            ? u"Give this user's mouse back to Windows."
-            : u"Stop this user's device producing native Windows input. "
-              u"Required for several users to work at once.");
-
-    auto* close_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
-        base::BindRepeating(&MouseMuxControlDialog::OnOwnerCloseWindowClicked,
-                            base::Unretained(this), owner.window),
-        u"Close win"));
-    close_btn->SetMinSize(gfx::Size(76, 28));
-    close_btn->SetEnabled(owner.has_window);
-    close_btn->SetTooltipText(u"Close the window this user is working in.");
+    // Capture is a STATE, so it is a checkbox rather than a button whose
+    // label flips.  That also frees the word "Release" for the other action,
+    // which is what it should always have meant: hand the window back.
+    entry.capture = row->AddChildView(std::make_unique<views::Checkbox>(
+        u"Capture", views::Button::PressedCallback()));
+    entry.capture->SetChecked(owner.captured);
+    entry.capture->SetCallback(base::BindRepeating(
+        &MouseMuxControlDialog::OnOwnerCaptureToggled, base::Unretained(this),
+        owner.hwid, base::Unretained(entry.capture.get())));
+    entry.capture->SetTooltipText(
+        u"Stop this user's device producing native Windows input. Required "
+        u"for several users to work at once, and the per-user version of the "
+        u"global blocking option below.");
 
     auto* release_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
         base::BindRepeating(&MouseMuxControlDialog::OnOwnerReleaseClicked,
                             base::Unretained(this), owner.hwid),
-        u"Drop"));
-    release_btn->SetMinSize(gfx::Size(58, 28));
+        u"Release"));
+    release_btn->SetStyle(ui::ButtonStyle::kText);
+    // A row action, not a call to action: the default button padding made it
+    // the widest thing on the row and pulled the eye to the one control you
+    // want people to use least.
+    release_btn->SetCustomPadding(gfx::Insets::VH(0, 6));
+    release_btn->SetMinSize(gfx::Size(0, kRowButtonHeight));
     release_btn->SetTooltipText(
-        u"Remove this owner. Their device stops driving Chrome until they "
-        u"click to claim again.");
+        u"Hand this window back. Their device stops driving Chrome until "
+        u"somebody clicks to claim it again.");
+
+    entry.close = row->AddChildView(std::make_unique<views::MdTextButton>(
+        base::BindRepeating(&MouseMuxControlDialog::OnOwnerCloseWindowClicked,
+                            base::Unretained(this), owner.hwid),
+        u"\u2715"));
+    entry.close->SetStyle(ui::ButtonStyle::kText);
+    entry.close->SetCustomPadding(gfx::Insets::VH(0, 4));
+    entry.close->SetMinSize(gfx::Size(24, kRowButtonHeight));
+    entry.close->SetEnabled(owner.has_window);
+    entry.close->SetTooltipText(u"Close the window this user is working in.");
+
+    owner_rows_.push_back(entry);
   }
+
   UpdateKeyboardNote();
+  UpdateStatusLine();
   owner_list_->InvalidateLayout();
+  EnsurePainted();
+}
+
+void MouseMuxControlDialog::ScheduleRebuild() {
+  // Posted, not called.
+  //
+  // Rebuilding inline from a controller callback means rebuilding on whatever
+  // stack raised it - and for the callback that matters most, a user claiming
+  // a window, that is the injected-input stack.
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+      FROM_HERE, base::BindOnce(&MouseMuxControlDialog::RebuildOwnerList,
+                                weak_factory_.GetWeakPtr()));
+}
+
+std::string MouseMuxControlDialog::ViewDiagnostics() const {
+  std::string out;
+  const views::Widget* widget = GetWidget();
+  out += base::StringPrintf(
+      "widget=%d visible=%d active=%d minimized=%d contents=%s list=%s rows=%d",
+      widget ? 1 : 0, widget && widget->IsVisible() ? 1 : 0,
+      widget && widget->IsActive() ? 1 : 0,
+      widget && widget->IsMinimized() ? 1 : 0,
+      bounds().ToString().c_str(),
+      owner_list_ ? owner_list_->bounds().ToString().c_str() : "none",
+      owner_list_ ? static_cast<int>(owner_list_->children().size()) : -1);
+
+  if (!owner_list_) {
+    return out;
+  }
+
+  int row_index = 0;
+  for (const views::View* row : owner_list_->children()) {
+    out += base::StringPrintf(
+        " | row%d %s vis=%d drawn=%d children=%d:", row_index++,
+        row->bounds().ToString().c_str(), row->GetVisible() ? 1 : 0,
+        row->IsDrawn() ? 1 : 0, static_cast<int>(row->children().size()));
+    for (const views::View* cell : row->children()) {
+      // Text where there is any: a label with correct bounds that draws
+      // nothing would mean the text is empty, which is a different bug from a
+      // label that is never painted.
+      std::string text;
+      if (const auto* label = views::AsViewClass<views::Label>(cell)) {
+        text = "'" + base::UTF16ToUTF8(label->GetText()) + "'";
+      }
+      out += base::StringPrintf(" [%s %s vis=%d drawn=%d %s]",
+                                std::string(cell->GetClassName()).c_str(),
+                                cell->bounds().ToString().c_str(),
+                                cell->GetVisible() ? 1 : 0,
+                                cell->IsDrawn() ? 1 : 0, text.c_str());
+    }
+  }
+  return out;
+}
+
+void MouseMuxControlDialog::EnsurePainted() {
+  // Called on every refresh, not only the ones that changed something: a
+  // rebuild that failed to reach the screen must not stay uncorrected until
+  // something else happens to redraw the window.  It destroys no views, so
+  // tooltips survive it.
+  if (views::Widget* widget = GetWidget()) {
+    widget->LayoutRootViewIfNecessary();
+    if (ui::Compositor* compositor = widget->GetCompositor()) {
+      compositor->ScheduleFullRedraw();
+    }
+    widget->GetRootView()->SchedulePaint();
+  }
+  SchedulePaint();
 }
 
 void MouseMuxControlDialog::UpdateKeyboardNote() {
@@ -1205,10 +1859,11 @@ void MouseMuxControlDialog::UpdateKeyboardNote() {
     }
   }
   if (missing_keyboard) {
-    keyboard_note_label_->SetText(
-        u"\u26a0 A user above has no keyboard. In MouseMux, give every user "
-        u"a mouse AND a keyboard, or their typing cannot be routed.");
-    keyboard_note_label_->SetVisible(true);
+    // The row already says "no keyboard" against the user it belongs to, and
+    // its tooltip explains what to do about it. Repeating the explanation
+    // underneath said the same thing twice and made a two-user dialog look
+    // like an error report.
+    keyboard_note_label_->SetVisible(false);
     return;
   }
 
@@ -1260,36 +1915,24 @@ void MouseMuxControlDialog::UpdateKeyboardNote() {
   keyboard_note_label_->SetVisible(true);
 }
 
-void MouseMuxControlDialog::OnOwnerCaptureClicked(int hwid) {
-  auto* controller = content::MouseMuxInputController::GetInstance();
-  // Read the current state rather than trusting the button's caption: the
-  // row may have been drawn before the control server changed things.
-  bool captured = false;
-  for (const auto& owner : controller->GetOwners()) {
-    if (owner.hwid == hwid) {
-      captured = owner.captured;
-      break;
-    }
-  }
-  if (captured) {
-    controller->ReleaseCaptureHwid(hwid);
-  } else {
-    controller->CaptureOwnerHwid(hwid);
-    // Capture steals OS focus to this dialog's window; put it back so the
-    // user can type straight away.
-    controller->FocusKeyboardTargetView();
-  }
-  RebuildOwnerList();
-}
-
 void MouseMuxControlDialog::OnOwnerReleaseClicked(int hwid) {
   // ReleaseOwnerHwid releases capture for this device before dropping it.
   content::MouseMuxInputController::GetInstance()->ReleaseOwnerHwid(hwid);
   RebuildOwnerList();
 }
 
-void MouseMuxControlDialog::OnOwnerCloseWindowClicked(
-    gfx::AcceleratedWidget window) {
+void MouseMuxControlDialog::OnOwnerCloseWindowClicked(int hwid) {
+  // Resolved now, not when the row was built.  Rows are long-lived and people
+  // move between windows, so a handle captured at build time can name a window
+  // that user has left - or one that no longer exists.
+  gfx::AcceleratedWidget window = gfx::AcceleratedWidget();
+  for (const auto& owner :
+       content::MouseMuxInputController::GetInstance()->GetOwners()) {
+    if (owner.hwid == hwid) {
+      window = owner.window;
+      break;
+    }
+  }
   if (!window || !::IsWindow(window)) {
     return;
   }
@@ -1377,15 +2020,6 @@ void MouseMuxControlDialog::OnNewSeatClicked() {
   }
 }
 
-void MouseMuxControlDialog::UpdateCaptureButton() {
-  if (capture_button_) {
-    // Button enabled only when we have an owner.
-    capture_button_->SetEnabled(owner_hwid_ != -1);
-    // Label changes based on capture state.
-    capture_button_->SetText(is_captured_ ? u"Release Capture" : u"Capture Mouse");
-  }
-}
-
 bool MouseMuxControlDialog::OnKeyboardEvent(int vkey, bool shift, bool ctrl, bool alt, bool is_down) {
   // Only check hotkey when captured and on key down.
   if (!is_captured_ || !is_down) {
@@ -1415,12 +2049,8 @@ void MouseMuxControlDialog::OnOwnershipChanged(int hwid, const std::string& name
   owner_hwid_ = hwid;
   owner_name_ = name;
 
-  // Update button states.
-  if (release_owner_button_) {
-    release_owner_button_->SetEnabled(hwid != -1);
-  }
-  UpdateCaptureButton();
-  RebuildOwnerList();
+  UpdateStatusLine();
+  ScheduleRebuild();
 
   // Update title.
   UpdateTitle();

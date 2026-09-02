@@ -80,6 +80,18 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   void SetMouseMuxEnabled(bool enabled);
   bool IsMouseMuxEnabled() const;
 
+  // A snapshot of the dialog's view tree, for diagnosing what reached the
+  // screen and what did not.  The dialog supplies it; content cannot look at
+  // views, so this is a string it hands over rather than anything structured.
+  using DiagnosticsCallback = base::RepeatingCallback<std::string()>;
+  void SetDiagnosticsCallback(DiagnosticsCallback callback);
+  std::string GetDialogDiagnostics() const;
+
+  // The MouseMux version we are connected to, empty when not connected or
+  // before the server has introduced itself.  Passed through from the client
+  // so the dialog does not have to know one exists.
+  std::string GetServerVersion() const;
+
   // Register/unregister views for event injection.
   void RegisterView(RenderWidgetHostViewAura* view);
   void UnregisterView(RenderWidgetHostViewAura* view);
@@ -173,6 +185,16 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // Nothing else in the product shows that, so it shows here.
     int keyboard_hwid = 0;        // 0 = no keyboard on this user
     bool keyboard_typed = false;  // a keystroke has arrived from it
+
+    // Which display this user's window is on, 1-based, 0 when unknown or when
+    // there is only one.  Operators of a four-monitor desk think in screens
+    // rather than window titles, and a title changes as people browse.
+    //
+    // This is an index into the display list, which is not necessarily the
+    // number Windows shows in its own display settings.  It is consistent
+    // within one session, which is what it is for: telling one user's row
+    // from another's at a glance.
+    int screen_index = 0;
   };
 
   // Every current owner, in hwid order so rows do not jump around between
@@ -468,6 +490,13 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // cross-process navigation, so a view pointer would go stale the moment
     // the user followed a link, and the lock would silently release.
     gfx::AcceleratedWidget locked_window = gfx::kNullAcceleratedWidget;
+
+    // The toplevel window this device last clicked in, kept alongside
+    // keyboard_target_view because the view dies with a tab while the window
+    // outlives it.  Without it there is no way, once a view is gone, to tell
+    // "they closed a tab" from "their whole window went away" - and those want
+    // opposite answers.
+    gfx::AcceleratedWidget claimed_window = gfx::kNullAcceleratedWidget;
   };
 
   std::map<int, DeviceState> device_state_;
@@ -482,7 +511,17 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Drops a view from every device's targets — on unregister the pointer is
   // about to dangle, and it may be the target of several devices at once.
+  //
+  // Also decides what a departing view MEANS for its owner: another tab of the
+  // same window takes over, or, if the window itself has gone, that user is
+  // released.
   void ForgetViewEverywhere(RenderWidgetHostViewAura* view);
+
+  // A registered web view in |window|, other than |except|.  Used to retarget
+  // a device when the tab it was working in closes but its window does not.
+  RenderWidgetHostViewAura* OtherWebViewInWindow(
+      gfx::AcceleratedWidget window,
+      RenderWidgetHostViewAura* except) const;
 
   // Owner tracking.
   //
@@ -546,6 +585,7 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Dialog visibility.  Tracked here rather than in the dialog so the control
   // server can report it without reaching across the layering boundary.
   VisibilityChangedCallback visibility_changed_callback_;
+  DiagnosticsCallback diagnostics_callback_;
   bool dialog_visible_ = true;
 
   // Whether the owner's mouse is currently captured.
