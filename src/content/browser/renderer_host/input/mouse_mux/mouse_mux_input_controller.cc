@@ -38,6 +38,7 @@
 #include "ui/events/keycodes/keyboard_code_conversion.h"
 #include "ui/events/keycodes/keyboard_codes.h"
 #include "ui/aura/env.h"
+#include "content/public/common/widget_type.h"
 #include "ui/aura/window.h"
 #include "ui/aura/window_tree_host.h"
 #include "ui/events/event.h"
@@ -212,6 +213,36 @@ void MouseMuxInputController::ForgetViewEverywhere(
     state.claimed_window = gfx::kNullAcceleratedWidget;
     state.locked_window = gfx::kNullAcceleratedWidget;
   }
+}
+
+bool MouseMuxInputController::RecoverStuckInputRouter(
+    RenderWidgetHostViewAura* view,
+    RenderWidgetHostImpl* host,
+    bool has_pending) {
+  if (!has_pending) {
+    pending_since_.erase(view);
+    return false;
+  }
+
+  const base::TimeTicks now = base::TimeTicks::Now();
+  auto [it, inserted] = pending_since_.insert({view, now});
+  if (inserted) {
+    return true;  // First time we have seen this view waiting.
+  }
+
+  // 300ms of un-acked events means the renderer stopped acking - typically
+  // after a view transition - and it will not start again on its own.
+  const base::TimeDelta waiting = now - it->second;
+  if (waiting <= base::Milliseconds(300)) {
+    return true;
+  }
+
+  DiagLog(base::StringPrintf(
+      "*** InputRouter STUCK for %lldms - resetting. view=%p",
+      waiting.InMilliseconds(), static_cast<void*>(view)));
+  host->ResetInputRouterForInjection();
+  pending_since_.erase(it);
+  return false;
 }
 
 void MouseMuxInputController::FlushPendingMotion() {
@@ -673,6 +704,16 @@ MouseMuxInputController::GetOwners() const {
     if (state_it != device_state_.end()) {
       info.captured = state_it->second.captured;
 
+      // Typing activity, for the glyph on the row.  Recent enough to read as
+      // "now"; long enough that a pause between words is not silence.
+      if (!state_it->second.last_key_time.is_null()) {
+        constexpr base::TimeDelta kRecent = base::Milliseconds(1500);
+        if (base::TimeTicks::Now() - state_it->second.last_key_time <
+            kRecent) {
+          info.typing = state_it->second.last_key_dropped ? 2 : 1;
+        }
+      }
+
       // Report the window this user is TYPING in — the keyboard target — which
       // is what "where is this user working" means to an operator.
       RenderWidgetHostViewAura* view = state_it->second.keyboard_target_view;
@@ -715,6 +756,53 @@ RenderWidgetHostViewAura* MouseMuxInputController::OtherWebViewInWindow(
   return nullptr;
 }
 
+RenderWidgetHostViewAura* MouseMuxInputController::ActiveWebViewInWindow(
+    gfx::AcceleratedWidget window) const {
+  if (!window || !::IsWindow(window)) {
+    return nullptr;
+  }
+
+  // Ask the browser first.  It knows which tab is active; everything below is
+  // inference and exists only for windows the browser does not own, or before
+  // the dialog has installed the callback.
+  if (active_view_for_window_callback_) {
+    if (RenderWidgetHostViewAura* active =
+            active_view_for_window_callback_.Run(window)) {
+      if (registered_views_.count(active)) {
+        return active;
+      }
+    }
+  }
+
+  // The LARGEST showing view in the window, not the first one found.
+  //
+  // "Only one view is showing per window" is false, and assuming it cost a
+  // day: every browser window here has a second showing view of 34x34 pixels
+  // alongside the page.  registered_views_ is a std::set ordered by POINTER,
+  // so which one came first was down to allocation addresses - and it was the
+  // small one, so every injected keystroke went into a 34-pixel widget with no
+  // page in it.  Nothing looked wrong from outside: the routing was right, the
+  // window was right, the keystroke was delivered, and it vanished.
+  //
+  // Area is the honest discriminator.  A page fills its window; the incidental
+  // widgets - popups, dropdowns, whatever these are - are small by nature.  It
+  // needs no assumption about how many views a window has.
+  RenderWidgetHostViewAura* best = nullptr;
+  int best_area = 0;
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    if (!view || !view->IsShowing() || ToplevelWindowOf(view) != window) {
+      continue;
+    }
+    const gfx::Rect bounds = view->GetViewBounds();
+    const int area = bounds.width() * bounds.height();
+    if (area > best_area) {
+      best_area = area;
+      best = view;
+    }
+  }
+  return best;
+}
+
 RenderWidgetHostViewAura* MouseMuxInputController::WebViewInWindow(
     gfx::AcceleratedWidget window) const {
   if (!window) {
@@ -733,10 +821,57 @@ MouseMuxInputController::GetKeyRoutes() const {
   return key_routes_;
 }
 
+std::string MouseMuxInputController::GetViewInventory() const {
+  std::string out;
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    if (!view) {
+      continue;
+    }
+    const gfx::Rect bounds = view->GetViewBounds();
+    // Type and name as well as size: a heuristic based on how big something
+    // is deserves to be replaced by one based on what it IS.
+    const char* kind =
+        view->GetWidgetType() == WidgetType::kPopup ? "popup" : "frame";
+    std::string name;
+    if (aura::Window* native = view->GetNativeView()) {
+      name = native->GetName();
+    }
+    out += base::StringPrintf(
+        " | view %p %s '%s' showing=%d focus=%d childframe=%d win=%p "
+        "bounds=%dx%d@%d,%d",
+        static_cast<void*>(view), kind, name.c_str(),
+        view->IsShowing() ? 1 : 0, view->HasFocus() ? 1 : 0,
+        view->IsRenderWidgetHostViewChildFrame() ? 1 : 0,
+        static_cast<void*>(ToplevelWindowOf(view)), bounds.width(),
+        bounds.height(), bounds.x(), bounds.y());
+  }
+  return out;
+}
+
+std::string MouseMuxInputController::GetInjectionStats() const {
+  std::string out;
+  for (const auto& [hwid, s] : injection_stats_) {
+    out += base::StringPrintf(
+        " | inject 0x%x fwd=%d ins=%d no_host=%d ignoring=%d dead=%d "
+        "view_focus=%d page_focus=%d",
+        hwid, s.forwarded, s.inserted, s.no_host, s.host_ignoring,
+        s.renderer_dead, s.last_view_focused ? 1 : 0,
+        s.last_page_focused ? 1 : 0);
+  }
+  return out;
+}
+
 void MouseMuxInputController::RecordKeyRoute(int keyboard_hwid,
                                              int mouse_hwid,
                                              const std::u16string& title,
                                              bool dropped) {
+  // Against the device as well as the list: the row shows activity, the list
+  // is for reading the history out of a running browser.
+  if (mouse_hwid != -1) {
+    DeviceState& state = StateFor(mouse_hwid);
+    state.last_key_time = base::TimeTicks::Now();
+    state.last_key_dropped = dropped;
+  }
   // Collapse repeats.  A sentence of typing is ONE routing decision taken a
   // hundred times, and a list that shows it a hundred times shows nothing —
   // the count is the useful part, not the repetition.
@@ -1011,6 +1146,11 @@ void MouseMuxInputController::SetDiagnosticsCallback(
   diagnostics_callback_ = std::move(callback);
 }
 
+void MouseMuxInputController::SetActiveViewForWindowCallback(
+    ActiveViewForWindowCallback callback) {
+  active_view_for_window_callback_ = std::move(callback);
+}
+
 std::string MouseMuxInputController::GetDialogDiagnostics() const {
   return diagnostics_callback_ ? diagnostics_callback_.Run() : std::string();
 }
@@ -1041,9 +1181,7 @@ void MouseMuxInputController::UnregisterView(RenderWidgetHostViewAura* view) {
   // Clear pointers that reference the unregistered view to prevent
   // dangling pointer access.
   ForgetViewEverywhere(view);
-  if (pending_view_ == view) {
-    pending_view_ = nullptr;
-  }
+  pending_since_.erase(view);
   LogDebug(base::StringPrintf("UnregisterView: now %zu views", registered_views_.size()));
 }
 
@@ -1083,10 +1221,20 @@ void MouseMuxInputController::OnMouseMotion(int hwid, float x, float y) {
     state.has_pending_motion = true;
     // Deliver it anyway if no further motion arrives — otherwise the cursor
     // comes to rest at a position the renderer never saw.
-    motion_flush_timer_.Start(
-        FROM_HERE, kMinMotionInterval,
-        base::BindOnce(&MouseMuxInputController::FlushPendingMotion,
-                       base::Unretained(this)));
+    //
+    // Only if the timer is not already pending.  Start() on a running
+    // OneShotTimer RESTARTS it, and one timer serves every device, so a second
+    // user moving their mouse pushed the deadline back indefinitely: the first
+    // user's cursor came to rest and its final position was never delivered
+    // while anybody else was still moving.  Hover is exactly the thing that
+    // needs the resting position, which is why menus opened sometimes and not
+    // others, and only with more than one person working.
+    if (!motion_flush_timer_.IsRunning()) {
+      motion_flush_timer_.Start(
+          FROM_HERE, kMinMotionInterval,
+          base::BindOnce(&MouseMuxInputController::FlushPendingMotion,
+                         base::Unretained(this)));
+    }
     return;
   }
 
@@ -1150,10 +1298,14 @@ void MouseMuxInputController::OnPenMotion(int hwid,
     state.pending_motion_x = x;
     state.pending_motion_y = y;
     state.has_pending_motion = true;
-    motion_flush_timer_.Start(
-        FROM_HERE, kMinPenInterval,
-        base::BindOnce(&MouseMuxInputController::FlushPendingMotion,
-                       base::Unretained(this)));
+    // Not restarted while pending - see the mouse path for why that starves
+    // a resting cursor when more than one device is moving.
+    if (!motion_flush_timer_.IsRunning()) {
+      motion_flush_timer_.Start(
+          FROM_HERE, kMinPenInterval,
+          base::BindOnce(&MouseMuxInputController::FlushPendingMotion,
+                         base::Unretained(this)));
+    }
     return;
   }
 
@@ -1410,7 +1562,7 @@ void MouseMuxInputController::OnConnectionStateChanged(bool connected) {
 #ifdef MOUSEMUX_PEN_TOUCH_INJECT
     pen_state_.clear();
 #endif
-    pending_view_ = nullptr;
+    pending_since_.clear();
     // Unblock native input so the user isn't stuck with blocked input.
     if (native_input_blocked_) {
       SetNativeInputBlocked(false);
@@ -1734,8 +1886,22 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
   // clicked last.  This is what lets several people type at once: each pair's
   // keystrokes follow its own mouse.
   RenderWidgetHostViewAura* view = nullptr;
-  if (kb_state.keyboard_target_view &&
-      registered_views_.count(kb_state.keyboard_target_view)) {
+
+  // The window this user claimed decides where their typing goes, and the
+  // active tab inside it is looked up fresh every time.
+  //
+  // It used to be the view they clicked in, which is a TAB.  Sites that open
+  // the next part of themselves in a new tab - which is ordinary behaviour,
+  // not an edge case - gave that user a tab their keyboard had never heard
+  // of, and it stopped answering them until they clicked in it. Switching
+  // tabs by hand had the same effect.
+  if (RenderWidgetHostViewAura* active =
+          ActiveWebViewInWindow(kb_state.claimed_window)) {
+    view = active;
+    // Keep the fallback current, for the paths that still read it.
+    kb_state.keyboard_target_view = active;
+  } else if (kb_state.keyboard_target_view &&
+             registered_views_.count(kb_state.keyboard_target_view)) {
     view = kb_state.keyboard_target_view;
   } else if (owners_.size() > 1) {
     // This device has not claimed a window yet, and with several users there
@@ -1748,12 +1914,19 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
     }
     return;
   } else {
-    // Single user: the old fallback, which is safe because there is only one
-    // place the keystroke could go.  First showing view, then any view.
+    // Single user: the largest showing view, for the same reason as
+    // ActiveWebViewInWindow - "the first showing view" can be a 34x34 widget
+    // that swallows every keystroke.
+    int best_area = 0;
     for (RenderWidgetHostViewAura* v : registered_views_) {
-      if (v && v->IsShowing()) {
+      if (!v || !v->IsShowing()) {
+        continue;
+      }
+      const gfx::Rect b = v->GetViewBounds();
+      const int area = b.width() * b.height();
+      if (area > best_area) {
+        best_area = area;
         view = v;
-        break;
       }
     }
     if (!view) {
@@ -2105,31 +2278,8 @@ void MouseMuxInputController::InjectMouseEvent(
   // renderer stopped acking events (typically after a view transition).
   // Reset the InputRouter to clear the stuck state, mirroring what
   // ResetStateForCreatedRenderWidget() does during widget creation.
-  bool has_pending = host->input_router()->HasPendingEvents();
-  if (has_pending) {
-    if (pending_view_ != view) {
-      // New view with pending state - start tracking.
-      pending_view_ = view;
-      pending_start_time_ = base::TimeTicks::Now();
-    } else {
-      base::TimeDelta pending_duration =
-          base::TimeTicks::Now() - pending_start_time_;
-      if (pending_duration > base::Milliseconds(300)) {
-        DiagLog(base::StringPrintf(
-            "*** InputRouter STUCK for %lldms - resetting. view=%p",
-            pending_duration.InMilliseconds(),
-            static_cast<void*>(view)));
-        host->ResetInputRouterForInjection();
-        pending_view_ = nullptr;
-        has_pending = false;  // Cleared now.
-      }
-    }
-  } else {
-    // Not pending anymore - clear tracking.
-    if (pending_view_ == view) {
-      pending_view_ = nullptr;
-    }
-  }
+  RecoverStuckInputRouter(view, host,
+                          host->input_router()->HasPendingEvents());
 
   // Diagnostic: check if the host will silently drop this event.
   bool is_ignoring = host->IsIgnoringWebInputEvents(event);
@@ -2142,7 +2292,7 @@ void MouseMuxInputController::InjectMouseEvent(
   if (should_log_diag) {
     DiagLog(base::StringPrintf(
         "DIAG MOUSE: ignoring=%d pending=%d views=%zu view=%p",
-        is_ignoring, has_pending,
+        is_ignoring, host->input_router()->HasPendingEvents(),
         registered_views_.size(), static_cast<void*>(view)));
   }
 
@@ -2551,27 +2701,12 @@ void MouseMuxInputController::InjectWheelEvent(
   event.delta_units = ui::ScrollGranularity::kScrollByPrecisePixel;
   event.dispatch_type = blink::WebInputEvent::DispatchType::kBlocking;
 
-  // Detect stuck InputRouter for wheel events too.
-  bool wheel_pending = host->input_router()->HasPendingEvents();
-  if (wheel_pending) {
-    if (pending_view_ != view) {
-      pending_view_ = view;
-      pending_start_time_ = base::TimeTicks::Now();
-    } else {
-      base::TimeDelta pending_duration =
-          base::TimeTicks::Now() - pending_start_time_;
-      if (pending_duration > base::Milliseconds(300)) {
-        DiagLog(base::StringPrintf(
-            "*** InputRouter STUCK (wheel) for %lldms - resetting. view=%p",
-            pending_duration.InMilliseconds(),
-            static_cast<void*>(view)));
-        host->ResetInputRouterForInjection();
-        pending_view_ = nullptr;
-      }
-    }
-  } else if (pending_view_ == view) {
-    pending_view_ = nullptr;
-  }
+  // The wheel wedges the same way clicks do, and shares the same recovery -
+  // the customer report that led here was "the pointer still moves but
+  // scrolling stopped", which is one view's router stuck while the OS cursor
+  // carries on regardless.
+  RecoverStuckInputRouter(view, host,
+                          host->input_router()->HasPendingEvents());
 
   // Check if the host will drop this event.
   bool wheel_ignoring = host->IsIgnoringWebInputEvents(event);
@@ -2704,12 +2839,23 @@ void MouseMuxInputController::InjectKeyboardEvent(
     return;
   }
 
+  InjectionStats& stats = injection_stats_[hwid];
+
   RenderWidgetHostImpl* host = RenderWidgetHostImpl::From(
       view->GetRenderWidgetHost());
   if (!host) {
+    ++stats.no_host;
     LogDebug("InjectKeyboardEvent: host is null!");
     return;
   }
+
+  // Recorded rather than acted on: if the renderer is discarding our events,
+  // that is the answer, and it is not something this code can force.
+  if (!host->IsInitializedAndNotDead()) {
+    ++stats.renderer_dead;
+  }
+  stats.last_view_focused = view->HasFocus();
+  stats.last_page_focused = host->is_focused();
 
 #ifdef MOUSEMUX_MULTI_OWNER
   // No OS focus manipulation at all.  Under capture there is no native input
@@ -2886,6 +3032,13 @@ void MouseMuxInputController::InjectKeyboardEvent(
   // Forward the kRawKeyDown/kKeyUp event (fires JS keydown/keyup).
   input::NativeWebKeyboardEvent native_event(event, gfx::NativeView());
   native_event.skip_if_unhandled = true;
+  // Whether the host will silently discard this, recorded before the call:
+  // a forwarded event that the renderer is ignoring looks exactly like a
+  // delivered one from anywhere outside this function.
+  if (host->IsIgnoringWebInputEvents(native_event)) {
+    ++stats.host_ignoring;
+  }
+  ++stats.forwarded;
   host->ForwardKeyboardEvent(native_event);
 
   // For character keys on keydown, call InsertChar to trigger text insertion.
@@ -2924,6 +3077,7 @@ void MouseMuxInputController::InjectKeyboardEvent(
           vkey, static_cast<unsigned>(ch)));
 #endif
 
+      ++stats.inserted;
       view->InsertChar(char_event);
     }
   }

@@ -1,7 +1,7 @@
 # Building the release package
 
-The thing we ship is **`native-chrome.zip`**, and it is not just a zip of the
-build directory. It is a MouseMux *app pack*: MouseMux's app browser reads
+The thing we ship is **`native-chrome-<version>-<date>.zip`**, and it is not
+just a zip of the build directory. It is a MouseMux *app pack*: MouseMux's app browser reads
 `app.json` out of it, shows `logo.jpg` and `icon.png`, and launches
 `chrome.exe` with the command line the manifest gives. Get its shape wrong and
 it does not appear in MouseMux at all.
@@ -14,7 +14,13 @@ python github-repo/package/make-release.py --version 2.2.58
 ```
 
 That produces `chrome-release-<version>-<date>/native-chrome/` and zips it as
-`native-chrome.zip` beside it. The reference package it was derived from,
+`native-chrome-<version>-<date>.zip` beside it.
+
+The FOLDER inside the zip must stay `native-chrome` — `app.json`'s
+`"base": "native-chrome"` names it and the app browser reads the manifest from
+there, so renaming the folder makes the pack invisible. The FILE name is free,
+and carries the version because the reference package did not: two builds a
+month apart were both `native-chrome.zip` and indistinguishable once emailed. The reference package it was derived from,
 which is the last hand-built one, is
 `C:\Users\dev\Desktop\MouseWithoutBorders\native-chrome.zip`.
 
@@ -28,19 +34,35 @@ copy `package/` across or the packager will stop and tell you what is missing.
 
 ## Before running it
 
-1. **Build, and let the link finish.** The package copies `chrome.dll`
+1. **Confirm the debug switches are OFF.** In
+   `content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h`, both
+   `MOUSEMUX_DEBUG` and `MOUSEMUX_DEBUG_TRACE` must be commented out — and
+   `MOUSEMUX_DEBUG_TRACE` again in
+   `ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc`, which keeps
+   its own mirrored copy. With either on, **every keystroke is written to
+   disk**. They were both switched on deliberately on 2026-09-03 to chase a
+   bug, which is exactly how a release ships with them still on.
+
+   ```
+   grep -n "define MOUSEMUX_DEBUG" mouse_mux_config.h
+   ```
+
+   Then delete any logs left behind: `O:\tmp\mousemux_debug.log`,
+   `O:\tmp\mousemux_diag.log`, `O:\chrome-log.txt`.
+
+2. **Build, and let the link finish.** The package copies `chrome.dll`
    straight from `out/Release`, so a stale DLL ships silently. Close Chrome
    first or the link fails and you package the previous build.
-2. **Check the build number.** `kBuildNumber` and `kBuildDate` in
+3. **Check the build number.** `kBuildNumber` and `kBuildDate` in
    `mouse_mux_control_dialog.cc`, and `kClientVersion` in
    `mouse_mux_client.cc`, must all match the version you are packaging. The
    script warns when the dialog disagrees. This has been wrong before: 2.2.55
    and 2.2.56 both shipped reporting build #54.
-3. **Retake the screenshot** if the dialog has changed —
+4. **Retake the screenshot** if the dialog has changed —
    `github-repo/package/screenshot.png`. It is the only picture of the product
    a customer sees before running it, and a screenshot of the previous UI is
    worse than none.
-4. **Update the README.** `github-repo/docs/RELEASE-README.md` is the source;
+5. **Update the README.** `github-repo/docs/RELEASE-README.md` is the source;
    the package gets two copies of it (see below).
 
 ---
@@ -71,17 +93,20 @@ Around 176 MB and 42 files when it is right.
 
 ---
 
-## `app.json`: one open question, one thing to remember
+## `app.json`: two things to remember
 
 Neither is something to fix by guessing, and both are worth putting to
 whoever owns the MouseMux side.
 
-**`mode.hint` says `switched`.** So do `native-freerdp` and
-`native-rustdesk` — it is the only value attested anywhere I can find. But
-Switched mode gives one user at a time, and this build exists so that several
-people can work *simultaneously*, which is Multiplex. The hint, and the help
-text beside it, are advising the mode this product is not for. Changing it
-means knowing the vocabulary the loader accepts.
+**`mode.hint` says `switched`, and that is correct.** Verified on hardware on
+2026-09-03: two users typing simultaneously in two windows, in Switched mode
+with multi-keyboard on. The name is misleading if you reason from it rather
+than testing it - "switched" does not mean one user at a time here - and this
+document previously claimed the hint was wrong on exactly that reasoning.
+
+What is NOT optional is **multi keyboard**. Without it there is no low-level
+keyboard hook, so keystrokes carry no per-device identity and arrive as
+ordinary focus-driven Windows input. Nothing downstream can separate them.
 
 **`make` tracks the MouseMux version**, and is set by hand. It sat at `3.0.11`
 against a 3.0.17 server until 2.2.58, when it was corrected to `3.0.21`.

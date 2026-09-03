@@ -181,6 +181,16 @@
 // the last writes when the browser crashes or is killed, which is exactly the
 // moment the tail of the log matters most.  Falls back to %TEMP% when the
 // configured drive does not exist on the target machine.
+//
+// The suppression below is scoped to this one function on purpose.  Chromium
+// 151 rejects fprintf/vfprintf/va_list under -Wunsafe-buffer-usage, and the
+// sanctioned alternative - listing our directory in unsafe_buffers_paths.txt -
+// would switch those checks off for ALL of our code permanently, to make a
+// debug facility compile.  This way the exemption disappears with the trace
+// build it exists for.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
 static inline void MouseMuxTrace(const char* stage, const char* fmt, ...) {
   FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH, "a");
   if (!f) {
@@ -209,6 +219,7 @@ static inline void MouseMuxTrace(const char* stage, const char* fmt, ...) {
   fputc('\n', f);
   fclose(f);
 }
+#pragma clang diagnostic pop
 
 #define MMTRACE(stage, ...) MouseMuxTrace(stage, __VA_ARGS__)
 #else

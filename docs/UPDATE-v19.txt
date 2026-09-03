@@ -189,8 +189,10 @@ dialog, because the diagnosis needed information the dialog had never shown.
      - more than two users. The list is built for sixteen to twenty-four and
        nothing in the routing is limited to two, but that is inference.
      - pen and touch, still never run on hardware (unchanged since 2.2.53)
-     - the mouse wheel, reported as not scrolling and not yet diagnosed;
-       nothing in this release touches the wheel path
+     - the mouse wheel on pages that scroll a nested element rather than the
+       page itself. Wheel injection works - verified on an ordinary long page
+       - and Gmail, where it was first noticed, does not respond. Nothing in
+       this release touches the wheel path either way.
      - layouts other than US and ABNT2
 
    The known-good fallback remains 2.2.55 on Chromium 146.

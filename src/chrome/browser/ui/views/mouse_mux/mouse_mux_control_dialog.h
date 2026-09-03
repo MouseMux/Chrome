@@ -155,13 +155,6 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // built.
   void ScheduleRebuild();
 
-  // Fills in the line under the owner list — see keyboard_note_label_.
-  // Takes no owner list, and asks the controller for its own: this header
-  // deliberately does not include the controller's, so it cannot name
-  // OwnerInfo, and pulling that header in here would rebuild all of
-  // chrome/browser/ui on every controller edit.
-  void UpdateKeyboardNote();
-
   // Per-owner row actions, all keyed by |hwid|.
   //
   // Deliberately NOT by window handle: rows outlive the window a user happened
@@ -228,10 +221,20 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
     raw_ptr<views::Label> name = nullptr;
     raw_ptr<views::Label> keyboard = nullptr;
     raw_ptr<views::Label> where = nullptr;
+    raw_ptr<views::Label> typing = nullptr;
     raw_ptr<views::Checkbox> capture = nullptr;
     raw_ptr<views::MdTextButton> close = nullptr;
   };
   std::vector<OwnerRow> owner_rows_;
+
+  // False until the rows have been built once.
+  //
+  // Without it, the very first refresh - no owners, nothing built - is
+  // indistinguishable from "nothing has changed since the last build", so the
+  // skip fires and the empty-state message is never created.  An empty list
+  // and an unbuilt list look identical from the data and are not the same
+  // thing.
+  bool list_built_ = false;
 
   // The user set the rows were built from - see OwnerMembership().
   std::string owner_membership_;
@@ -241,10 +244,6 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   // What the rows were last drawn from - see OwnerSignature().
   std::string owner_signature_;
-
-  // One line under the owner list: either a warning that a user has no
-  // keyboard assigned in MouseMux, or where recent typing actually went.
-  raw_ptr<views::Label> keyboard_note_label_ = nullptr;
 
   // Owners' window titles change as they browse, and nothing notifies us when
   // a user clicks into a different window, so the list is refreshed on a

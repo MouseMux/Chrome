@@ -1,0 +1,153 @@
+MouseMux Chrome Patches v20 - Build #59 - 2026-09-03
+=====================================================
+
+Chromium base: 151.0.7922.77 (unchanged from 2.2.58)
+Client version reported to the SDK: 2.2.59
+
+Three faults reported from the field against 2.2.58, all three real, all three
+the same underlying mistake: state that was correct when one device could
+drive Chrome and became wrong when several could.
+
+
+1. A USER OWNS A WINDOW, NOT A TAB
+
+   Reported as: the web application opens the next part of itself in a new tab
+   beside the current one - ordinary behaviour, not an edge case - and that tab
+   does not answer the user's mouse and keyboard.
+
+   Correct, and the customer's own summary of the fix was exactly right:
+   MouseMux user = Chrome window, not tab.
+
+   A user's keyboard was bound to a RenderWidgetHostViewAura, which IS a tab.
+   A tab the site opened had no relationship to anything that user had
+   claimed, so their keystrokes fell through to a fallback. Switching tabs by
+   hand had the same effect.
+
+   Ownership is now the WINDOW, and the active tab inside it is resolved on
+   every keystroke.
+
+   Resolved by ASKING THE BROWSER, not by inference. The dialog installs a
+   callback that maps a window handle to that window's active tab, via
+   TabStripModel::GetActiveWebContents(); content/ cannot see a tab strip, so
+   the knowledge comes down through the same callback pattern the rest of this
+   feature uses.
+
+   The first attempt did infer it - "the first registered view in that window
+   that reports it is showing" - and that was wrong in a way worth recording,
+   because nothing about it looked wrong. Every browser window has TWO views
+   registered that both report themselves as showing frames with identical
+   names: the page, and a second one of 34x34 pixels. registered_views_ is a
+   std::set ordered by POINTER, and the small one sorted first, so every
+   injected keystroke went into a 34-pixel widget with no page in it. The
+   routing was right, the window was right, the event was delivered, and it
+   vanished.
+
+   It was invisible for a further reason: with the device uncaptured, Windows
+   was still delivering keys natively to the real tab, so it looked like it
+   worked. Capture removes the native path, and only then was it clear that
+   injection had been landing nowhere.
+
+   WidgetType, the aura window name and the child-frame flag are all identical
+   between those two views, so nothing but geometry - or the browser itself -
+   can tell them apart. Hence the callback. Largest-area remains as a fallback
+   for windows the browser does not own.
+
+
+2. HOVER
+
+   Reported as: menus that open on hover are inconsistent - sometimes the
+   submenu appears, sometimes the page does not seem to notice the pointer.
+
+   Motion is throttled to 60fps per device, and when a move arrives too soon
+   its position is held and delivered by a timer, so that a cursor coming to
+   rest still tells the renderer where it stopped. Hover depends entirely on
+   that final position.
+
+   There was ONE timer for every device, and Start() on a running OneShotTimer
+   restarts it. So while any other user kept moving their mouse, the resting
+   position of the first user was postponed indefinitely and never sent. The
+   timer is no longer restarted while it is pending.
+
+   This could only ever happen with more than one person working, which is
+   why it read as flaky rather than broken.
+
+
+3. CLICKS AND SCROLLING DEGRADING OVER TIME
+
+   Reported as: after using the application for a while, the wheel stops
+   scrolling and clicks become unreliable in a captured window, while the
+   pointer still moves.
+
+   Chrome's InputRouter can be left holding un-acked events - typically after
+   a view transition - and does not recover on its own. We detect that and
+   reset it after 300ms.
+
+   The detection tracked ONE view and ONE timestamp. Injecting into a
+   different view restarted the clock, so with two users working in two
+   windows the "pending for more than 300ms" test could never come true and a
+   genuinely wedged view was never reset. That window then stopped taking
+   clicks and the wheel while its cursor carried on moving - the cursor being
+   an OS thing that needs nothing from us, which is exactly the reported
+   symptom.
+
+   Tracking is now per view, shared by the click and wheel paths, and cleaned
+   up when a view goes away.
+
+
+4. WHAT THE SETUP ACTUALLY REQUIRES
+
+   Two facts established on hardware, both of which belong in customer
+   instructions.
+
+   SWITCHED mode, with MULTI KEYBOARD ON. Multi keyboard is the part that is
+   not optional: without it there is no low-level keyboard hook, keystrokes
+   carry no per-device identity, and nothing downstream can separate them.
+   (Earlier notes in this repo claimed this product needs Multiplex. That was
+   reasoned from the word "switched" rather than tested, and it is wrong.)
+
+   MouseMux does not report a user's keyboard over the SDK until that keyboard
+   has been USED once. Before that first keystroke there is no pairing to
+   route by, and with several owners those keys are dropped rather than
+   guessed at. Each user should press a key before capture.
+
+
+5. DIAGNOSTICS
+
+   The control server now reports, on request: per-device injection counters
+   (forwards, InsertChars, whether the host was ignoring input, whether the
+   renderer was dead, focus state), an inventory of every registered view with
+   its type, name, showing state, window and bounds, and the recent key
+   routing history.
+
+   Counters and geometry only - no key codes, no characters, nothing written
+   to disk - so it stays compiled into release builds. It turned a day of
+   guessing into a single query, and it is the reason section 1 above has an
+   explanation rather than a theory.
+
+   The dialog shows the same thing at a glance: each user's row says "typing"
+   in green while their keys are landing, or IGNORED in red when they are
+   being dropped.
+
+   The in-dialog debug log panel is gone. It duplicated the log file, fought
+   the user list for vertical space until the panes overlapped, and made the
+   debug dialog a different dialog from the release one - which is how a debug
+   build ends up missing the control you are trying to test.
+
+
+6. VERIFIED, AND NOT
+
+   Verified on hardware 2026-09-03:
+     - two users, two mice, two keyboards, each typing into their own window
+     - a tab opened by the page inheriting its window's user, with no click
+     - switching tabs by hand, and closing them
+     - Switched mode with multi keyboard, captured, with and without native
+       input blocking
+
+   NOT verified:
+     - hover (2) and long-run degradation (3). Both were diagnosed from code
+       and fixed with confidence, but confirming them needs two people doing
+       real work for a sustained period, which is the customer's bench.
+     - four users. Two work.
+     - pen and touch, still never run on hardware.
+
+   The known-good fallback remains 2.2.55 on Chromium 146.

@@ -38,6 +38,7 @@ class WebMouseEvent;
 namespace content {
 
 class MouseMuxControlServer;
+class RenderWidgetHostImpl;
 class RenderWidgetHostViewAura;
 
 // Singleton controller that coordinates MouseMux integration.
@@ -186,6 +187,9 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     int keyboard_hwid = 0;        // 0 = no keyboard on this user
     bool keyboard_typed = false;  // a keystroke has arrived from it
 
+    // Typing activity: 0 nothing recently, 1 delivered, 2 dropped.
+    int typing = 0;
+
     // Which display this user's window is on, 1-based, 0 when unknown or when
     // there is only one.  Operators of a four-monitor desk think in screens
     // rather than window titles, and a title changes as people browse.
@@ -220,6 +224,40 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Most recent last.  Bounded by kMaxKeyRoutes.
   std::vector<KeyRoute> GetKeyRoutes() const;
+
+  // What happened to keystrokes AFTER they were routed.
+  //
+  // Routing is observable already - the dialog shows each user typing - but
+  // that only proves the event reached a view.  Everything past that point is
+  // invisible from outside: whether we called into the renderer at all, and
+  // whether the renderer took it.  Those two look identical from the dialog
+  // and have completely different causes.
+  //
+  // Counters only.  No key codes, no characters, nothing that identifies what
+  // was typed, so this stays compiled in and can be read from a customer's
+  // machine over the control server.
+  std::string GetInjectionStats() const;
+
+  // Every registered view, with whether it claims to be showing and which
+  // window it is in.  The keyboard goes to "the first showing view in the
+  // user's window", and if more than one answers that, the choice is
+  // arbitrary and can land in a tab nobody is looking at.
+  std::string GetViewInventory() const;
+
+  // Asks the browser which view belongs to the active tab of a window.
+  //
+  // The authoritative answer to "which page is this person looking at",
+  // supplied by the dialog because only chrome/browser/ui can see a tab strip
+  // and content/ must not depend on it.  Returns null when the window is not
+  // a browser window or the callback is not installed.
+  //
+  // Worth the plumbing: guessing this from the views we happen to have
+  // registered cost a day.  Two views in one window both reported themselves
+  // as showing frames with identical names, and the one that sorted first was
+  // a 34x34 widget that swallowed every keystroke.
+  using ActiveViewForWindowCallback =
+      base::RepeatingCallback<RenderWidgetHostViewAura*(gfx::AcceleratedWidget)>;
+  void SetActiveViewForWindowCallback(ActiveViewForWindowCallback callback);
 
   // Launches another seat: a separate browser process with its own profile,
   // control port and dialog.  Picks the lowest free seat itself and starts
@@ -497,6 +535,13 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // "they closed a tab" from "their whole window went away" - and those want
     // opposite answers.
     gfx::AcceleratedWidget claimed_window = gfx::kNullAcceleratedWidget;
+
+    // When this pair last typed, and whether that keystroke was delivered.
+    // Read by the dialog to show typing activity per user - a sentence
+    // describing where everybody's keys went was unreadable at two users and
+    // would be absurd at twenty.
+    base::TimeTicks last_key_time;
+    bool last_key_dropped = false;
   };
 
   std::map<int, DeviceState> device_state_;
@@ -522,6 +567,17 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   RenderWidgetHostViewAura* OtherWebViewInWindow(
       gfx::AcceleratedWidget window,
       RenderWidgetHostViewAura* except) const;
+
+  // The web view of the ACTIVE tab in |window|, or null.
+  //
+  // This is what a user's keyboard follows, rather than the view they happened
+  // to click in.  A user owns a WINDOW; the tab showing inside it is Chrome's
+  // business and changes without anybody claiming anything - the site opens
+  // one, they switch to it, they close it again.  Binding input to a view
+  // meant a tab the site opened for them inherited nothing and stopped
+  // answering their keyboard.
+  RenderWidgetHostViewAura* ActiveWebViewInWindow(
+      gfx::AcceleratedWidget window) const;
 
   // Owner tracking.
   //
@@ -586,6 +642,7 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // server can report it without reaching across the layering boundary.
   VisibilityChangedCallback visibility_changed_callback_;
   DiagnosticsCallback diagnostics_callback_;
+  ActiveViewForWindowCallback active_view_for_window_callback_;
   bool dialog_visible_ = true;
 
   // Whether the owner's mouse is currently captured.
@@ -605,6 +662,18 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // different faults with different fixes, and indistinguishable without it.
   std::set<int> keyboards_seen_;
 
+  // See GetInjectionStats().
+  struct InjectionStats {
+    int forwarded = 0;       // ForwardKeyboardEvent calls
+    int inserted = 0;        // InsertChar calls
+    int no_host = 0;         // view had no RenderWidgetHostImpl
+    int host_ignoring = 0;   // host said it was ignoring web input
+    int renderer_dead = 0;   // no live renderer to send to
+    bool last_view_focused = false;
+    bool last_page_focused = false;
+  };
+  std::map<int, InjectionStats> injection_stats_;
+
   // Keyboard routing history for the dialog — see KeyRoute.
   static constexpr size_t kMaxKeyRoutes = 6;
   std::vector<KeyRoute> key_routes_;
@@ -618,8 +687,23 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // InputRouter pending-state tracking for stuck ACK detection.
   // When the InputRouter has had pending events for too long, we reset it.
-  base::TimeTicks pending_start_time_;
-  raw_ptr<RenderWidgetHostViewAura> pending_view_ = nullptr;
+  // When each view's InputRouter started holding un-acked events.
+  //
+  // Per VIEW, not one at a time.  It used to be a single view pointer and a
+  // single timestamp: whenever injection touched a different view the clock
+  // restarted, so with two people working in two windows the "stuck for more
+  // than 300ms" test could never come true, and a genuinely stuck router was
+  // never reset.  That view then stopped answering clicks and the wheel while
+  // its cursor carried on moving - which is an OS thing and needs nothing
+  // from us - so it looked like input decaying after a while rather than one
+  // view wedging.
+  std::map<raw_ptr<RenderWidgetHostViewAura>, base::TimeTicks> pending_since_;
+
+  // Resets |view|'s InputRouter if it has been waiting too long, and returns
+  // whether anything is still pending afterwards.
+  bool RecoverStuckInputRouter(RenderWidgetHostViewAura* view,
+                               RenderWidgetHostImpl* host,
+                               bool has_pending);
 
   // Notify ownership changed.
   void NotifyOwnershipChanged();

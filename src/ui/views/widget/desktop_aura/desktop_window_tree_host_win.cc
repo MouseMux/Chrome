@@ -98,6 +98,13 @@
 #include <stdio.h>
 
 #define MOUSEMUX_DEBUG_TRACE_PATH "O:\\chrome-log.txt"
+// Scoped to this debug-only helper: Chromium 151 rejects fprintf and
+// va_list, and the alternative is exempting this whole file from the
+// unsafe-buffer checks permanently. Mirrors the same block in
+// mouse_mux_config.h.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
 static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
   FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH, "a");
   if (!f) {
@@ -114,6 +121,8 @@ static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
   fputc('\n', f);
   fclose(f);
 }
+#pragma clang diagnostic pop
+
 #define MMTRACE_VIEWS(stage, ...) MouseMuxTraceViews(stage, __VA_ARGS__)
 #else
 #define MMTRACE_VIEWS(stage, ...) ((void)0)

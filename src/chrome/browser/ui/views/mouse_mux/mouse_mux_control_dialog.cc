@@ -39,6 +39,8 @@
 #include "chrome/browser/ui/tabs/tab_strip_model.h"
 #include "chrome/browser/ui/views/chrome_layout_provider.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
+#include "content/browser/renderer_host/render_widget_host_view_aura.h"
+#include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
 #include "ui/base/base_window.h"
 #include "ui/display/screen.h"
@@ -124,12 +126,12 @@ class HotkeyComboboxModel : public ui::ComboboxModel {
   }
 };
 
-// Shown in the dialog footer.  MUST track the release version — 2.2.58 is
-// build #58 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
+// Shown in the dialog footer.  MUST track the release version — 2.2.59 is
+// build #59 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
 // 2.2.56 releases, so the dialog reported a build three versions older than the
 // binary it was part of, which makes it impossible to tell by looking whether
 // someone is running what you think they are.
-constexpr int kBuildNumber = 58;
+constexpr int kBuildNumber = 59;
 
 // Product name, used for the window title.  The build number lives in the
 // footer with the build date rather than the title, which should read as a
@@ -148,8 +150,10 @@ constexpr char kProductName[] = "MouseMux Multi-Seat Chrome Control";
 constexpr int kWindowIconSize = 24;
 
 #ifdef MOUSEMUX_DEBUG
-constexpr int kDialogWidth = 600;
-constexpr int kDialogHeight = 500;
+// The same size as the release dialog: with the log panel gone there is
+// nothing left that a debug build needs extra room for.
+constexpr int kDialogWidth = 660;
+constexpr int kDialogHeight = 520;
 constexpr int kLogFlushThreshold = 5;
 const char kLogFilePath[] = MOUSEMUX_DEBUG_LOG_PATH;
 #else
@@ -165,6 +169,17 @@ constexpr int kDialogHeight = 520;
 
 // How much of the list is shown before it scrolls.  Four users fit; a fifth
 // scrolls rather than squeezing everybody.
+
+// Date only.  A "TRACE" suffix was hardcoded here on 2026-08-04 and left in,
+// so ordinary builds claimed to be trace builds that log input to disk.  The
+// trace warning belongs in kProductName above, where it is #ifdef-guarded and
+// cannot lie.  Do not put build flavour in this string.
+const char kBuildDate[] = "2026-09-03";
+#endif
+
+// How much of the user list is shown before it scrolls.  Outside the debug
+// guard because the list exists in both builds - it was inside, so turning
+// debug on stopped the dialog compiling.
 constexpr int kListMinHeight = 40;
 constexpr int kListMaxHeight = 240;
 
@@ -172,12 +187,8 @@ constexpr int kListMaxHeight = 240;
 // icon and one button, so it can be much smaller than the dialog.
 constexpr int kCollapsedWidth = 150;
 constexpr int kCollapsedHeight = 52;
-// Date only.  A "TRACE" suffix was hardcoded here on 2026-08-04 and left in,
-// so ordinary builds claimed to be trace builds that log input to disk.  The
-// trace warning belongs in kProductName above, where it is #ifdef-guarded and
-// cannot lie.  Do not put build flavour in this string.
-const char kBuildDate[] = "2026-09-02";
-#endif
+// Outside the debug guard: collapsing works in both builds, so its sizes
+// cannot live in the non-debug branch.
 
 constexpr int kSpacing = 12;
 constexpr int kToggleSpacing = 8;
@@ -332,6 +343,47 @@ std::u16string Where(
 int WhereStyle(const content::MouseMuxInputController::OwnerInfo& owner) {
   return owner.has_window ? views::style::STYLE_SECONDARY
                           : views::style::STYLE_DISABLED;
+}
+
+// Typing activity, as one glyph. A sentence naming where everybody's keys
+// went was unreadable with two users and would be absurd with twenty; this is
+// the same information at a glance, per row.
+std::u16string Typing(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  // A word, not a symbol. A 16px glyph in a row of text is invisible, and
+  // the keyboard character may have no font at all - the operator asked for
+  // this three times before it was legible.
+  if (owner.typing == 1) {
+    return u"typing";
+  }
+  if (owner.typing == 2) {
+    return u"IGNORED";
+  }
+  return std::u16string();
+}
+
+SkColor TypingColor(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.typing == 1) {
+    return kDotOk;
+  }
+  if (owner.typing == 2) {
+    return kDotBad;
+  }
+  return SkColorSetRGB(0xBD, 0xC1, 0xC6);
+}
+
+std::u16string TypingTip(
+    const content::MouseMuxInputController::OwnerInfo& owner) {
+  if (owner.typing == 1) {
+    return u"Typing now, and their keys are reaching their window.";
+  }
+  if (owner.typing == 2) {
+    return u"Typing now, but their keys are being ignored - see the keyboard "
+           u"column. A keyboard that is not assigned to this user in MouseMux "
+           u"cannot be routed.";
+  }
+  return u"Not typing.";
 }
 
 }  // namespace row_text
@@ -592,6 +644,10 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
   // filled blue - the loudest thing in the window - which is the wrong
   // emphasis for the one control that closes everybody's windows.
   SetButtonStyle(ui::mojom::DialogButton::kCancel, ui::ButtonStyle::kTonal);
+  // And not the default button: the frame draws the default one prominently
+  // whatever style it was given, which is how the control that closes
+  // everybody's windows ended up as the brightest thing in the dialog.
+  SetDefaultButton(static_cast<int>(ui::mojom::DialogButton::kNone));
 
   SetModalType(ui::mojom::ModalType::kNone);
   set_draggable(true);
@@ -631,6 +687,41 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
   controller->SetCaptureChangedCallback(
       base::BindRepeating(&MouseMuxControlDialog::OnCaptureStateChanged,
                           base::Unretained(this)));
+
+  // Tell the controller which view belongs to the active tab of a window.
+  //
+  // Only this layer can answer that: a tab strip is a chrome/browser/ui
+  // concept and content/ cannot see one.  Without it the controller has to
+  // infer the active tab from the views it happens to have registered, and
+  // that inference was wrong in a way that swallowed every keystroke.
+  controller->SetActiveViewForWindowCallback(base::BindRepeating(
+      [](gfx::AcceleratedWidget window)
+          -> content::RenderWidgetHostViewAura* {
+        if (!window) {
+          return nullptr;
+        }
+        for (BrowserWindowInterface* browser :
+             GetAllBrowserWindowInterfaces()) {
+          ui::BaseWindow* base_window = browser->GetWindow();
+          aura::Window* native =
+              base_window ? base_window->GetNativeWindow() : nullptr;
+          if (!native || !native->GetHost() ||
+              native->GetHost()->GetAcceleratedWidget() != window) {
+            continue;
+          }
+          TabStripModel* model = browser->GetTabStripModel();
+          if (!model) {
+            return nullptr;
+          }
+          content::WebContents* active = model->GetActiveWebContents();
+          if (!active) {
+            return nullptr;
+          }
+          return static_cast<content::RenderWidgetHostViewAura*>(
+              active->GetRenderWidgetHostView());
+        }
+        return nullptr;
+      }));
 
   // Report the view tree to the control server, so the state of a dialog
   // that has drawn wrongly can be read from outside instead of guessed at.
@@ -1079,18 +1170,6 @@ void MouseMuxControlDialog::SetupContents() {
   owner_list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
       views::BoxLayout::Orientation::kVertical, gfx::Insets(), 2));
 
-  // Where typing actually went.  The rows above say where each user is
-  // WORKING; this says where their KEYS landed, and the two differ exactly
-  // when something is misconfigured - which is the case nobody can otherwise
-  // diagnose from the outside.
-  keyboard_note_label_ =
-      users_pane->AddChildView(std::make_unique<views::Label>(
-          std::u16string(), views::style::CONTEXT_DIALOG_BODY_TEXT,
-          views::style::STYLE_SECONDARY));
-  keyboard_note_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  keyboard_note_label_->SetElideBehavior(gfx::ELIDE_TAIL);
-  keyboard_note_label_->SetVisible(false);
-
   // ---------------------------------------------------------------------
   // Pane 3 - options that apply to everybody.
   // ---------------------------------------------------------------------
@@ -1210,22 +1289,11 @@ void MouseMuxControlDialog::SetupContents() {
   build_label_ = SetExtraView(std::move(footer));
 #endif
 
-#ifdef MOUSEMUX_DEBUG
-  // Debug log section.
-  auto* debug_label = AddChildView(std::make_unique<views::Label>(
-      u"Debug Log:", views::style::CONTEXT_DIALOG_BODY_TEXT,
-      views::style::STYLE_PRIMARY));
-  debug_label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-
-  // Debug textarea.
-  debug_log_ = AddChildView(std::make_unique<views::Textarea>());
-  debug_log_->SetPlaceholderText(u"Debug output will appear here...");
-  debug_log_->SetReadOnly(true);
-  debug_log_->SetFontList(gfx::FontList("Consolas, 10px"));
-
-  // Make the textarea expand to fill available space.
-  layout->SetFlexForView(debug_log_, 1);
-#endif
+  // No in-dialog log panel, even in debug builds.  It duplicated the log file,
+  // and as a second flex child it fought the users pane for height until the
+  // panes overlapped and the options pane - checkbox and all - was pushed off
+  // the bottom.  A debug dialog that is missing controls the release dialog
+  // has cannot be used to test the release dialog.  The log is on disk.
   // No trailing spacer: the users pane takes the slack, so the list grows
   // with the window and the options pane stays put at the bottom.
 }
@@ -1561,6 +1629,7 @@ std::string MouseMuxControlDialog::OwnerSignature() const {
         owner.keyboard_hwid, owner.keyboard_typed ? 1 : 0,
         owner.captured ? 1 : 0, owner.has_window ? 1 : 0, owner.screen_index,
         base::UTF16ToUTF8(owner.window_title).c_str());
+    sig += base::StringPrintf("%d;", owner.typing);
   }
   return sig;
 }
@@ -1578,9 +1647,8 @@ void MouseMuxControlDialog::RebuildOwnerList() {
   // Same people, same everything: there is nothing to write.  Still re-assert
   // the frame, because a rebuild that failed to reach the screen must not be
   // left uncorrected until something else happens to redraw.
-  if (membership == owner_membership_ && signature == owner_signature_ &&
-      owner_rows_.size() == owners.size()) {
-    UpdateKeyboardNote();
+  if (list_built_ && membership == owner_membership_ &&
+      signature == owner_signature_ && owner_rows_.size() == owners.size()) {
     UpdateStatusLine();
     EnsurePainted();
     return;
@@ -1590,7 +1658,8 @@ void MouseMuxControlDialog::RebuildOwnerList() {
   // already there.  This is the common case by a wide margin - every title
   // change as anybody browses lands here - and it destroys no views, so the
   // tooltip under the operator's pointer survives.
-  if (membership == owner_membership_ && owner_rows_.size() == owners.size()) {
+  if (list_built_ && membership == owner_membership_ &&
+      owner_rows_.size() == owners.size()) {
     for (size_t i = 0; i < owners.size(); ++i) {
       const auto& owner = owners[i];
       OwnerRow& row = owner_rows_[i];
@@ -1609,6 +1678,12 @@ void MouseMuxControlDialog::RebuildOwnerList() {
       if (row.where) {
         row.where->SetText(row_text::Where(owner));
         row.where->SetTextStyle(row_text::WhereStyle(owner));
+        row.where->SetPreferredSize(gfx::Size(0, kRowButtonHeight));
+      }
+      if (row.typing) {
+        row.typing->SetText(row_text::Typing(owner));
+        row.typing->SetEnabledColor(row_text::TypingColor(owner));
+        row.typing->SetTooltipText(row_text::TypingTip(owner));
       }
       if (row.capture && row.capture->GetChecked() != owner.captured) {
         row.capture->SetChecked(owner.captured);
@@ -1618,7 +1693,6 @@ void MouseMuxControlDialog::RebuildOwnerList() {
       }
     }
     owner_signature_ = signature;
-    UpdateKeyboardNote();
     UpdateStatusLine();
     EnsurePainted();
     return;
@@ -1631,6 +1705,7 @@ void MouseMuxControlDialog::RebuildOwnerList() {
       views::BoxLayout::Orientation::kVertical, gfx::Insets(), 0));
   owner_membership_ = membership;
   owner_signature_ = signature;
+  list_built_ = true;
 
   if (owners.empty()) {
     auto* empty = owner_list_->AddChildView(std::make_unique<views::Label>(
@@ -1639,11 +1714,6 @@ void MouseMuxControlDialog::RebuildOwnerList() {
         views::style::STYLE_DISABLED));
     empty->SetHorizontalAlignment(gfx::ALIGN_LEFT);
     empty->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(6, 6)));
-    // Nobody owns anything, so any routing note left over from the last
-    // session of use describes people who are no longer here.
-    if (keyboard_note_label_) {
-      keyboard_note_label_->SetVisible(false);
-    }
     UpdateStatusLine();
     EnsurePainted();
     return;
@@ -1677,7 +1747,11 @@ void MouseMuxControlDialog::RebuildOwnerList() {
         .AddColumn(views::LayoutAlignment::kStart,
                    views::LayoutAlignment::kCenter, 0,
                    views::TableLayout::ColumnSize::kFixed, 88, 88)
-        .AddPaddingColumn(0, 8)
+        .AddPaddingColumn(0, 6)
+        .AddColumn(views::LayoutAlignment::kStart,
+                   views::LayoutAlignment::kCenter, 0,
+                   views::TableLayout::ColumnSize::kFixed, 54, 54)
+        .AddPaddingColumn(0, 6)
         .AddColumn(views::LayoutAlignment::kStretch,
                    views::LayoutAlignment::kCenter, 1.0f,
                    views::TableLayout::ColumnSize::kFixed, 0, 0)
@@ -1723,11 +1797,22 @@ void MouseMuxControlDialog::RebuildOwnerList() {
     entry.keyboard->SetElideBehavior(gfx::ELIDE_TAIL);
     entry.keyboard->SetTooltipText(row_text::KeyboardTip(owner));
 
+    entry.typing = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Typing(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    entry.typing->SetEnabledColor(row_text::TypingColor(owner));
+    entry.typing->SetTooltipText(row_text::TypingTip(owner));
+
     entry.where = row->AddChildView(std::make_unique<views::Label>(
         row_text::Where(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
         row_text::WhereStyle(owner)));
     entry.where->SetHorizontalAlignment(gfx::ALIGN_LEFT);
     entry.where->SetElideBehavior(gfx::ELIDE_TAIL);
+    // A long page title must not decide how wide the dialog is.  The label
+    // elides visually but still reports the FULL text as its preferred width,
+    // which the table adds up and the window then grows to fit - one long
+    // title took the dialog to 1857px.
+    entry.where->SetPreferredSize(gfx::Size(0, kRowButtonHeight));
 
     // Capture is a STATE, so it is a checkbox rather than a button whose
     // label flips.  That also frees the word "Release" for the other action,
@@ -1770,7 +1855,6 @@ void MouseMuxControlDialog::RebuildOwnerList() {
     owner_rows_.push_back(entry);
   }
 
-  UpdateKeyboardNote();
   UpdateStatusLine();
   owner_list_->InvalidateLayout();
   EnsurePainted();
@@ -1802,6 +1886,20 @@ std::string MouseMuxControlDialog::ViewDiagnostics() const {
   if (!owner_list_) {
     return out;
   }
+
+  // The routing history, which is the thing worth reading when input goes
+  // somewhere unexpected.  On the dialog it is one line of elided text, which
+  // is unreadable; here it can be printed properly.
+  for (const auto& route :
+       content::MouseMuxInputController::GetInstance()->GetKeyRoutes()) {
+    out += base::StringPrintf(
+        " | route kb=0x%x -> mouse=0x%x %s x%d '%s'", route.keyboard_hwid,
+        route.mouse_hwid, route.dropped ? "DROPPED" : "delivered", route.count,
+        base::UTF16ToUTF8(route.window_title).c_str());
+  }
+
+  out += content::MouseMuxInputController::GetInstance()->GetInjectionStats();
+  out += content::MouseMuxInputController::GetInstance()->GetViewInventory();
 
   int row_index = 0;
   for (const views::View* row : owner_list_->children()) {
@@ -1840,79 +1938,6 @@ void MouseMuxControlDialog::EnsurePainted() {
     widget->GetRootView()->SchedulePaint();
   }
   SchedulePaint();
-}
-
-void MouseMuxControlDialog::UpdateKeyboardNote() {
-  if (!keyboard_note_label_) {
-    return;
-  }
-  const auto owners =
-      content::MouseMuxInputController::GetInstance()->GetOwners();
-
-  // A missing pairing outranks anything else this line could say: it is the
-  // cause, and the routing underneath it would only be the symptom.
-  bool missing_keyboard = false;
-  for (const auto& owner : owners) {
-    if (owner.keyboard_hwid == 0) {
-      missing_keyboard = true;
-      break;
-    }
-  }
-  if (missing_keyboard) {
-    // The row already says "no keyboard" against the user it belongs to, and
-    // its tooltip explains what to do about it. Repeating the explanation
-    // underneath said the same thing twice and made a two-user dialog look
-    // like an error report.
-    keyboard_note_label_->SetVisible(false);
-    return;
-  }
-
-  auto routes =
-      content::MouseMuxInputController::GetInstance()->GetKeyRoutes();
-  if (routes.empty()) {
-    keyboard_note_label_->SetVisible(false);
-    return;
-  }
-
-  // Name the destination by the user it belongs to, not by hwid: this line is
-  // read next to a list of names.
-  std::u16string text = u"Typing: ";
-  bool first = true;
-  for (const auto& route : routes) {
-    if (!first) {
-      text += u"  \u00b7  ";
-    }
-    first = false;
-
-    std::u16string who;
-    for (const auto& owner : owners) {
-      if (owner.keyboard_hwid == route.keyboard_hwid) {
-        who = owner.name.empty()
-                  ? base::ASCIIToUTF16(
-                        base::StringPrintf("0x%x", route.keyboard_hwid))
-                  : base::UTF8ToUTF16(owner.name);
-        break;
-      }
-    }
-    if (who.empty()) {
-      who = base::ASCIIToUTF16(
-          base::StringPrintf("kb 0x%x", route.keyboard_hwid));
-    }
-
-    text += who;
-    if (route.dropped) {
-      text += u" \u2192 ignored (keyboard not assigned to a user)";
-    } else {
-      text += u" \u2192 ";
-      text += route.window_title.empty() ? std::u16string(u"(untitled window)")
-                                         : route.window_title;
-    }
-    if (route.count > 1) {
-      text += base::ASCIIToUTF16(base::StringPrintf(" x%d", route.count));
-    }
-  }
-  keyboard_note_label_->SetText(text);
-  keyboard_note_label_->SetVisible(true);
 }
 
 void MouseMuxControlDialog::OnOwnerReleaseClicked(int hwid) {
