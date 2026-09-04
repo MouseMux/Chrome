@@ -248,6 +248,18 @@ Why:    the caption only shows in the taskbar with Chrome's own frame; the
         person at the seat wants to see it on the window.
 Revert: revert the commit alone.
 
+19. Injected Chrome-UI events dropped where the hit test is not client   src (next commit)
+----------------------------------------------------------------------------
+What:   In the views hook, the frame's own NonClientHitTest decides: any
+        answer but HTCLIENT (caption buttons, drag strip, resize edges)
+        drops the injected press or move. Tabs, new-tab button, toolbar,
+        chip and page answer HTCLIENT and are unaffected.
+Why:    an injected click on minimize/maximize/close reached Chrome's
+        painted caption buttons as an ordinary press: a user could close a
+        window that was theirs to work in, not to manage; and the buttons
+        flickered under an injected pointer.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
