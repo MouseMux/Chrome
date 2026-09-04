@@ -357,6 +357,16 @@ Why:    Chrome's frame handles caption buttons itself and waits for the
         looked dead until an activation change (21:22, UI thread idle).
 Revert: revert the commit alone.
 
+29. An owned window keeps its page focus across activation changes   src (next commit)
+----------------------------------------------------------------------------
+What:   ShouldSuppressBlur is true for a page in an owned window, captured
+        or not (was capture-gated). Unowned windows unchanged.
+Why:    with nobody captured, every OS activation change blurred the
+        deactivated window's page and killed a caret somebody was typing
+        behind (21:12: thirteen blurs in three minutes). Under ownership
+        routing, activation says nothing about who is working where.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
