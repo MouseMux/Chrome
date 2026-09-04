@@ -175,6 +175,23 @@ Why:    Gustavo's 2.2.62 logs showed every wheel event handed to the page
         must name the outcome.
 Revert: revert the commit alone; no behaviour is involved.
 
+13. A user owns a set of windows; one window, one owner         src 30b0a9c74ce
+----------------------------------------------------------------------------
+What:   Each user has a set of owned windows and one current window; all
+        their input goes to the current one. A press inside another window
+        of their own set makes it current (rectangle test against this
+        user's windows only). A new window is adopted by its opener's owner
+        (popups, links into new windows, print), else by the user whose
+        injected input arrived last within 2 s (Ctrl+N, the menu); with no
+        recent injected input it stays unowned. A window in somebody's set
+        cannot be claimed by anyone else. A closed window leaves the set;
+        the user is released only when the set is empty; Release hands back
+        the whole set. Dialog row shows "+N" for extra windows.
+Why:    a window the owner opened themselves (Ctrl+N, a site's login popup)
+        could not be used: presses outside the single owned window were
+        dropped. And two users could end up owning one window.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
