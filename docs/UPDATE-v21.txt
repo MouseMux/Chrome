@@ -143,7 +143,7 @@ Why:    Customer screenshot 2026-09-03: pointer far left of a menu the page
         why it appeared only with a third user on a third monitor.
 Revert: revert the commit alone.
 
-11. MOUSEMUX_ANONYMOUS_KEYS; stamp #62 / 2.2.62                 src (next commit)
+11. MOUSEMUX_ANONYMOUS_KEYS; stamp #62 / 2.2.62                 src d3fc4db9870
 ----------------------------------------------------------------------------
 What:   With MOUSEMUX_DEBUG on, keys that produce text are logged as 'X'
         (vkey 0x58, scan 0, character U+0058) and raw MouseMux keyboard
