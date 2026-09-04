@@ -248,7 +248,7 @@ Why:    the caption only shows in the taskbar with Chrome's own frame; the
         person at the seat wants to see it on the window.
 Revert: revert the commit alone.
 
-19. Injected Chrome-UI events dropped where the hit test is not client   src (next commit)
+19. Injected Chrome-UI events dropped where the hit test is not client   src 4a8fd71a5b2
 ----------------------------------------------------------------------------
 What:   In the views hook, the frame's own NonClientHitTest decides: any
         answer but HTCLIENT (caption buttons, drag strip, resize edges)
