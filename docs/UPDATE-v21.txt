@@ -269,6 +269,14 @@ Why:    since entry 7 every user is always kept in their own windows; the
         option changed nothing.
 Revert: revert the commit alone (restores a checkbox that still does nothing).
 
+21. Dialog footer (Help, Collapse, build label) in every build   src (next commit)
+----------------------------------------------------------------------------
+What:   The footer is no longer wrapped in #ifndef MOUSEMUX_DEBUG.
+Why:    leftover from the old debug log panel in that spot; a debug build had
+        neither panel nor footer, so no Help and no Collapse. Debug and
+        release dialogs are identical now.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
