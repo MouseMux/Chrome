@@ -143,6 +143,18 @@ Why:    Customer screenshot 2026-09-03: pointer far left of a menu the page
         why it appeared only with a third user on a third monitor.
 Revert: revert the commit alone.
 
+11. MOUSEMUX_ANONYMOUS_KEYS; stamp #62 / 2.2.62                 src (next commit)
+----------------------------------------------------------------------------
+What:   With MOUSEMUX_DEBUG on, keys that produce text are logged as 'X'
+        (vkey 0x58, scan 0, character U+0058) and raw MouseMux keyboard
+        messages are not logged. Modifier, navigation and function keys
+        are logged as they are. Comment the define out in
+        mouse_mux_config.h for rich logging on the bench.
+Why:    a debug build sent to a customer must not come back with a log
+        that reads as what their users typed.
+Package: chrome-release-2.2.62-debug-20260904 (field test for Gustavo).
+Revert: comment out #define MOUSEMUX_ANONYMOUS_KEYS.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
