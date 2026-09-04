@@ -313,7 +313,7 @@ Why:    a new tab's view registers before it is attached, so RegisterView
         window then took the real mouse's wheel and clicks (log 20:41).
 Revert: revert the commit alone.
 
-25. Double-click and side-button messages blocked; all input classes logged  src (next commit)
+25. Double-click and side-button messages blocked; all input classes logged  src 76912189950
 ----------------------------------------------------------------------------
 What:   WM_*BUTTONDBLCLK and WM_XBUTTON* added to the native block list.
         NATIVE/In now logs mouse, key, pointer (pen/touch/mouse-as-pointer),
