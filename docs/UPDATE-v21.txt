@@ -367,7 +367,7 @@ Why:    with nobody captured, every OS activation change blurred the
         routing, activation says nothing about who is working where.
 Revert: revert the commit alone.
 
-30. Users list: window after the name, column lines, header row   src (next commit)
+30. Users list: window after the name, column lines, header row   src 8e0b1c9f73a
 ----------------------------------------------------------------------------
 What:   One table definition for a header row and every user row: dot |
         User || Window || Keyboard || Typing || Capture | Block native |
