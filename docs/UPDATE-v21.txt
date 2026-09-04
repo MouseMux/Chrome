@@ -325,6 +325,15 @@ Why:    a fast second press is WM_LBUTTONDBLCLK, which the list did not
         NATIVE/In line printed a predicted decision, wrong for exactly those.
 Revert: revert the commit alone.
 
+26. Page focus trace                                            src (next commit)
+----------------------------------------------------------------------------
+What:   PAGE/Focus in chrome-log.txt: page view, window, GAINED/LOST,
+        blur-suppressed flag, stack trace. MOUSEMUX_DEBUG_TRACE only.
+Why:    the caret in a text field disappears under blocked native clicks
+        (2026-09-04, no button message reached any page); the cause must
+        pass through the page's focus change, which was silent.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
