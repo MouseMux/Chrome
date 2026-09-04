@@ -347,7 +347,7 @@ Why:    the activation request precedes the button message and was never
         minutes at 21:12, zero clicks delivered).
 Revert: revert the commit alone.
 
-28. The release after a caption-button press passes the block    src (next commit)
+28. The release after a caption-button press passes the block    src bf80464d474
 ----------------------------------------------------------------------------
 What:   A window whose caption button was pressed by the real mouse is
         remembered; the next client-area button-up on it passes the block.
