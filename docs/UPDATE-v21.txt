@@ -120,7 +120,7 @@ Why:    Entry 7 dropped presses outside the owned window, and the dialog is
         still picking a page by position, inconsistent with the rule.
 Revert: revert the commit alone (loses both).
 
-9. Users list: "Window N · title"                              src (next commit)
+9. Users list: "Window N · title"                              src 5c507e1cc5d
 ----------------------------------------------------------------------------
 What:   The row's window column leads with the window's number in the order
         the windows were opened, then the page title. The screen is gone.
