@@ -313,6 +313,18 @@ Why:    a new tab's view registers before it is attached, so RegisterView
         window then took the real mouse's wheel and clicks (log 20:41).
 Revert: revert the commit alone.
 
+25. Double-click and side-button messages blocked; all input classes logged  src (next commit)
+----------------------------------------------------------------------------
+What:   WM_*BUTTONDBLCLK and WM_XBUTTON* added to the native block list.
+        NATIVE/In now logs mouse, key, pointer (pen/touch/mouse-as-pointer),
+        touch, gesture and raw-input messages, saying whether the window is
+        in the blocked set; the actual drop is the BLOCKED line after it.
+Why:    a fast second press is WM_LBUTTONDBLCLK, which the list did not
+        contain: 16 of them reached a blocked window's tab strip and switched
+        tabs while all 36 single presses were dropped (20:52). The previous
+        NATIVE/In line printed a predicted decision, wrong for exactly those.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
