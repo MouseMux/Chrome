@@ -109,7 +109,7 @@ Cost:   switching windows is only possible via Release in the dialog; the
         will be removed in a later step.
 Revert: revert the commit alone.
 
-8. Dialog always clickable; wheel follows ownership             src (next commit)
+8. Dialog always clickable; wheel follows ownership             src 60bce070bbb
 ----------------------------------------------------------------------------
 What:   The MouseMux dialog and its help window are checked before the
         ownership rule: any user can click them whatever window they own.
@@ -119,6 +119,14 @@ Why:    Entry 7 dropped presses outside the owned window, and the dialog is
         outside it - nobody could release or toggle anything. The wheel was
         still picking a page by position, inconsistent with the rule.
 Revert: revert the commit alone (loses both).
+
+9. Users list: "Window N · title"                              src (next commit)
+----------------------------------------------------------------------------
+What:   The row's window column leads with the window's number in the order
+        the windows were opened, then the page title. The screen is gone.
+Why:    two windows on the same page read identically (the title is the
+        active tab's); the screen did not tell them apart.
+Revert: revert the commit alone.
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,

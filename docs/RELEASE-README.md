@@ -70,7 +70,7 @@ Each row reads, left to right:
 | name | the MouseMux user |
 | `kb 0x… ✓` | the keyboard MouseMux has attached to this user; the tick means it has typed. **no keyboard** means MouseMux has not attached one — fix that in MouseMux |
 | typing / IGNORED | shown while keys arrive: green **typing** means they are landing in this user's window; red **IGNORED** means they are being dropped, see the keyboard column |
-| Screen N · title | which monitor the user's window is on, and the page it is showing |
+| Window N · title | which window the user is working in, numbered in the order the windows were opened, and the page it is showing |
 | **Capture** (checkbox) | stops this user's device producing native Windows input. Required for several users to work at once |
 | **Release** (button) | hands this user's window back. Their device stops driving Chrome until they click to claim again |
 | **×** (button) | closes the window this user is working in. Closing a window releases its user automatically |
