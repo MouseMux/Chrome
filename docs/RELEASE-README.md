@@ -74,6 +74,7 @@ Each row reads, left to right:
 | typing / IGNORED | shown while keys arrive: green **typing** means they are landing in this user's window; red **IGNORED** means they are being dropped, see the keyboard column |
 | Window N · title | which window the user is working in, numbered in the order the windows were opened, and the page it is showing |
 | **Capture** (checkbox) | stops this user's device producing native Windows input. Required for several users to work at once |
+| **Block native** (checkbox) | drops the real mouse's input inside this user's windows: clicks, movement and wheel, in pages and in Chrome's own toolbars. On by default, because an owned window is somebody's workplace. Untick it to let the operator's own mouse work inside them. Our dialog and Help window always stay native |
 | **Release** (button) | hands this user's window back. Their device stops driving Chrome until they click to claim again |
 | **×** (button) | closes the window this user is working in. Closing a window releases its user automatically |
 
@@ -83,15 +84,9 @@ scrolls.
 
 **Options** (bottom pane):
 
-**Block native mouse input (all devices)** (checkbox) — Drops the operating
-system's own mouse input inside Chrome, for every device at once: clicks,
-movement and the wheel, in pages and in Chrome's own toolbars and menus. Only
-this dialog and its Help window keep responding to the real mouse, so the
-operator can always reach them. A safety net rather than the mechanism:
-capture already stops each captured device at the source, so with everyone
-captured this makes no difference. It matters for devices MouseMux is not
-capturing, and for the operator's own mouse, which loses hover and wheel over
-the browser while this is on.
+**Block native** is per user, on each row (see above). There is no global
+switch any more: an owned window drops the real mouse's input by itself, and
+a window nobody owns stays fully native for the operator.
 
 **Release hotkey** (dropdown) — The keyboard shortcut that releases capture
 (default: Shift+Escape). This is the escape hatch: it works even when injected
