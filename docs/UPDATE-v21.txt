@@ -92,6 +92,23 @@ Cost:   while "Block native mouse input" is on, the operator's real mouse
         gets no hover in Chrome UI (it could not click there anyway).
 Revert: revert commit dd46eb45a01.
 
+7. Ownership routes the mouse                                   src (next commit)
+----------------------------------------------------------------------------
+What:   A user who owns a window sends every mouse event to that window.
+        Inside it, the point picks one of its own popups (its menu), its
+        page, or its Chrome UI. Outside it, moves and releases still reach
+        the page as under Windows capture; presses are dropped. The search
+        over all windows by position (Z-order walk) survives only for a user
+        who owns nothing yet.
+Why:    Two overlapping windows: a click on the front window's toolbar was
+        injected into the page of the window behind it (its rectangle
+        contained the point; toolbars do not compete in a page search).
+        Position-first routing predates ownership.
+Cost:   switching windows is only possible via Release in the dialog; the
+        "Keep each user in their own window" checkbox is now redundant and
+        will be removed in a later step.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
