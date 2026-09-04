@@ -1,0 +1,108 @@
+UPDATE v21 - keyboard through the window (branch keyboard-aura-routing)
+=======================================================================
+
+Started 2026-09-03. One entry per change, in order, each with the commit in the
+Chromium tree (chrome-151-20260809/src) so any step can be reverted alone.
+Build stamp #61 / 2.2.61 unless stated.
+
+Every entry: WHAT changed, WHY (what was measured), and HOW TO REVERT.
+
+
+1. Keyboard routed through the window            src commit 8cb777fd52e (snapshot)
+----------------------------------------------------------------------------
+What:   MOUSEMUX_AURA_KEYBOARD (mouse_mux_config.h, on). The controller no
+        longer hands keys to the renderer; it posts WM_MOUSEMUX_KEYDOWN /
+        KEYUP / CHAR to the user's window. DesktopWindowTreeHostWin::
+        PreHandleMSG turns them into ui::KeyEvents flagged EF_IS_SYNTHESIZED
+        and sends them where a real WM_KEYDOWN enters (the focus manager), and
+        inserts characters straight into the focused TextInputClient.
+        RenderWidgetHostViewEventHandler lets synthesized events past native
+        keyboard blocking.
+Why:    Keys reached only the page. The omnibox, find bar and browser shortcuts
+        live in the views focus manager, which the renderer path never visits.
+Revert: comment out #define MOUSEMUX_AURA_KEYBOARD; the old renderer path is
+        the #else branch of InjectKeyboardEvent and still compiles.
+
+2. OS-inactive window re-activated on the views side only     (same snapshot)
+----------------------------------------------------------------------------
+What:   Before dispatching a synthetic key to a window the OS has deactivated,
+        PreHandleMSG runs HandleActivationChanged(true). During a synthetic
+        key IsActive() reports true, Activate() and ClearNativeFocus() do
+        nothing (g_mousemux_synthetic_key).
+Why:    Measured with a foreground-window recorder: the OS foreground flipped
+        between two users' windows on every keystroke. Stack traces showed the
+        focus manager activating the widget (SetWindowPos) before it would
+        focus a view in an inactive window, and View::OnFocus calling
+        SetFocus(hwnd). With the overrides: zero activations in 669 keys.
+Revert: remove the three g_mousemux_synthetic_key checks in
+        desktop_window_tree_host_win.cc.
+
+3. No OLE drag-and-drop from an injected mouse                 (same snapshot)
+----------------------------------------------------------------------------
+What:   g_mousemux_sdk_button_held (set by the controller while any injected
+        mouse holds a button). WebContentsViewAura::StartDragging and
+        DesktopDragDropClientWin::StartDragAndDrop refuse to start an OLE drag
+        while it is set.
+Why:    Field dump 2026-09-04 (other machine, "Chrome hangs"): UI thread in
+        ole32!DoDragDrop under StartDragging. DoDragDrop ends only on a real
+        button release; a captured device never produces one.
+Cost:   an injected mouse cannot drag links, images or selected text out of
+        a page or onto the bookmark bar. Selection itself is unaffected.
+Revert: remove the two g_mousemux_sdk_button_held checks.
+
+4. Chrome UI under an injected mouse                            (same snapshot)
+----------------------------------------------------------------------------
+What:   (a) SetForegroundWindow on synthetic clicks commented out in
+        PreHandleMSG. (b) Mouse moves over non-page areas posted as
+        WM_MOUSEMUX_MOUSEMOVE (about 60 Hz), WM_MOUSEMUX_MOUSELEAVE when the
+        pointer leaves that window or returns to the page. (c) Before injecting
+        into a page, an aura hit test (PageIsTopmostAt) checks that the page
+        is what is on top; a child widget such as the find bar takes the
+        window path instead.
+Why:    (a) trace: menu_before=1, menu_after=0 on every menu click - activating
+        the menu popup deactivated its owner and closed the menu. (b) menus and
+        toolbar buttons never saw hover. (c) clicks on the find bar's X were
+        injected into the page underneath.
+Revert: (a) uncomment; (b) drop the kMouseMove case from the two dispatch
+        conditions in InjectMouseEventToAnyView; (c) remove the PageIsTopmostAt
+        call.
+
+5. Virtual cursor                                               (same snapshot)
+----------------------------------------------------------------------------
+What:   g_mousemux_virtual_cursor_* (defined in ui/display/win/screen_win.cc,
+        set by the controller on every injected mouse event, valid while
+        anybody owns a window). ScreenWin::GetCursorScreenPoint() and aura's
+        GetLastMouseLocationInRoot() (synthesized moves on window changes)
+        answer with the injected pointer's position.
+Why:    Chrome's menu asks "where is the mouse" when a submenu opens and
+        re-selects from the answer; the real mouse idles elsewhere.
+Note:   this alone did not stop the flicker; see 6.
+Revert: remove the two reads; the definitions can stay.
+
+6. Native moves and wheel blocked in Chrome UI while blocking   src dd46eb45a01
+----------------------------------------------------------------------------
+What:   The views-layer native block (MOUSEMUX_FULL_NATIVE_BLOCK) now drops
+        WM_MOUSEMOVE, WM_MOUSEWHEEL and WM_MOUSEHWHEEL as well as the button
+        messages. Dialog and help window remain exempt.
+Why:    MOUSEMUX_MENU_TRACE stack traces: every deselect came from a NATIVE
+        WM_MOUSEMOVE (HWNDMessageHandler::HandleMouseEventInternal) reaching
+        the menu window, interleaved one-for-one with our moves. Windows
+        re-posts an idle mouse's position to the window holding capture.
+Cost:   while "Block native mouse input" is on, the operator's real mouse
+        gets no hover in Chrome UI (it could not click there anyway).
+Revert: revert commit dd46eb45a01.
+
+Diagnostics in this branch (all off in a release build):
+  MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
+  desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
+  mousemux_diag.log, chrome-log.txt (activation stack traces, custom-mouse
+  trace, native-move-under-menu trace).
+  MOUSEMUX_MENU_TRACE (menu_controller.cc): temporary, selection-change
+  stack traces. Remove before release.
+
+Open:
+  - flicker after 6: to be tested.
+  - "warm-up" of clicks on the other machine: not reproduced; log shows early
+    clicks going down the Chrome-UI path with no outcome recorded at the time.
+  - keyboard "duplication"/"zero keys" from the other machine: not seen in
+    its log (88 down / 89 up, all posted).

@@ -1,20 +1,10 @@
 # Chrome MouseMux Compliant Edition
 
-![Chrome Logo](../logo.jpg)
+*Latest revision: September 2026 — Build #59 — Chromium 151.0.7922.77*
 
-![App Screenshot](screenshot.png)
-
-*Latest revision: August 2026 — Build #56 — Chromium 151.0.7922.77*
-
-> **New in Build #56: rebased onto Chromium 151.**
-> Builds up to #55 were based on Chromium 146.0.7650.0. This build moves five
-> major Chromium versions forward, picking up everything upstream changed in
-> between — security fixes, rendering and performance work included.
->
-> The MouseMux functionality is unchanged. No features were added or removed;
-> the work was in adapting the integration to Chromium API changes. If you are
-> upgrading from #55 and something behaves differently, it is worth reporting,
-> because it was not an intended change.
+> **Chromium base: 151.0.7922.77**, since Build #56. Builds up to #55 were on
+> Chromium 146.0.7650.0. Everything upstream changed between those versions —
+> security fixes, rendering and performance work — is included.
 
 ## Multi-Seat Web Browser
 
@@ -38,7 +28,7 @@ When you launch Chrome with MouseMux integration enabled, a small **MouseMux Con
 
 Any connected user can **claim** the browser window by clicking on it. Once claimed, that browser instance belongs to that user.
 
-To enter full multi-seat mode, press **Capture all**. That tells MouseMux to stop each captured device producing native Windows input, so every user's mouse and keyboard reach Chrome only as MouseMux events, routed to that user's own window.
+To enter full multi-seat mode, tick **Capture** on every user's row in the dialog. That tells MouseMux to stop each captured device producing native Windows input, so every user's mouse and keyboard reach Chrome only as MouseMux events, routed to that user's own window. Capture is per user on purpose: one person can be handed their mouse back without disturbing the others.
 
 Capture is not optional when several people work at once. Native input is what forces Windows to have a single active window, and a single active window is what makes one user's click extinguish another user's caret. With every device captured, that stops happening: each window keeps its own blinking caret and each user's keystrokes follow their own mouse.
 
@@ -52,31 +42,72 @@ This differs fundamentally from simply sharing a browser. In traditional shared 
 
 ### MouseMux Control Dialog
 
-The control dialog provides the following controls:
+The dialog is three panes — the connection, the users, and options that apply
+to everybody — with a footer. The screenshot above shows it with two users.
 
-**MouseMux Connection** (toggle) — Connects to the MouseMux server. Must be on for multi-seat features to work.
+**Connection** (top pane) — A status line, **Connected to MouseMux 3.0.22** or
+**Not connected to MouseMux**, with a small indicator (green when connected,
+grey when not) and a **Connect** / **Disconnect** button. The version shown is
+what the MouseMux server reports about itself. Every other control in the
+dialog is greyed out until the connection is up, because none of them can do
+anything without it.
 
-**Native Input Blocking** (toggle) — Prevents the operating system's own mouse and keyboard events from reaching the browser. This is turned on automatically when you enter capture mode, ensuring only your dedicated input reaches the page without duplication.
+**Users (N)** (middle pane) — One row per user who has claimed a window; N is
+how many. The heading carries **+ Window** and **+ Seat**:
 
-**Lock Users To Their Window** (toggle) — Off, a user who clicks another window simply moves there. On, clicks landing outside a user's own window are ignored, giving each user one window they cannot leave. Cursors still move freely across the whole screen; only clicks are blocked. A user with no window claims the first one they click, and closing a window frees its user to claim another.
+- **+ Window** copies the current tab into another window of *this* browser,
+  already signed in, sharing one session with everybody else. This is the
+  normal way to add a person.
+- **+ Seat** starts a separate browser with its *own* profile and its own
+  login, and its own dialog. See **Windows and seats** below — they are not
+  two flavours of the same thing.
 
-**Owners** (list) — One row per user, showing their device name, the window they are typing in, and whether they are captured. The row acts on that one user without disturbing the others:
+Each row reads, left to right:
 
-| Row control | Effect |
+| Column | Meaning |
 |---|---|
-| **Capture** / **Release** | Capture or release just this user's device |
-| **Close win** | Close the window this user is working in |
-| **Drop** | Remove this user's claim; their device stops driving Chrome until they click again |
+| dot | **green** captured and working · **amber** has a window but is not captured · **red** no keyboard assigned to this user in MouseMux |
+| name | the MouseMux user |
+| `kb 0x… ✓` | the keyboard MouseMux has attached to this user; the tick means it has typed. **no keyboard** means MouseMux has not attached one — fix that in MouseMux |
+| typing / IGNORED | shown while keys arrive: green **typing** means they are landing in this user's window; red **IGNORED** means they are being dropped, see the keyboard column |
+| Screen N · title | which monitor the user's window is on, and the page it is showing |
+| **Capture** (checkbox) | stops this user's device producing native Windows input. Required for several users to work at once |
+| **Release** (button) | hands this user's window back. Their device stops driving Chrome until they click to claim again |
+| **×** (button) | closes the window this user is working in. Closing a window releases its user automatically |
 
-An asterisk marks the primary owner — the one reported to the control server and to the older single-owner automation API.
+There is no single "capture everyone" control: capture is a checkbox on each
+row, ticked once per user. When more users are present than fit, the list
+scrolls.
 
-**Capture all** / **Drop all** (buttons) — The same two actions applied to everyone. Capture all is normally what you want: several users can only work at once if every one of them is captured, because capture is what stops a device producing native Windows input.
+**Options** (bottom pane):
 
-**+ Window** / **+ Seat** (buttons) — **+ Window** copies the current tab into another window of this browser, already signed in; **+ Seat** starts a separate browser with its own profile and its own login. See **Windows and seats** below — they are not two flavours of the same thing.
+**Keep each user in their own window** (checkbox) — Off, a user who clicks
+another window simply moves there. On, clicks landing outside a user's own
+window are ignored, giving each user one window they cannot leave. Cursors
+still move freely across the whole screen; only clicks are blocked. A user with
+no window claims the first one they click, and closing a window frees its user
+to claim another. With several people side by side you will usually want it.
 
-**Release Hotkey** (dropdown) — Choose which keyboard shortcut exits capture mode (default: Shift+Escape). This is the escape hatch: it works even when injected input is not reaching the page, so the mice cannot be used to reach this dialog.
+**Block native mouse input (all devices)** (checkbox) — Drops the operating
+system's own mouse input inside Chrome, for every device at once. A safety net
+rather than the mechanism: capture already stops each captured device at the
+source, so with everyone captured this makes no difference. It matters for
+devices MouseMux is not capturing.
 
-**Collapse** (button, footer) — Shrinks the dialog to a small strip out of the way. Click it again to restore. It deliberately leaves something on screen, so there is always a way back.
+**Release hotkey** (dropdown) — The keyboard shortcut that releases capture
+(default: Shift+Escape). This is the escape hatch: it works even when injected
+input is not reaching the page, so the mice cannot be used to reach this
+dialog.
+
+**Release all** (button) — Hands every window back at once.
+
+**Footer** — **Help** opens a window explaining every control and the order to
+do things in. **Collapse** shrinks the dialog to a small strip out of the way;
+click it again to restore — it deliberately leaves something on screen, so
+there is always a way back. **Quit** closes this dialog *and every window of
+this browser*; use Collapse if you only want the dialog out of the way. The
+build number and date sit bottom-left, which is the quickest way to confirm
+which build is running.
 
 ---
 
@@ -272,7 +303,7 @@ The build number and date appear in the lower left of the dialog, which is the q
 
 ### Pen and Touch Input
 
-*Experimental in Build #56 — not yet verified on hardware.*
+*Experimental — not yet verified on hardware.*
 
 MouseMux sends pen and touch devices down a separate channel from mice, carrying pressure, tilt and barrel rotation. This build receives that channel and delivers it to web pages as pointer input: a page reads `pointerType` as `"pen"` or `"touch"`, along with `pressure`, `tiltX`, `tiltY` and `twist` values. A touchpad is deliberately reported as a mouse, since it moves a cursor rather than making contact with the screen.
 
@@ -330,7 +361,7 @@ focus around behind the browser's back — and that is precisely what makes one
 person's click stop another person's typing. Capture everyone, or the rest of
 this does not hold.
 
-**Lock Users To Their Window** confines each user to the window they first
+**Keep each user in their own window** confines each user to the window they first
 clicked in. Cursors still move freely across all monitors — a cursor stopping at
 an invisible wall reads as broken hardware — but clicks outside a user's own
 window are ignored. With several people side by side this is usually what you
@@ -353,6 +384,19 @@ have one open at once.
 
 ---
 
+### Known Limitations
+
+**One menu at a time.** Chrome draws its menus itself — the **⋯** menu, right-click
+menus, bookmark folder menus, the tab strip's menu, and the drop-down lists on
+web pages — and one component draws all of them for the whole browser. It shows
+one menu at a time and holds the mouse while it is open, so when a second user
+opens a menu, the first user's menu closes. Nothing is lost; the first user
+simply opens theirs again. Address-bar suggestions, the find bar and the
+bookmark and download bubbles are not menus and are not affected: each window
+has its own.
+
+---
+
 ### Performance Considerations
 
 Running multiple browser instances requires more system resources than a single browser. Each Chrome instance consumes memory for its tabs, media, and rendering. Modern systems handle this well, but keep the following in mind:
@@ -368,24 +412,31 @@ For optimal performance, close unused tabs and browser instances when not needed
 
 ### Getting Started
 
-1. Ensure MouseMux is running — **MouseMux V3 (3.0.x series)**
+1. Ensure MouseMux is running — **MouseMux V3**, in **Switched** mode with
+   **multi keyboard ON**. Multi keyboard is not optional: without it keystrokes
+   carry no per-device identity and nothing can be routed
 2. Run **`start-mousemux-chrome.bat`** — or start `chrome.exe` yourself with
    `--enable-features=MouseMuxIntegration` (see **Starting Chrome** above)
-3. The MouseMux Control Dialog appears — turn on the **MouseMux** toggle
-4. **Sign in to the site everyone will share** — once, in this first window.
+3. The MouseMux Control Dialog appears — press **Connect**; the indicator
+   turns green
+4. **Have each user press one key** on their own keyboard. MouseMux only
+   reports a keyboard as belonging to a user once it has been used, and until
+   it does that user's keystrokes cannot be routed
+5. **Sign in to the site everyone will share** — once, in this first window.
    Do this before the next step: **+ Window** copies the tab you are on, so it
    can only hand out a session that already exists
-5. Press **+ Window** once for each additional user. Each new window opens on
+6. Press **+ Window** once for each additional user. Each new window opens on
    the same page, already signed in
-6. Each user clicks in their own window to claim it — their name appears in the
-   **Owners** list, with the window they are working in and the keyboard
+7. Each user clicks in their own window to claim it — their row appears in
+   the **Users** list, with the window they are working in and the keyboard
    assigned to them
-7. Press **Capture all** — required for several users at once, because capture
-   is what stops each device producing native Windows input
-8. Everyone works at the same time, each with their own cursor and caret
-9. Optionally turn on **Lock Users To Their Window** so nobody can click into
-   somebody else's window
-10. Press the release hotkey (default: Shift+Escape) to release capture
+8. Tick **Capture** on every row — required for several users at once,
+   because capture is what stops each device producing native Windows input.
+   Every dot should now be green
+9. Everyone works at the same time, each with their own cursor and caret
+10. Optionally tick **Keep each user in their own window** so nobody can click
+    into somebody else's window
+11. Press the release hotkey (default: Shift+Escape) to release capture
 
 ---
 
