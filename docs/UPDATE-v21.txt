@@ -206,7 +206,7 @@ Why:    Every injected wheel was phase Began and nothing ever ended the
         scroll there with my mouse".
 Revert: revert the commit alone.
 
-15. "[N] title" in every window caption                          src (next commit)
+15. "[N] title" in every window caption                          src 33a055b3a3a
 ----------------------------------------------------------------------------
 What:   A stable number per browser window (assigned when first seen, kept
         while it lives, keyed by session id) prefixed to the caption while
