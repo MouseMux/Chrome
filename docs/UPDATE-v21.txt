@@ -325,7 +325,7 @@ Why:    a fast second press is WM_LBUTTONDBLCLK, which the list did not
         NATIVE/In line printed a predicted decision, wrong for exactly those.
 Revert: revert the commit alone.
 
-26. Page focus trace                                            src (next commit)
+26. Page focus trace                                            src d4b401ad58c
 ----------------------------------------------------------------------------
 What:   PAGE/Focus in chrome-log.txt: page view, window, GAINED/LOST,
         blur-suppressed flag, stack trace. MOUSEMUX_DEBUG_TRACE only.
