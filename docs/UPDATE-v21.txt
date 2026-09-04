@@ -128,6 +128,21 @@ Why:    two windows on the same page read identically (the title is the
         active tab's); the screen did not tell them apart.
 Revert: revert the commit alone.
 
+10. Screen pixels through Chrome's per-monitor mapping          src fe28a86e981
+----------------------------------------------------------------------------
+What:   Every MouseMux screen position is converted with
+        display::win::ScreenWin::ScreenToDIPPoint (page injection, wheel,
+        the unclaimed-user hit test, the owned-window page check) instead of
+        pixels / this window's scale factor. PageIsTopmostAt no longer
+        subtracts the window origin twice.
+Why:    Customer screenshot 2026-09-03: pointer far left of a menu the page
+        kept hovering. Chrome lays monitors out edge to edge in scaled units;
+        on a monitor whose scaling differs from the primary's, the division
+        lands a few hundred units off, so hover, clicks and the wheel act at
+        the wrong spot. Right with one monitor or uniform scaling - which is
+        why it appeared only with a third user on a third monitor.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
