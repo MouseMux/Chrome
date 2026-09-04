@@ -225,7 +225,7 @@ Why:    the person at a seat had no way to see on the window that it was
         theirs (entry 15's number was not what was asked for).
 Revert: revert the commit alone.
 
-17. The window under a press is what Windows says it is           src (next commit)
+17. The window under a press is what Windows says it is           src eae7751eea4
 ----------------------------------------------------------------------------
 What:   WindowFromPoint names the top-level window under a press (a menu
         popup resolves to the browser window that owns it). Rule: the
