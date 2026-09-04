@@ -192,7 +192,7 @@ Why:    a window the owner opened themselves (Ctrl+N, a site's login popup)
         dropped. And two users could end up owning one window.
 Revert: revert the commit alone.
 
-14. The wheel's scroll gesture is ended                          src (next commit)
+14. The wheel's scroll gesture is ended                          src f4083facb85
 ----------------------------------------------------------------------------
 What:   Per device, 100 ms after the last wheel notch, a zero-delta wheel
         event with phase Ended goes to the page the last notch went to
