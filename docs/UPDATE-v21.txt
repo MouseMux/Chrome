@@ -347,6 +347,16 @@ Why:    the activation request precedes the button message and was never
         minutes at 21:12, zero clicks delivered).
 Revert: revert the commit alone.
 
+28. The release after a caption-button press passes the block    src (next commit)
+----------------------------------------------------------------------------
+What:   A window whose caption button was pressed by the real mouse is
+        remembered; the next client-area button-up on it passes the block.
+Why:    Chrome's frame handles caption buttons itself and waits for the
+        release, which arrives as a client button-up that the block dropped:
+        the button stayed pressed, the frame kept the mouse, the window
+        looked dead until an activation change (21:22, UI thread idle).
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
