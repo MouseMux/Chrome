@@ -2,6 +2,21 @@
 
 Open items, newest first. Each says why it is open and what would close it.
 
+- **Update the Help dialog** (2026-09-04). It still describes the dialog as it
+  was this morning: no per-row "Block native", no window sets, no "[Green]"
+  caption/chip, no column header. Rewrite the Options and row sections and
+  the flow steps to match.
+- **Save / load** (2026-09-04). A named layout: windows, positions, sizes,
+  tabs/URLs, and which user owns which; load it on start or on demand. Same
+  item as the disconnect note below; this is the user-facing form.
+- **Advanced options** (2026-09-04). A place for the settings that should not
+  sit in the main dialog: hotkey, wheel notch size, the legacy global block,
+  logging switches, control-server port. A separate small dialog or a pane
+  that unfolds.
+- **Screen sharing for remote access** (2026-09-04). Let a remote person see
+  (and possibly drive) one user's window - the seat concept over the network.
+  Scope to be defined: view-only first.
+
 - **Tab-strip clicks from an injected mouse do nothing** (2026-09-04). Presses
   at the top of the window (tab titles, a tab's X) reach the window via the
   Chrome-UI path but no view handles them (`handled=0` in chrome-log.txt),
