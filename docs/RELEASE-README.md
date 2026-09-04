@@ -83,10 +83,6 @@ scrolls.
 
 **Options** (bottom pane):
 
-**Keep each user in their own window** (checkbox) — No longer does anything:
-since Build #62 every user is always kept in their own window (see **How It
-Works**). The checkbox will be removed in a coming build.
-
 **Block native mouse input (all devices)** (checkbox) — Drops the operating
 system's own mouse input inside Chrome, for every device at once: clicks,
 movement and the wheel, in pages and in Chrome's own toolbars and menus. Only

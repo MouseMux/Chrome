@@ -20,9 +20,6 @@ Open items, newest first. Each says why it is open and what would close it.
   disconnect. Today a lost connection releases every user and everyone has
   to click to claim again. The disconnect itself is left as it is until this
   exists.
-- **Remove the "Keep each user in their own window" checkbox.** Since Build
-  #62 every user is always kept in their own window(s); the checkbox does
-  nothing.
 - **`"debug": true` in app.json for `--tag debug` packages**, if MouseMux
   reads that flag. The packager writes `false` for every build.
 - **New screenshot** of the current dialog (rows read "Window N · title").

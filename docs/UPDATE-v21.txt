@@ -260,6 +260,15 @@ Why:    an injected click on minimize/maximize/close reached Chrome's
         flickered under an injected pointer.
 Revert: revert the commit alone.
 
+20. "Keep each user in their own window" removed                 src (next commit)
+----------------------------------------------------------------------------
+What:   The checkbox, its help entry, the toggle handler, SetHardLock /
+        IsHardLock, hard_lock_, locked_window and the two dead branches on
+        the first-claim path are gone. README no longer lists it.
+Why:    since entry 7 every user is always kept in their own windows; the
+        option changed nothing.
+Revert: revert the commit alone (restores a checkbox that still does nothing).
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
