@@ -290,6 +290,20 @@ Why:    "block native" is per window in practice: the owner's own device is
         mice, and only where somebody works.
 Revert: revert the commit alone.
 
+23. Logging for frozen-input situations                          src (next commit)
+----------------------------------------------------------------------------
+What:   NATIVE/In in chrome-log.txt: every native mouse/key message that
+        reaches a Chrome window, position, and the decision (BLOCKED-here,
+        passes, exempt dialog/help); moves every 50th. BLOCKING in
+        mousemux_debug.log: the blocked-window set with owners and each
+        view's state whenever recomputed. FWD: every event forwarded to a
+        page with its origin - injected-page, injected-ui, NATIVE - so the
+        ACK after it can be attributed (the old ours= mark could not tell
+        injected-ui from native).
+Why:    "everything froze" on the bench (2026-09-04 20:31) could not be read
+        from the logs: native input arriving nowhere is silent.
+Revert: revert the commit alone; no behaviour is involved.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
