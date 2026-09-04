@@ -192,6 +192,20 @@ Why:    a window the owner opened themselves (Ctrl+N, a site's login popup)
         dropped. And two users could end up owning one window.
 Revert: revert the commit alone.
 
+14. The wheel's scroll gesture is ended                          src (next commit)
+----------------------------------------------------------------------------
+What:   Per device, 100 ms after the last wheel notch, a zero-delta wheel
+        event with phase Ended goes to the page the last notch went to
+        (SendWheelEnd), as MouseWheelPhaseHandler does for a real mouse.
+Why:    Every injected wheel was phase Began and nothing ever ended the
+        gesture, so Chrome kept scrolling whatever the first notch latched
+        onto - nothing, when that notch hit a spot without a scroller or
+        the end of one. ACK log 2026-09-04: 206 consecutive "no consumer"
+        on a page a real mouse scrolled at once; 447 scroll updates, 3
+        scroll begins. This is the customer's "their wheel stops until I
+        scroll there with my mouse".
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
