@@ -290,7 +290,7 @@ Why:    "block native" is per window in practice: the owner's own device is
         mice, and only where somebody works.
 Revert: revert the commit alone.
 
-23. Logging for frozen-input situations                          src (next commit)
+23. Logging for frozen-input situations                          src c7b46531ea6
 ----------------------------------------------------------------------------
 What:   NATIVE/In in chrome-log.txt: every native mouse/key message that
         reaches a Chrome window, position, and the decision (BLOCKED-here,
