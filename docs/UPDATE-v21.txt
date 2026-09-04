@@ -225,6 +225,20 @@ Why:    the person at a seat had no way to see on the window that it was
         theirs (entry 15's number was not what was asked for).
 Revert: revert the commit alone.
 
+17. The window under a press is what Windows says it is           src (next commit)
+----------------------------------------------------------------------------
+What:   WindowFromPoint names the top-level window under a press (a menu
+        popup resolves to the browser window that owns it). Rule: the
+        dialog/help window get the press whoever the user is; one of the
+        user's own windows becomes current and gets it; an unowned window
+        is claimed; anything else is dropped. Moves/wheel/keys go to the
+        current window without a lookup; a move over the current window or
+        its popups is delivered there for hover. Replaces three rectangle
+        tests.
+Why:    rectangles cannot know what is on top: two overlapping windows of
+        one user alternated on every press, so each click took two.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
