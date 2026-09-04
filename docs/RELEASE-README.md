@@ -364,7 +364,7 @@ focus around behind the browser's back — and that is precisely what makes one
 person's click stop another person's typing. Capture everyone, or the rest of
 this does not hold.
 
-**Ownership routes all input.** A user's window is chosen once, by their first
+**A user's window routes all input.** A user's window is chosen once, by their first
 click, and after that position never chooses again: every event from that
 user's devices goes to that window, and the position only decides where inside
 it — the page, the tab strip, a menu. Cursors still move freely across all
