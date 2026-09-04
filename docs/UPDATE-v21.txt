@@ -357,7 +357,7 @@ Why:    Chrome's frame handles caption buttons itself and waits for the
         looked dead until an activation change (21:22, UI thread idle).
 Revert: revert the commit alone.
 
-29. An owned window keeps its page focus across activation changes   src (next commit)
+29. An owned window keeps its page focus across activation changes   src 6e0fde49a16
 ----------------------------------------------------------------------------
 What:   ShouldSuppressBlur is true for a page in an owned window, captured
         or not (was capture-gated). Unowned windows unchanged.
