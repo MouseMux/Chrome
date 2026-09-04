@@ -92,7 +92,7 @@ Cost:   while "Block native mouse input" is on, the operator's real mouse
         gets no hover in Chrome UI (it could not click there anyway).
 Revert: revert commit dd46eb45a01.
 
-7. Ownership routes the mouse                                   src (next commit)
+7. Ownership routes the mouse                                   src 513d243572d
 ----------------------------------------------------------------------------
 What:   A user who owns a window sends every mouse event to that window.
         Inside it, the point picks one of its own popups (its menu), its
@@ -108,6 +108,17 @@ Cost:   switching windows is only possible via Release in the dialog; the
         "Keep each user in their own window" checkbox is now redundant and
         will be removed in a later step.
 Revert: revert the commit alone.
+
+8. Dialog always clickable; wheel follows ownership             src (next commit)
+----------------------------------------------------------------------------
+What:   The MouseMux dialog and its help window are checked before the
+        ownership rule: any user can click them whatever window they own.
+        The wheel goes to the owned window's page wherever the pointer is,
+        the same rule as clicks. Debug-only OWNED ROUTE log line per press.
+Why:    Entry 7 dropped presses outside the owned window, and the dialog is
+        outside it - nobody could release or toggle anything. The wheel was
+        still picking a page by position, inconsistent with the rule.
+Revert: revert the commit alone (loses both).
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
