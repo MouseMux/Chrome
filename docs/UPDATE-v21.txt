@@ -277,7 +277,7 @@ Why:    leftover from the old debug log panel in that spot; a debug build had
         release dialogs are identical now.
 Revert: revert the commit alone.
 
-22. Native blocking per owner                                    src (next commit)
+22. Native blocking per owner                                    src 9dc6239b2f4
 ----------------------------------------------------------------------------
 What:   Every window an owner holds drops native mouse and keyboard input
         (page event handlers, and the views hook now checks a set of
