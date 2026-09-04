@@ -26,7 +26,9 @@ Our MouseMux-specific modifications enable the multi-seat functionality while pr
 
 When you launch Chrome with MouseMux integration enabled, a small **MouseMux Control Dialog** appears alongside the browser. This dialog shows connection status and provides controls for multi-seat operation.
 
-Any connected user can **claim** the browser window by clicking on it. Once claimed, that browser instance belongs to that user.
+Any connected user can **claim** a browser window by clicking on it. From then on **everything that user's mouse and keyboard produce goes to that window**: clicks, hover, the wheel and every keystroke, wherever their pointer happens to be on the screen. Moving the pointer over somebody else's window does nothing there. To move a user to another window, press **Release** on their row and let them click in the new one.
+
+Inside their window, users have the whole browser, not only the page: the address bar, Find (Ctrl+F), tabs, the **⋯** menu, right-click menus and keyboard shortcuts such as Ctrl+T all work, per user.
 
 To enter full multi-seat mode, tick **Capture** on every user's row in the dialog. That tells MouseMux to stop each captured device producing native Windows input, so every user's mouse and keyboard reach Chrome only as MouseMux events, routed to that user's own window. Capture is per user on purpose: one person can be handed their mouse back without disturbing the others.
 
@@ -81,18 +83,19 @@ scrolls.
 
 **Options** (bottom pane):
 
-**Keep each user in their own window** (checkbox) — Off, a user who clicks
-another window simply moves there. On, clicks landing outside a user's own
-window are ignored, giving each user one window they cannot leave. Cursors
-still move freely across the whole screen; only clicks are blocked. A user with
-no window claims the first one they click, and closing a window frees its user
-to claim another. With several people side by side you will usually want it.
+**Keep each user in their own window** (checkbox) — No longer does anything:
+since Build #62 every user is always kept in their own window (see **How It
+Works**). The checkbox will be removed in a coming build.
 
 **Block native mouse input (all devices)** (checkbox) — Drops the operating
-system's own mouse input inside Chrome, for every device at once. A safety net
-rather than the mechanism: capture already stops each captured device at the
-source, so with everyone captured this makes no difference. It matters for
-devices MouseMux is not capturing.
+system's own mouse input inside Chrome, for every device at once: clicks,
+movement and the wheel, in pages and in Chrome's own toolbars and menus. Only
+this dialog and its Help window keep responding to the real mouse, so the
+operator can always reach them. A safety net rather than the mechanism:
+capture already stops each captured device at the source, so with everyone
+captured this makes no difference. It matters for devices MouseMux is not
+capturing, and for the operator's own mouse, which loses hover and wheel over
+the browser while this is on.
 
 **Release hotkey** (dropdown) — The keyboard shortcut that releases capture
 (default: Shift+Escape). This is the escape hatch: it works even when injected
@@ -361,11 +364,18 @@ focus around behind the browser's back — and that is precisely what makes one
 person's click stop another person's typing. Capture everyone, or the rest of
 this does not hold.
 
-**Keep each user in their own window** confines each user to the window they first
-clicked in. Cursors still move freely across all monitors — a cursor stopping at
-an invisible wall reads as broken hardware — but clicks outside a user's own
-window are ignored. With several people side by side this is usually what you
-want.
+**Ownership routes all input.** A user's window is chosen once, by their first
+click, and after that position never chooses again: every event from that
+user's devices goes to that window, and the position only decides where inside
+it — the page, the tab strip, a menu. Cursors still move freely across all
+monitors — a cursor stopping at an invisible wall reads as broken hardware —
+but a press outside the user's own window does nothing. Windows may overlap
+freely. Monitors with different Windows scaling are handled per monitor.
+
+**The keyboard enters through the window**, the way a real keyboard does, so
+Chrome's own focus handling decides where a keystroke lands: the page, the
+address bar, the find bar, or a shortcut. Several users typing at once each
+keep their own caret, without any window changing activation.
 
 What is shared, and what is not:
 
@@ -394,6 +404,12 @@ opens a menu, the first user's menu closes. Nothing is lost; the first user
 simply opens theirs again. Address-bar suggestions, the find bar and the
 bookmark and download bubbles are not menus and are not affected: each window
 has its own.
+
+**No drag-and-drop with a MouseMux mouse.** Dragging a link, an image or
+selected text out of a page, or onto the bookmark bar, does nothing. Windows'
+drag-and-drop only ends on a real mouse-button release, which a captured
+device never produces, and letting it start would freeze the browser. Selecting
+text by dragging is unaffected; only carrying things somewhere is.
 
 ---
 
@@ -434,8 +450,8 @@ For optimal performance, close unused tabs and browser instances when not needed
    because capture is what stops each device producing native Windows input.
    Every dot should now be green
 9. Everyone works at the same time, each with their own cursor and caret
-10. Optionally tick **Keep each user in their own window** so nobody can click
-    into somebody else's window
+10. To move a user to another window, press **Release** on their row and let
+    them click in the new one
 11. Press the release hotkey (default: Shift+Escape) to release capture
 
 ---
