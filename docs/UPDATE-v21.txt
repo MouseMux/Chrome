@@ -269,7 +269,7 @@ Why:    since entry 7 every user is always kept in their own windows; the
         option changed nothing.
 Revert: revert the commit alone (restores a checkbox that still does nothing).
 
-21. Dialog footer (Help, Collapse, build label) in every build   src dcec6690bf9
+21. Dialog footer (Help, Collapse, build label) in every build   src (next commit)
 ----------------------------------------------------------------------------
 What:   The footer is no longer wrapped in #ifndef MOUSEMUX_DEBUG.
 Why:    leftover from the old debug log panel in that spot; a debug build had
