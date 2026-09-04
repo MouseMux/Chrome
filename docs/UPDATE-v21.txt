@@ -373,6 +373,8 @@ What:   One table definition for a header row and every user row: dot |
         User || Window || Keyboard || Typing || Capture | Block native |
         Release | x, one-pixel lines between the text columns. Dialog
         width 660 -> 740 so the window title keeps about 190px.
+        Follow-up 5a543ef3f2d: no lines in the header row (they looked like a
+        fence); the rows keep theirs.
 Why:    the window is what the operator reads first and sat behind two
         narrow status columns; the rows read better as a table.
 Revert: revert the commit alone.
