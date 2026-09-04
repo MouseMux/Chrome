@@ -206,6 +206,16 @@ Why:    Every injected wheel was phase Began and nothing ever ended the
         scroll there with my mouse".
 Revert: revert the commit alone.
 
+15. "[N] title" in every window caption                          src (next commit)
+----------------------------------------------------------------------------
+What:   A stable number per browser window (assigned when first seen, kept
+        while it lives, keyed by session id) prefixed to the caption while
+        MouseMux integration is on, and used by the dialog's "Window N".
+        Header-only helper mouse_mux_window_number.h.
+Why:    a person at a seat could not tell which window their row meant; and
+        the dialog's numbering shifted when a window closed.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
