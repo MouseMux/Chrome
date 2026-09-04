@@ -108,6 +108,15 @@ What is NOT optional is **multi keyboard**. Without it there is no low-level
 keyboard hook, so keystrokes carry no per-device identity and arrive as
 ordinary focus-driven Windows input. Nothing downstream can separate them.
 
+Since 2.2.62 the hint therefore lists both: `"hint": ["switched",
+"multi-keyboard"]`. The MouseMux launcher checks each name in `mode.hint`
+against the mode it is running in and, for the first one that is not active,
+shows `mode.help` with "Do you want to continue anyway?". (`mode.hard` would
+refuse the launch instead; we do not use it.) The names it knows are
+`native`, `switched`, `multiplex` and `multi-keyboard`; multi-keyboard is a
+separate flag beside the mode, so listing both means both must be on. Source:
+`app_launcher_logic_exec.c` in the MouseMux tree.
+
 **`make` tracks the MouseMux version**, and is set by hand. It sat at `3.0.11`
 against a 3.0.17 server until 2.2.58, when it was corrected to `3.0.21`.
 Nothing detects this, so bump it when MouseMux is released - otherwise the
