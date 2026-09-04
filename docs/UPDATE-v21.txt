@@ -155,6 +155,26 @@ Why:    a debug build sent to a customer must not come back with a log
 Package: chrome-release-2.2.62-debug-20260904 (field test for Gustavo).
 Revert: comment out #define MOUSEMUX_ANONYMOUS_KEYS.
 
+12. Logging that follows every event end to end                 src a46c70d7e14
+----------------------------------------------------------------------------
+What:   Under MOUSEMUX_DEBUG, four line kinds in mousemux_debug.log:
+          IN     what arrived (device, user, raw screen pixels)
+          ROUTE  the branch taken and why (owned window, popup, page,
+                 Chrome UI, outside, drag lock, unowned search)
+          OUT    what was handed to Chrome (view, host, scaled coordinates,
+                 view bounds, widget coordinates, pending/ignoring state,
+                 cross-process frame count)
+          ACK    Chrome's answer to every input event of every registered
+                 view (RenderWidgetHost::InputEventObserver): consumed,
+                 not-consumed, NO-CONSUMER, IGNORED; ours=1 for injected
+                 events (kFromDebugger), ours=0 for native
+        Mouse moves every 50th per device (acks every 50th per host);
+        everything else always. Keys carry user and window.
+Why:    Gustavo's 2.2.62 logs showed every wheel event handed to the page
+        and nothing about what the page did with it. The next field log
+        must name the outcome.
+Revert: revert the commit alone; no behaviour is involved.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
