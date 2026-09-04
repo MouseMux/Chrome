@@ -216,7 +216,7 @@ Why:    a person at a seat could not tell which window their row meant; and
         the dialog's numbering shifted when a window closed.
 Revert: revert the commit alone.
 
-16. "[Green] title": the owner's name in the caption              src 33a055b3a3a
+16. "[Green] title": the owner's name in the caption              src 6d5464b02d8
 ----------------------------------------------------------------------------
 What:   A window's caption starts with its owner's MouseMux name; with the
         window number while nobody owns it. Captions refresh on every
