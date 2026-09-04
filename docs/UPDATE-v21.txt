@@ -304,6 +304,15 @@ Why:    "everything froze" on the bench (2026-09-04 20:31) could not be read
         from the logs: native input arriving nowhere is silent.
 Revert: revert the commit alone; no behaviour is involved.
 
+24. Blocking recomputed once a new tab's view has its window      src (next commit)
+----------------------------------------------------------------------------
+What:   The deferred lookup that adopts new windows (MaybeAdoptNewWindow)
+        also recomputes native blocking when the view's window is known.
+Why:    a new tab's view registers before it is attached, so RegisterView
+        computed blocked=0 for window=(nil); the second tab of a blocked
+        window then took the real mouse's wheel and clicks (log 20:41).
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
