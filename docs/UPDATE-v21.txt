@@ -216,6 +216,15 @@ Why:    a person at a seat could not tell which window their row meant; and
         the dialog's numbering shifted when a window closed.
 Revert: revert the commit alone.
 
+16. "[Green] title": the owner's name in the caption              src 33a055b3a3a
+----------------------------------------------------------------------------
+What:   A window's caption starts with its owner's MouseMux name; with the
+        window number while nobody owns it. Captions refresh on every
+        ownership change, including a window joining a user's set.
+Why:    the person at a seat had no way to see on the window that it was
+        theirs (entry 15's number was not what was asked for).
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
