@@ -304,7 +304,7 @@ Why:    "everything froze" on the bench (2026-09-04 20:31) could not be read
         from the logs: native input arriving nowhere is silent.
 Revert: revert the commit alone; no behaviour is involved.
 
-24. Blocking recomputed once a new tab's view has its window      src (next commit)
+24. Blocking recomputed once a new tab's view has its window      src 141047a7d46
 ----------------------------------------------------------------------------
 What:   The deferred lookup that adopts new windows (MaybeAdoptNewWindow)
         also recomputes native blocking when the view's window is known.
