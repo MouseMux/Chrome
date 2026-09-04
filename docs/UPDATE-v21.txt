@@ -260,7 +260,7 @@ Why:    an injected click on minimize/maximize/close reached Chrome's
         flickered under an injected pointer.
 Revert: revert the commit alone.
 
-20. "Keep each user in their own window" removed                 src (next commit)
+20. "Keep each user in their own window" removed                 src dcec6690bf9
 ----------------------------------------------------------------------------
 What:   The checkbox, its help entry, the toggle handler, SetHardLock /
         IsHardLock, hard_lock_, locked_window and the two dead branches on
