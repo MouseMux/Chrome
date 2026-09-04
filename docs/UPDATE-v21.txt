@@ -334,7 +334,7 @@ Why:    the caret in a text field disappears under blocked native clicks
         pass through the page's focus change, which was silent.
 Revert: revert the commit alone.
 
-27. A native click on a blocked window no longer activates it    src (next commit)
+27. A native click on a blocked window no longer activates it    src f8a7743fb85
 ----------------------------------------------------------------------------
 What:   WM_MOUSEACTIVATE for client-area clicks on a blocked window is
         answered MA_NOACTIVATEANDEAT, in the frame hook and in the per-page
