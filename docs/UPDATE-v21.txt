@@ -754,6 +754,14 @@ What:   CONTROL IN / CONTROL OUT lines in mousemux_debug.log (300 chars);
 Why:    a failed share on host.html left no trace on our side.
 Revert: revert the commit alone.
 
+70. Host and View buttons   src 8146493b6f7
+----------------------------------------------------------------------------
+What:   footer buttons open http://127.0.0.1:<port>/host.html and
+        view.html in a new window; greyed without --mousemux-control-port.
+Why:    the pages must not sit in a window a user owns, and nobody should
+        type the URL.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
