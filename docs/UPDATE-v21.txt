@@ -747,6 +747,13 @@ Why:    the minimal remote seat: a remote user of a window on the host,
         both ends running only this Chrome.
 Revert: revert the commit alone.
 
+69. Control server logs every message in and out   src 0f302ef6d32
+----------------------------------------------------------------------------
+What:   CONTROL IN / CONTROL OUT lines in mousemux_debug.log (300 chars);
+        LogDebug is public for that.
+Why:    a failed share on host.html left no trace on our side.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
