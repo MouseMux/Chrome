@@ -420,8 +420,16 @@ For optimal performance, close unused tabs and browser instances when not needed
 ### Getting Started
 
 1. Ensure MouseMux is running — **MouseMux V3**, in **Switched** mode with
-   **multi keyboard ON**. Multi keyboard is not optional: without it keystrokes
-   carry no per-device identity and nothing can be routed
+   **Multi-keyboard ON**. Multi-keyboard is not optional. Chrome receives
+   every user's keystrokes over the MouseMux connection; whether Windows
+   *also* delivers them to whatever program is in the foreground is decided
+   by MouseMux, not by Chrome. In Switched mode without Multi-keyboard the
+   keyboard stays a normal Windows keyboard, so each key typed into a Chrome
+   window is typed a second time into the foreground program — which may be
+   somebody else's. With Multi-keyboard on, MouseMux keeps the keyboard's
+   input to itself and Chrome is the only place it arrives. The **Block
+   native** option stops the duplicate inside Chrome's own windows; nothing
+   in Chrome can stop it in other programs. The app pack hints both settings
 2. Run **`start-mousemux-chrome.bat`** — or start `chrome.exe` yourself with
    `--enable-features=MouseMuxIntegration` (see **Starting Chrome** above)
 3. The MouseMux Control Dialog appears — press **Connect**; the indicator
