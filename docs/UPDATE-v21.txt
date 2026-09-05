@@ -698,6 +698,13 @@ Why:    owners are assigned by MouseMux name through the user list, which
         Simpler than a pending list.
 Revert: revert the commit alone.
 
+65. Save layout only while connected   src b1e4963d02b
+----------------------------------------------------------------------------
+What:   the Save layout button is greyed out until connected.
+Why:    disconnected there are no owners; a save then overwrote a layout
+        that had them with one that did not.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
