@@ -555,6 +555,16 @@ Why:    the page dropped native keys (its handler checks the flag) but the
         with multi-keyboard on, 0 beside 58).
 Revert: revert the commit alone.
 
+51. Virtual cursor: no position of its own -> the latest one   src 662546ead48
+----------------------------------------------------------------------------
+What:   MouseMuxVirtualCursorAtDIP answers with the most recent injected
+        position when the asking window has none; the real mouse only when
+        nothing has been injected.
+Why:    after entry 38 the ... menu and right-click menus flickered again:
+        a popup whose handle did not resolve to its window found no entry and
+        fell back to the real mouse, the exact cause fixed on 2026-09-04.
+Revert: revert the commit alone (entry 38 then has the bug again).
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
