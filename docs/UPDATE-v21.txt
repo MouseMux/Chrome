@@ -705,6 +705,20 @@ Why:    disconnected there are no owners; a save then overwrote a layout
         that had them with one that did not.
 Revert: revert the commit alone.
 
+66. Control server: capture message (hosted-browser spike, part 1)   src 6a84367be49
+----------------------------------------------------------------------------
+What:   {"type":"capture","owner":"Green"|"hwnd":N,"page":"<url>"} ->
+        DesktopMediaID::RegisterNativeWindow(root) + DesktopStreamsRegistry
+        ::RegisterStream for the tab showing <page>; reply
+        {"type":"capture","id","hwnd","x","y","width","height"}.  Spike page:
+        O:/mousemux-builds/Chrome/spike/capture-host.html.
+Why:    getUserMedia(chromeMediaSource "desktop", that id) is served by the
+        compositor-based AuraWindowVideoCaptureDevice on Windows: no screen
+        involved, and WindowTreeHost::VideoCaptureLock keeps an occluded
+        window's compositor alive.  Screen Matrix already requests sources
+        exactly this way.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
