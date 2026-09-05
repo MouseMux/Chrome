@@ -9,10 +9,17 @@ Open items, newest first. Each says why it is open and what would close it.
 - **Save / load** (2026-09-04). A named layout: windows, positions, sizes,
   tabs/URLs, and which user owns which; load it on start or on demand. Same
   item as the disconnect note below; this is the user-facing form.
-- **Advanced options** (2026-09-04). A place for the settings that should not
-  sit in the main dialog: hotkey, wheel notch size, the legacy global block,
-  logging switches, control-server port. A separate small dialog or a pane
-  that unfolds.
+- **Advanced options** (2026-09-04, plan 2026-09-05). Four commits, in order:
+  1. logging becomes a runtime switch: the `MOUSEMUX_DEBUG` code stays
+     compiled in, the four log sinks (controller log, diag log, controller
+     trace, views trace) check one flag; default off, on via
+     `--mousemux-log` or the option; anonymised keys stay compile-time;
+  2. `mousemux-settings.json` next to the layout file, read at startup:
+     hotkey, wheel step, logging, global block;
+  3. an Advanced dialog from a footer button: the hotkey dropdown moves
+     there, plus wheel step, logging, global block, port read-only;
+  4. the wheel step (today a constant, 40 px per notch) read from the
+     setting.
 - **Screen sharing for remote access** (2026-09-04). Let a remote person see
   (and possibly drive) one user's window - the seat concept over the network.
   Scope to be defined: view-only first.
