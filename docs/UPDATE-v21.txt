@@ -662,6 +662,15 @@ Why:    the first building block of save/load and of reconnect memory: a
         change with hardware.
 Revert: revert the commit alone (nothing calls it yet).
 
+61. Save layout   src 6eb9bbc914b
+----------------------------------------------------------------------------
+What:   footer button; writes <profile>/mousemux-layout.json: per normal
+        window (window-number order) x/y/width/height, maximized, url of the
+        active tab, owner, captured, block_native.  Version 1.
+Why:    first half of save/load; the file is also what reconnect memory
+        will read.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
