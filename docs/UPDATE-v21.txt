@@ -576,6 +576,35 @@ Why:    the flicker of entry 6 came back with per-owner blocking: the list
         at the wrong cause and is harmless.
 Revert: revert the commit alone.
 
+53. An injected click in the page gives the page Chrome's focus   src 6a14a728b57
+----------------------------------------------------------------------------
+What:   on an injected page press the controller also calls view->Focus()
+        (the page's aura window) with g_mousemux_synthetic_key set, which
+        now lives in namespace content.  The views side then neither
+        activates the OS window nor moves native focus.
+Why:    a real click focuses the page's window on its way through aura; an
+        injected one went straight to the renderer.  After a tab closed,
+        Chrome restores focus only on activation, which an owned window
+        never gets: keys posted to the window found no focused view and
+        were dropped (15:11: 114 posted, none forwarded to any page).
+Revert: revert the commit alone.
+
+54. KEY/In trace (views)   src 9a29438f2ed
+----------------------------------------------------------------------------
+What:   under MOUSEMUX_DEBUG_TRACE, every posted key logs window, active
+        aura window, focused aura window and focused view class.
+Why:    "keys arrive, nothing happens" is this line.
+Revert: revert the commit alone.
+
+55. A keyboard whose pairing owns nothing re-requests the user list   src 48be028b46b
+----------------------------------------------------------------------------
+What:   in the "KEY NOT AN OWNER" branch, RequestUserList() at most every
+        two seconds (the existing throttle member).
+Why:    the server sent the user list at connect and nothing when a
+        keyboard was moved from Lime to Aqua during the session; 128 keys
+        kept arriving as Lime's and were dropped.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
