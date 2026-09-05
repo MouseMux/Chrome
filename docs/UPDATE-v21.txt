@@ -627,6 +627,18 @@ Note:   another user's click on Chrome UI (not a page) still closes an
         Documented limitation until capture knows about users.
 Revert: revert the commit alone.
 
+58. A key in another window is not the menu's, native or injected   src 1c1e066077c
+----------------------------------------------------------------------------
+What:   entry 57 without the synthesized-only condition: any key whose
+        target root differs from the menu owner's root is ignored by the
+        menu handler.
+Why:    with Multi-keyboard off the native copy of a keystroke lands in the
+        foreground window - our exempt dialog - and the menu took it from
+        there (15:47: six native key-downs at the dialog, one for one with
+        Aqua's typing, drove Green's menu).  Block native never covered the
+        dialog, by design.
+Revert: revert the commit alone (entry 57 remains).
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
