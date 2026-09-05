@@ -651,6 +651,17 @@ Why:    the server (2026-09-05) now sends "update" when a device is
 Revert: revert the commit alone; entry 55's re-request still covers it,
         two seconds late.
 
+60. AssignWindow(name, window, captured, block_native)   src 6ed641b14a7
+----------------------------------------------------------------------------
+What:   controller API: the user list maps the MouseMux name to a device,
+        AddOwner + ClaimForPress make the window theirs, the two flags are
+        applied.  False (nothing changed) when the name is not connected
+        or the window is another user's.
+Why:    the first building block of save/load and of reconnect memory: a
+        window made somebody's without a press.  Names, because device ids
+        change with hardware.
+Revert: revert the commit alone (nothing calls it yet).
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
