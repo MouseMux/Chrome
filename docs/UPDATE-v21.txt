@@ -379,13 +379,175 @@ Why:    the window is what the operator reads first and sat behind two
         narrow status columns; the rows read better as a table.
 Revert: revert the commit alone.
 
+Code review follow-ups (2026-09-04/05).  A read-only review of the whole
+integration listed 25 findings; each was checked against the code first and
+fixed in its own commit where it held.  Two structural items (a shared header
+for the cross-layer globals in ui/base; moving the PreHandleMSG blocks into a
+MouseMux-owned file) are not done - separate branch.  The debug switches stay
+ON in this branch for the bench; off before any release.
+
+31. The dialog unregisters its callbacks before it dies   src 822745bb4d3
+----------------------------------------------------------------------------
+What:   MouseMuxInputController::ClearUiCallbacks(), called from the dialog
+        destructor, resets the ten callbacks the dialog bound to itself.
+Why:    closing the dialog ends the seat, so the dialog died before the browser
+        windows, and every tab closing afterwards notified ownership changes
+        into freed memory.
+Revert: revert the commit alone.
+
+32. A closing window releases its owner   src 0dd88bd7820
+----------------------------------------------------------------------------
+What:   ForgetViewEverywhere drops the closing window from the owned set
+        before pruning; the injector's prune on a dead handle releases too.
+Why:    Chrome destroys a window's pages before its frame, so IsWindow still
+        said yes and the owner was kept on an empty frame.
+Revert: revert the commit alone.
+
+33. Claiming uses the window rule   src d3c1ee13d1a
+----------------------------------------------------------------------------
+What:   OnMouseButton claims through WindowFromPoint like the routing does;
+        the rectangle test and its claim-on-miss fallback are gone.
+Why:    a press on the desktop or another user's UI made an owner with no
+        window, who then hovered everyone's pages.
+Revert: revert the commit alone.
+
+34. Owning nothing gets nothing of another user's   src 7eab73e9361
+----------------------------------------------------------------------------
+What:   in the unowned search every event (not only presses) stops at another
+        user's window; wheel with no page under it is dropped instead of
+        scrolling the first registered view.
+Why:    hover and wheel from a windowless user leaked into other users' pages.
+Revert: revert the commit alone.
+
+35. A press focuses the clicked page only   src dc24ce6f1a3
+----------------------------------------------------------------------------
+What:   host->Focus() for the clicked page; the every-renderer loop on each
+        press and FocusKeyboardTargetView (capture toggle) are gone.
+Why:    ownership already holds focus (ShouldSuppressBlur); the loop put a
+        caret back in pages whose users were typing in the omnibox.
+Revert: revert the commit alone.
+
+36. One truth for capture; disposal order   src 83568b2bf11
+----------------------------------------------------------------------------
+What:   is_captured_ removed, every reader asks IsCaptured(); OnUserDisposed
+        removes the owner before erasing its state.
+Why:    the cached flag drifted (a disposed device left it stale); RemoveOwner
+        re-created the state OnUserDisposed had just erased.
+Revert: revert the commit alone.
+
+37. Stale window handles   src 8edafde3843
+----------------------------------------------------------------------------
+What:   g_mousemux_help_hwnd cleared when the help window dies; OwnerOfWindow
+        skips handles whose window is gone.
+Why:    Windows reuses handles: a browser window could inherit the help
+        window's blocking exemption, or report an old owner and refuse a
+        claim.
+Revert: revert the commit alone.
+
+38. Virtual cursor per window   src 72c6ffb43bf
+----------------------------------------------------------------------------
+What:   screen_win.cc keeps one injected position per top-level window (popups
+        resolve to their owner); a window's dispatcher asks for its own,
+        GetCursorScreenPoint falls back to the most recent, a window with
+        none reports the real mouse.
+Why:    one global was overwritten by every device: a menu opened by one user
+        got synthesized moves at the other's position, and a fresh window
+        was told the cursor sat at 0,0.
+Revert: revert the commit alone.
+
+39. One ClaimForPress   src bc060573533
+----------------------------------------------------------------------------
+What:   the three copies of 'a press adopts this window' in the routing are one
+        function with one owner check.
+Why:    three places set current window, keyboard target and owned set by hand.
+Revert: revert the commit alone.
+
+40. Users list reads the current window   src 81fb8412f02
+----------------------------------------------------------------------------
+What:   GetOwners takes window, title (Win32 caption) and window count from
+        claimed_window; keyboard_target_view is a keyboard fallback only.
+Why:    the row came from the last clicked tab: gone when it closed, elsewhere
+        after a drag, while the current window was known.
+Revert: revert the commit alone.
+
+41. Ownership UI refresh on its own task   src 76fe9820ff2
+----------------------------------------------------------------------------
+What:   OnOwnershipChanged logs and posts one RefreshOwnershipUi; a second
+        notification while one is pending folds into it.
+Why:    captions and toolbar chips of every window were updated inline from
+        injected input and from a page's destructor, twice per claim.
+Revert: revert the commit alone.
+
+42. Native blocking recomputed once per change   src 2e4b7eb81e8
+----------------------------------------------------------------------------
+What:   SetOwnerBlockNative relies on the notification's apply; RegisterView on
+        MaybeAdoptNewWindow's; adoption applies through the notification.
+Why:    each of those applied twice.
+Revert: revert the commit alone.
+
+43. Server notices in a window, not a MessageBox   src 2d84ecec316
+----------------------------------------------------------------------------
+What:   NoticeCallback controller -> dialog; MouseMuxNoticeDialog (non-modal,
+        Close button) shows timeout warnings and session end.  One friend
+        line added in ui/views/window/dialog_delegate.h.
+Why:    MessageBoxW inside the socket callback spun a nested loop on the UI
+        thread and stalled every user's input until dismissed.
+Revert: revert the commit alone.
+
+44. One rounding for SDK positions   src 37bdd44cee8
+----------------------------------------------------------------------------
+What:   ScreenPixelPoint/ScreenPixelPOINT (floor) replace the mix of
+        static_cast<int>/<LONG> and floor across claim, hit tests, window
+        lookup, aura dispatch.
+Why:    truncation rounds toward zero: on a monitor left of or above the
+        primary the same point could be on different sides of an edge.
+Revert: revert the commit alone.
+
+45. Adopt retry without a dangling pointer   src 7d30bcd0892
+----------------------------------------------------------------------------
+What:   views registered before their window exists go into adopt_pending_
+        (erased by UnregisterView); RetryPendingAdoptions walks the set.
+Why:    a raw view pointer was bound into a task 200 ms out.
+Revert: revert the commit alone.
+
+46. MULTI_OWNER and AURA_KEYBOARD promoted   src 5e708542d88
+----------------------------------------------------------------------------
+What:   the #ifdefs and their #else halves are gone (single-owner claim,
+        every-renderer focus loop, SetForegroundWindow, InsertChar keyboard
+        path, about 250 lines).  Config header keeps the history.
+Why:    shipped and verified, yet the dead halves were still carried.
+Revert: revert the commit alone.
+
+47. Dead code out   src dc4a9b0af2a
+----------------------------------------------------------------------------
+What:   IsPointOverChrome, GetOwnerKeyboardHwid, user_positions_,
+        motion_count_, ScreenNumberOf/screen_index, dialog UpdateTitle,
+        dialog owner fields, native-blocking-changed callback, ToggleButton
+        include; InjectionStats counts posted keys/chars.
+Why:    none of it was read, or it described the InsertChar path.
+Revert: revert the commit alone.
+
+48. One version stamp; comments match the code   src 5057fce19d7
+----------------------------------------------------------------------------
+What:   MOUSEMUX_VERSION / BUILD_NUMBER / BUILD_DATE in mouse_mux_config.h,
+        used by client and dialog.  ShouldSuppressBlur comments say captured
+        OR owned; dialog.h orphan comments removed; prune log names the
+        closed window.
+Why:    three constants in two files already disagreed on the date.
+Revert: revert the commit alone.
+
+49. Menu selection trace removed   src 279bac0f47f
+----------------------------------------------------------------------------
+What:   MOUSEMUX_MENU_TRACE and its SetSelection block in menu_controller.cc.
+Why:    its question was answered on 2026-09-04; it wrote a stack trace to disk
+        on every selection change since.
+Revert: revert the commit alone.
+
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
   desktop_window_tree_host_win.cc): logs in %TEMP%: mousemux_debug.log,
   mousemux_diag.log, chrome-log.txt (activation stack traces, custom-mouse
   trace, native-move-under-menu trace).
-  MOUSEMUX_MENU_TRACE (menu_controller.cc): temporary, selection-change
-  stack traces. Remove before release.
 
 Open:
   - flicker after 6: to be tested.
