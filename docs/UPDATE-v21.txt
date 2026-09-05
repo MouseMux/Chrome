@@ -671,6 +671,24 @@ Why:    first half of save/load; the file is also what reconnect memory
         will read.
 Revert: revert the commit alone.
 
+62. OpenWindowCopy()   src 1827ffd4319
+----------------------------------------------------------------------------
+What:   "+ Window" as a function returning the new window (found by
+        elimination against the windows that existed before).
+Why:    Load layout opens windows the same way and then needs the window.
+Revert: revert the commit alone.
+
+63. Load layout   src 4175cf09ab6
+----------------------------------------------------------------------------
+What:   footer button; reads the layout file off the UI thread; entries go
+        to the existing normal windows in window-number order, the rest are
+        opened as copies of the signed-in tab; bounds, navigation to the
+        saved page (in the copy, so session storage survives), then
+        AssignWindow by name with the saved flags.
+Why:    second half of save/load.  Names not connected yet are skipped and
+        logged; those users claim by clicking.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
