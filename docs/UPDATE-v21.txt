@@ -719,6 +719,17 @@ Why:    getUserMedia(chromeMediaSource "desktop", that id) is served by the
         exactly this way.
 Revert: revert the commit alone.
 
+67. Capture stream bound to process and origin, not one frame   src bb756c7e603
+----------------------------------------------------------------------------
+What:   RegisterStream with restrict_to_render_frame_id = nullopt; the
+        spike page adds a random fragment to its URL before connecting.
+Why:    second attempt failed "Error starting tab capture"
+        (STREAM_NOT_FOUND_IN_REGISTRY): a second tab or a reload made the
+        requesting frame differ from the one the URL lookup found.  The
+        first attempt had worked (it captured the spike page's own window,
+        which was Green's current one).
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
