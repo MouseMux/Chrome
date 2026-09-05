@@ -615,6 +615,18 @@ Why:    the ... button is Chrome UI and never reached the page path, so
         Aqua's next click in her own page closed it (15:30).
 Revert: revert the commit alone.
 
+57. Another user's injected keys are not the menu's   src 3defeb89943
+----------------------------------------------------------------------------
+What:   menu_pre_target_handler_aura.cc: a synthesized key whose target
+        root is not the menu owner's root is ignored by the menu handler.
+Why:    the handler is on the process-wide Env and took every key in the
+        process while a menu was open; Green's arrows drove and closed
+        Aqua's menu (15:40).
+Note:   another user's click on Chrome UI (not a page) still closes an
+        open menu: it takes mouse capture, and Windows has one per thread.
+        Documented limitation until capture knows about users.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
