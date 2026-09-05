@@ -689,6 +689,15 @@ Why:    second half of save/load.  Names not connected yet are skipped and
         logged; those users claim by clicking.
 Revert: revert the commit alone.
 
+64. Load layout only while connected   src 83c2652958a
+----------------------------------------------------------------------------
+What:   the Load layout button is greyed out until connected, like + Window.
+Why:    owners are assigned by MouseMux name through the user list, which
+        only the connection provides; a disconnected Load rebuilt the
+        windows and assigned nobody (17:49: six presses, 0 assigned).
+        Simpler than a pending list.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
