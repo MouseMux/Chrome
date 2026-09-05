@@ -542,6 +542,19 @@ What:   MOUSEMUX_MENU_TRACE and its SetSelection block in menu_controller.cc.
 Why:    its question was answered on 2026-09-04; it wrote a stack trace to disk
         on every selection change since.
 Revert: revert the commit alone.
+50. Native block covers the keyboard   src 2b677e9a186
+----------------------------------------------------------------------------
+What:   PreHandleMSG drops WM_KEYDOWN/KEYUP/CHAR/DEADCHAR/UNICHAR and the
+        WM_SYSKEY family for a window on the block list.  Our own
+        WM_MOUSEMUX_KEY* messages pass.
+Why:    the page dropped native keys (its handler checks the flag) but the
+        address bar, a views text field, took them.  With MouseMux in
+        switched mode WITHOUT multi-keyboard the server let the keyboard's
+        native input through too, and every character typed in the address
+        bar arrived twice (13:07: 12 native key-downs beside 24 SDK keys;
+        with multi-keyboard on, 0 beside 58).
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
