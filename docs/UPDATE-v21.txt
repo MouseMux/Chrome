@@ -605,6 +605,16 @@ Why:    the server sent the user list at connect and nothing when a
         kept arriving as Lime's and were dropped.
 Revert: revert the commit alone.
 
+56. A menu belongs to whoever opened it, whichever way   src abfda9d79a9
+----------------------------------------------------------------------------
+What:   MenuDismissCallback(hwid, page_press).  Every injected press feeds
+        the attribution before routing; only a page press by the menu's
+        owner cancels it.
+Why:    the ... button is Chrome UI and never reached the page path, so
+        Green's menu was attributed to the last page-presser (Aqua) and
+        Aqua's next click in her own page closed it (15:30).
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
