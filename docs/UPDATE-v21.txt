@@ -730,6 +730,23 @@ Why:    second attempt failed "Error starting tab capture"
         which was Green's current one).
 Revert: revert the commit alone.
 
+68. Hosted-browser spike, part 2: host.html and view.html   src 81ef2c2933a
+----------------------------------------------------------------------------
+What:   control server serves <exe dir>/mousemux-web over HTTP ("/" =
+        host.html); messages sources, rect, assign (AssignWindowToHwid).
+        host.html: Share = capture id -> getUserMedia -> MouseMux virtual
+        user (user.hwid/user.create over ws://localhost:41001) -> assign ->
+        session on wss://signal.mousemux.com (auth/create-session, same
+        protocol as Screen Matrix) -> code; viewer input from the data
+        channel -> pointer.motion/button/wheel, keyboard.key as that user.
+        view.html: join-session, video full-window, normalized pointer and
+        vkey events on the channel; double-click = fullscreen + keyboard
+        lock.  Pages live in content/.../mouse_mux/web/ and are copied to
+        out/Release/mousemux-web/ by hand for now (packager: TODO).
+Why:    the minimal remote seat: a remote user of a window on the host,
+        both ends running only this Chrome.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
