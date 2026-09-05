@@ -248,17 +248,22 @@ void RenderWidgetHostViewEventHandler::OnKeyEvent(ui::KeyEvent* event) {
     // Records whether OnKeyEvent is reached at all.  This writes the key code
     // of EVERY keystroke to disk and flushes per key — it must never be
     // compiled into a release build, and it is not cheap even in debug.
-    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH, "a");
+    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH.c_str(), "a");
     if (diag) {
       fprintf(diag, "[OnKeyEvent] blocked=%d type=%s vkey=0x%x code=%d\n",
               native_keyboard_input_blocked_ ? 1 : 0,
               event->type() == ui::EventType::kKeyPressed ? "DOWN" : "UP",
-              event->key_code(), static_cast<int>(event->code()));
+              MouseMuxLogVkey(event->key_code()),
+              MouseMuxLogDomKey(event->key_code(),
+                                static_cast<int>(event->code())));
       fflush(diag);
     }
   }
 #endif
-  if (native_keyboard_input_blocked_) {
+  // Synthesized events are the SDK's own, arriving through the window the
+  // way a real keystroke does; the block is for the hardware keyboard.
+  if (native_keyboard_input_blocked_ &&
+      !(event->flags() & ui::EF_IS_SYNTHESIZED)) {
     event->SetHandled();
     return;
   }

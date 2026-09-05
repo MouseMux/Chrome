@@ -118,6 +118,7 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "components/stylus_handwriting/win/features.h"
+#include "base/debug/stack_trace.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
 #include "content/browser/renderer_host/input/stylus_handwriting_controller_win.h"
 #include "content/browser/renderer_host/legacy_render_widget_host_win.h"
@@ -2761,6 +2762,23 @@ void RenderWidgetHostViewAura::OnSystemCursorSizeChanged(
 
 void RenderWidgetHostViewAura::OnWindowFocused(aura::Window* gained_focus,
                                                aura::Window* lost_focus) {
+#ifdef MOUSEMUX_DEBUG_TRACE
+  // MouseMux: every page focus change, with who caused it.  A caret that
+  // disappears under a blocked native click comes through here or nowhere.
+  {
+    const bool gained = window_ == gained_focus;
+    const bool suppress =
+        !gained && base::FeatureList::IsEnabled(features::kMouseMuxIntegration) &&
+        MouseMuxInputController::GetInstance()->ShouldSuppressBlur(this);
+    aura::WindowTreeHost* host_tree = window_ ? window_->GetHost() : nullptr;
+    const std::string stack = base::debug::StackTrace().ToString();
+    MMTRACE("PAGE/Focus", "view=%p hwnd=%p %s%s\n%s", static_cast<void*>(this),
+            host_tree ? static_cast<void*>(host_tree->GetAcceleratedWidget())
+                      : nullptr,
+            gained ? "GAINED" : "LOST",
+            suppress ? " (blur suppressed: captured)" : "", stack.c_str());
+  }
+#endif
   if (window_ == gained_focus) {
     // We need to honor input bypass if the associated tab does not want input.
     // This gives the current focused window a chance to be the text input
@@ -2801,22 +2819,18 @@ void RenderWidgetHostViewAura::OnWindowFocused(aura::Window* gained_focus,
     NOTREACHED();
   }
 
-#ifdef MOUSEMUX_MULTI_OWNER
-  // MouseMux: keep page focus while captured.  With several users in several
-  // windows, only one window can be the OS foreground one, so every
-  // activation change — the operator clicking the control dialog, another
-  // user's window coming forward — would blur the others and kill the caret
-  // of somebody who is still typing.  While captured, OS focus carries no
-  // information: nothing is producing native input, and injected events reach
-  // a view by hit-test rather than by focus.
-  //
-  // Capture-gated, so with capture off this does nothing and normal blur
-  // behaviour returns untouched.
+  // MouseMux: keep page focus while anyone is captured or this view's window
+  // is owned.  With several users in several windows, only one window can be
+  // the OS foreground one, so every activation change — the operator clicking
+  // the control dialog, another user's window coming forward — would blur the
+  // others and kill the caret of somebody who is still typing.  In those
+  // states OS focus carries no information: input reaches a view by
+  // ownership, not by focus.  With nobody captured and nothing owned, normal
+  // blur behaviour is untouched.
   if (base::FeatureList::IsEnabled(features::kMouseMuxIntegration) &&
       MouseMuxInputController::GetInstance()->ShouldSuppressBlur(this)) {
     return;
   }
-#endif
 
   UpdateActiveState(false);
   host()->LostFocus();

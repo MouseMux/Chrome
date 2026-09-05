@@ -21,6 +21,10 @@ class MouseMuxInputController;
 // Listens on a configurable port (--mousemux-control-port) and accepts
 // JSON messages to query/set owner, connection, capture, and blocking state.
 //
+// Plain HTTP GETs serve files from <directory of chrome.exe>/mousemux-web
+// ("/" is host.html): the pages of the hosted-browser feature, host.html and
+// view.html, so both ends need nothing but this Chrome.
+//
 // Protocol:
 //   → {"type":"status"}
 //   ← {"type":"status","owner":"user1:mouse1","connected":true,
@@ -62,6 +66,24 @@ class CONTENT_EXPORT MouseMuxControlServer {
 
   // Handles "set" request.
   void HandleSet(int connection_id, const std::string& data);
+
+  // {"type":"capture","owner":"Green"|"hwnd":N,"page":"<url>"}: registers
+  // the window's root as a desktop-capture source for the tab showing
+  // <page>, and replies {"type":"capture","id":"...",x,y,width,height}.
+  // The page then calls getUserMedia with chromeMediaSource "desktop" and
+  // that id; Chromium serves it from the compositor, so the window need not
+  // be visible on any screen.  See HandleCapture for what is checked.
+  void HandleCapture(int connection_id, const std::string& data);
+
+  // {"type":"sources"} -> {"type":"sources","windows":[{hwnd,title,owner,
+  // x,y,width,height}...]}: every window with a page of ours in it.
+  void HandleSources(int connection_id);
+  // {"type":"rect","hwnd":N} -> {"type":"rect","hwnd",x,y,width,height}:
+  // where the window is now, for mapping a viewer's normalized coordinates.
+  void HandleRect(int connection_id, const std::string& data);
+  // {"type":"assign","hwnd":N,"hwid":M} -> {"type":"ok"}: the window becomes
+  // that device's, as if it had clicked in it (AssignWindowToHwid).
+  void HandleAssign(int connection_id, const std::string& data);
 
   raw_ptr<MouseMuxInputController> controller_;  // Not owned, singleton.
   std::unique_ptr<base::Thread> io_thread_;

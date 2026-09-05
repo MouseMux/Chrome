@@ -36,13 +36,13 @@ constexpr size_t kMaxIncomingMessageSize = 64 * 1024;  // 64KB max message
 // sdk_web_server_client_login() copies them into app.make / sdk.make and does
 // no comparison — so they are informational, not a compatibility gate.
 //
-// kClientVersion tracks this Chrome build.  kSdkVersion records which MouseMux
-// SDK protocol this client was written against and is deliberately NOT bumped
-// alongside it: raising it would claim support for a protocol revision nobody
-// has verified against this code.
-constexpr char kClientVersion[] = "2.2.59";
+// kClientVersion is this Chrome build (stamped in mouse_mux_config.h).
+// kSdkVersion records which MouseMux SDK protocol this client was written
+// against and is deliberately NOT bumped alongside it: raising it would claim
+// support for a protocol revision nobody has verified against this code.
+constexpr char kClientVersion[] = MOUSEMUX_VERSION;
 constexpr char kSdkVersion[] = "2.2.35";
-constexpr char kBuildDate[] = "2026-08-31";
+constexpr char kBuildDate[] = MOUSEMUX_BUILD_DATE;
 
 // MouseMux message types (M2A = server to app).
 constexpr char kTypeMotion[] = "pointer.motion.notify.M2A";
@@ -440,8 +440,8 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
   // Raw WS keyboard logging — to verify the server sends exactly one event
   // per physical keypress.  Writes key codes to disk, so it must never be
   // compiled into a release build.
-  if (*type == "keyboard.key.notify.M2A") {
-    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH, "a");
+  if (*type == "keyboard.key.notify.M2A" && MouseMuxLogRawKeys()) {
+    static FILE* diag = fopen(MOUSEMUX_DIAG_LOG_PATH.c_str(), "a");
     if (diag) {
       fprintf(diag, "[RAW_WS] %s\n", json_str.c_str());
       fflush(diag);
@@ -634,7 +634,8 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
 #ifdef MOUSEMUX_DEBUG
     LogDebug(base::StringPrintf(
         "KEY RECV: hwid=0x%x vkey=0x%x msg=0x%x scan=%d flags=%d",
-        *hwid, *vkey, *message, *scan, *flags));
+        *hwid, MouseMuxLogVkey(*vkey), *message, MouseMuxLogScan(*vkey, *scan),
+        *flags));
 #endif
 
     for (Observer& observer : observers_) {
@@ -743,11 +744,16 @@ void MouseMuxClient::ParseAndDispatchMessage(const std::vector<uint8_t>& data) {
         }
         return;
       }
-      if (*action == "map") {
-        // Keyboard was mapped/unmapped for a user - refresh user list
-        // to update keyboard-to-mouse mapping.
+      if (*action == "map" || *action == "update") {
+        // A device was attached to a user ("map") or detached from one that
+        // still exists ("update": unplug, unmap, the losing side of a
+        // keyboard reassignment).  The message carries the user's new
+        // hwids, but the list is the truth for everybody, so ask for it and
+        // let OnUserList rebuild the pairing from scratch.  "update" is
+        // new on the server side (2026-09-05); before it, the losing user
+        // kept the keyboard here and its keys were dropped as theirs.
 #ifdef MOUSEMUX_DEBUG
-        LogDebug(base::StringPrintf("User map event received - requesting user list refresh"));
+        LogDebug("User " + *action + " event received - requesting user list refresh");
 #endif
         SendMessage("{\"type\":\"user.list.request.A2M\"}");
         return;

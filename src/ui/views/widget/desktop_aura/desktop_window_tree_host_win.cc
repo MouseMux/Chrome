@@ -10,6 +10,10 @@
 #include <utility>
 #include <vector>
 
+#include <set>
+
+#include "base/auto_reset.h"
+#include "base/debug/stack_trace.h"
 #include "base/check_op.h"
 #include "base/command_line.h"
 #include "base/containers/flat_set.h"
@@ -33,6 +37,9 @@
 #include "ui/base/cursor/cursor.h"
 #include "ui/base/cursor/platform_cursor.h"
 #include "ui/base/ime/input_method.h"
+#include "ui/base/ime/text_input_client.h"
+#include "ui/views/controls/menu/menu_controller.h"
+#include "ui/views/window/non_client_view.h"
 #include "ui/base/mojom/menu_source_type.mojom-shared.h"
 #include "ui/base/mojom/ui_base_types.mojom-shared.h"
 #include "ui/base/mojom/window_show_state.mojom.h"
@@ -48,6 +55,7 @@
 #include "ui/display/win/screen_win.h"
 #include "ui/events/keyboard_hook.h"
 #include "ui/events/keycodes/dom/dom_code.h"
+#include "ui/events/keycodes/keyboard_code_conversion_win.h"
 #include "ui/events/keycodes/dom/dom_keyboard_layout_map.h"
 #include "ui/events/platform/platform_event_source.h"
 #include "ui/gfx/geometry/insets.h"
@@ -72,6 +80,7 @@
 #include "ui/views/window/native_frame_view.h"
 #include "ui/wm/core/compound_event_filter.h"
 #include "ui/wm/core/window_animations.h"
+#include "ui/wm/public/activation_client.h"
 #include "ui/wm/public/scoped_tooltip_disabler.h"
 
 #include "ui/events/event_utils.h"
@@ -89,7 +98,7 @@
 // #define MOUSEMUX_EXPERIMENT_NATIVE_BLOCK_HARD
 // #define MOUSEMUX_EXPERIMENT_NC_HANDLING
 // #define MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
-// #define MOUSEMUX_DEBUG_TRACE
+#define MOUSEMUX_DEBUG_TRACE  // ON for the 2026-09-03 field debug build
 
 #ifdef MOUSEMUX_DEBUG_TRACE
 // Duplicated from mouse_mux_config.h for the same reason as the defines:
@@ -97,7 +106,6 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#define MOUSEMUX_DEBUG_TRACE_PATH "O:\\chrome-log.txt"
 // Scoped to this debug-only helper: Chromium 151 rejects fprintf and
 // va_list, and the alternative is exempting this whole file from the
 // unsafe-buffer checks permanently. Mirrors the same block in
@@ -106,7 +114,16 @@
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
 static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
-  FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH, "a");
+  // %TEMP%, never a drive letter: this build is sent to other machines, and a
+  // hardcoded path that does not exist there fails silently.  Same file as
+  // the content-side trace, so the two interleave.
+  char path[MAX_PATH];
+  const DWORD n = GetTempPathA(MAX_PATH, path);
+  if (n == 0 || n >= MAX_PATH) {
+    return;
+  }
+  strncat_s(path, sizeof(path), "chrome-log.txt", _TRUNCATE);
+  FILE* f = fopen(path, "a");
   if (!f) {
     return;
   }
@@ -133,6 +150,34 @@ static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
 #define WM_MOUSEMUX_RBUTTONUP    (WM_APP + 0x103)
 #define WM_MOUSEMUX_MBUTTONDOWN  (WM_APP + 0x104)
 #define WM_MOUSEMUX_MBUTTONUP    (WM_APP + 0x105)
+// Hover for Chrome UI and menus: moves over anything that is not page
+// content, and a leave when the pointer goes back to the page or to another
+// window, so a highlight does not stick.
+#define WM_MOUSEMUX_MOUSEMOVE    (WM_APP + 0x106)
+#define WM_MOUSEMUX_MOUSELEAVE   (WM_APP + 0x107)
+// Keyboard, on the same principle.  wParam: low word the virtual key
+// (KEYDOWN/KEYUP) or the UTF-16 unit (CHAR); high word the ui::EventFlags
+// modifiers of the device that typed it, carried in the message because
+// GetKeyState() knows one keyboard and there are several.  lParam: low 32
+// bits the ui::DomCode, bits 32-47 the virtual key (CHAR only).  lParam is
+// 64 bits wide on x64, which is the only place this runs.
+#define WM_MOUSEMUX_KEYDOWN      (WM_APP + 0x110)
+#define WM_MOUSEMUX_KEYUP        (WM_APP + 0x111)
+#define WM_MOUSEMUX_CHAR         (WM_APP + 0x112)
+
+// True while PreHandleMSG is handling one of the keyboard messages above,
+// and while the controller gives a page Chrome's focus for an injected
+// click.  Restoring a window's focused view makes the focus manager clear
+// native focus, which is a Win32 SetFocus on the HWND, and SetFocus
+// activates an inactive top-level window.  With two users typing, that is
+// the OS foreground flipping between their windows on every burst of keys.
+// While this is set, ClearNativeFocus() and Activate() do nothing and
+// IsActive() says yes: under capture there is no hardware keyboard whose
+// focus would need moving.  In namespace content like the other shared
+// flags, so the controller can set it.
+namespace content {
+bool g_mousemux_synthetic_key = false;
+}  // namespace content
 
 #ifdef MOUSEMUX_NATIVE_BLOCK
 // Global flag set by MouseMuxInputController::SetNativeInputBlocked().
@@ -141,10 +186,55 @@ static void MouseMuxTraceViews(const char* stage, const char* fmt, ...) {
 // Lives in namespace content to match the extern in the controller.
 namespace content {
 bool g_mousemux_native_input_blocked = false;
+// The windows that drop native input on their own: every window of every
+// owner who has "Block native" on (the default).  Maintained by
+// MouseMuxInputController::ApplyNativeBlocking().  The bool above is the
+// legacy everything-at-once flag the control server can still set.
+std::set<HWND>* g_mousemux_blocked_windows = nullptr;
+// True while PreHandleMSG is dispatching one of our custom mouse messages,
+// so the controller's forward log can tell "injected via Chrome UI" from
+// "native": both reach the page without the kFromDebugger modifier.
+bool g_mousemux_in_custom_dispatch = false;
+// Windows whose caption (non-client) button is currently pressed by the real
+// mouse.  Non-client presses pass the block - the operator may close,
+// minimize or resize an owned window - but the RELEASE that ends the press
+// arrives as a client-area button-up, which the block dropped: the caption
+// button stayed pressed, Chrome's frame kept the mouse, and the window
+// looked dead until an activation change reset it (2026-09-04 21:22).  The
+// release passes while this is set.
+std::set<HWND>* g_mousemux_caption_press = nullptr;
 HWND g_mousemux_dialog_hwnd = nullptr;  // Exempt from native blocking.
 // The help window, likewise: it is one of ours, the operator drives it with a
 // real mouse, and a help window nobody can click is worse than no help window.
 HWND g_mousemux_help_hwnd = nullptr;
+// True while any injected mouse holds a button, maintained by
+// MouseMuxInputController::NoteSdkButtonState().  Read where a drag and drop
+// would start: a drag that begins while this is set was begun by an injected
+// mouse and must not become an OLE drag, because DoDragDrop is a modal Win32
+// loop that ends only on a real button release, which an injected mouse never
+// produces - the browser process hangs in that loop.
+bool g_mousemux_sdk_button_held = false;
+
+// Whether native input to `self` is blocked: the window is on the list, or
+// the window that OWNS it is.  Menus, bubbles and other popups are windows
+// of their own, owned by the browser window they serve, and Windows re-posts
+// the idle real mouse's position to whichever of them holds capture - the
+// menu flicker of 2026-09-04, which the per-owner list let back in because
+// it named only the browser windows (2026-09-05: 934 native moves under
+// menus in one session, every popup "in-open-window").
+bool MouseMuxWindowBlocked(HWND self) {
+  if (g_mousemux_native_input_blocked) {
+    return true;
+  }
+  if (!g_mousemux_blocked_windows || !self) {
+    return false;
+  }
+  if (g_mousemux_blocked_windows->count(self) > 0) {
+    return true;
+  }
+  const HWND owner = ::GetAncestor(self, GA_ROOTOWNER);
+  return owner && owner != self && g_mousemux_blocked_windows->count(owner) > 0;
+}
 }  // namespace content
 #endif
 
@@ -531,6 +621,14 @@ void DesktopWindowTreeHostWin::SetParent(gfx::AcceleratedWidget parent) {
 }
 
 void DesktopWindowTreeHostWin::Activate() {
+  if (content::g_mousemux_synthetic_key) {
+    // The focus manager activates the widget before it will focus a view in
+    // an OS-inactive window.  During a synthetic keystroke that would move
+    // the OS foreground to whichever user typed last; IsActive() below tells
+    // the focus manager the window is already active, and this makes sure
+    // nothing activates it for real.
+    return;
+  }
   if (WidgetActivationDelegate::Get()) {
     WidgetActivationDelegate::Get()->MaybeActivate(GetWidget(),
                                                    /*activate=*/true);
@@ -547,6 +645,9 @@ void DesktopWindowTreeHostWin::Deactivate() {
 }
 
 bool DesktopWindowTreeHostWin::IsActive() const {
+  if (content::g_mousemux_synthetic_key) {
+    return true;  // See Activate().
+  }
   if (WidgetActivationDelegate::Get()) {
     return WidgetActivationDelegate::Get()->IsActive(GetWidget());
   }
@@ -650,6 +751,9 @@ bool DesktopWindowTreeHostWin::SetWindowTitle(const std::u16string& title) {
 }
 
 void DesktopWindowTreeHostWin::ClearNativeFocus() {
+  if (content::g_mousemux_synthetic_key) {
+    return;  // See content::g_mousemux_synthetic_key.
+  }
   message_handler_->ClearNativeFocus();
 }
 
@@ -1136,6 +1240,15 @@ DesktopWindowTreeHostWin::GetParentNativeViewAccessible() {
 }
 
 void DesktopWindowTreeHostWin::HandleActivationChanged(bool active) {
+#ifdef MOUSEMUX_DEBUG_TRACE
+  // Who activates windows while users type: the stack names the caller.
+  {
+    const std::string stack = base::debug::StackTrace().ToString();
+    MouseMuxTraceViews("ACTIVATION", "hwnd=%p active=%d synthetic_key=%d\n%s",
+                       static_cast<void*>(GetAcceleratedWidget()), active ? 1 : 0,
+                       content::g_mousemux_synthetic_key ? 1 : 0, stack.c_str());
+  }
+#endif
   if (WidgetActivationDelegate::Get()) {
     return;
   }
@@ -1476,17 +1589,111 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
                                             WPARAM w_param,
                                             LPARAM l_param,
                                             LRESULT* result) {
+#ifdef MOUSEMUX_DEBUG_TRACE
+  // Every native input message that reaches a Chrome window - mouse, key,
+  // pointer (pen, touch, and mouse when Windows sends it as pointer),
+  // touch, gesture, raw input - so "nothing responds" can be read off the
+  // log: what arrived, at which window, and whether that window is in the
+  // blocked set.  Whether it was actually dropped is the "BLOCKED msg="
+  // line that follows, from the block list itself; this line predicts
+  // nothing.  Moves (WM_MOUSEMOVE, WM_POINTERUPDATE) every 50th per window.
+  {
+    const bool is_mouse =
+        (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
+        (message >= WM_NCLBUTTONDOWN && message <= WM_NCMBUTTONDBLCLK) ||
+        message == WM_NCXBUTTONDOWN || message == WM_NCXBUTTONUP ||
+        message == WM_NCXBUTTONDBLCLK;
+    const bool is_pointer =
+        (message >= 0x0241 && message <= 0x024F) ||  // WM_NCPOINTER*, WM_POINTER*
+        message == WM_TOUCH || message == WM_GESTURE ||
+        message == WM_GESTURENOTIFY || message == WM_INPUT;
+    const bool is_key = message == WM_KEYDOWN || message == WM_KEYUP ||
+                        message == WM_CHAR || message == WM_SYSKEYDOWN ||
+                        message == WM_SYSKEYUP;
+    if (is_mouse || is_pointer || is_key) {
+      const HWND self = GetAcceleratedWidget();
+      const bool exempt = self == content::g_mousemux_dialog_hwnd ||
+                          self == content::g_mousemux_help_hwnd;
+      const bool in_blocked_window =
+          !exempt && content::MouseMuxWindowBlocked(self);
+      static std::map<HWND, int>* move_counts = new std::map<HWND, int>();
+      const bool is_move = message == WM_MOUSEMOVE || message == 0x0245;
+      if (!is_move || (++(*move_counts)[self] % 50) == 1) {
+        const char* kind = is_key ? "key" : (is_pointer ? "pointer/touch" : "mouse");
+        MouseMuxTraceViews(
+            "NATIVE/In", "%s msg=0x%04x hwnd=%p client(%d,%d) %s", kind,
+            message, static_cast<void*>(self),
+            is_mouse ? static_cast<int>(static_cast<int16_t>(LOWORD(l_param))) : 0,
+            is_mouse ? static_cast<int>(static_cast<int16_t>(HIWORD(l_param))) : 0,
+            exempt ? "dialog/help (exempt)"
+                   : (in_blocked_window ? "in-blocked-window" : "in-open-window"));
+      }
+    }
+  }
+#endif
+
 #ifdef MOUSEMUX_NATIVE_BLOCK
-  // When native input is blocked, drop native mouse button messages so
+  // When native input is blocked, drop native mouse and keyboard messages so
   // only SDK custom messages (WM_MOUSEMUX_*) reach the views UI.
-  if (content::g_mousemux_native_input_blocked &&
+  if (content::MouseMuxWindowBlocked(GetAcceleratedWidget()) &&
       GetAcceleratedWidget() != content::g_mousemux_dialog_hwnd &&
       GetAcceleratedWidget() != content::g_mousemux_help_hwnd) {
+    // A native click on a blocked window must not ACTIVATE it either.  The
+    // activation request precedes the button message and never reached the
+    // block list, so the click was dropped but the window still came to the
+    // front and the previously active window's page lost focus - the caret
+    // vanishing under a blocked click (measured 2026-09-04 21:12: thirteen
+    // page blurs in three minutes, all via HandleActivationChanged, zero
+    // clicks delivered).  Client-area only: caption buttons and edges keep
+    // their native behaviour.
+    if (message == WM_MOUSEACTIVATE && LOWORD(l_param) == HTCLIENT) {
+      *result = MA_NOACTIVATEANDEAT;
+      return true;
+    }
+    if (message == WM_NCLBUTTONDOWN || message == WM_NCRBUTTONDOWN ||
+        message == WM_NCMBUTTONDOWN) {
+      if (!content::g_mousemux_caption_press) {
+        content::g_mousemux_caption_press = new std::set<HWND>();
+      }
+      content::g_mousemux_caption_press->insert(GetAcceleratedWidget());
+    }
+    if ((message == WM_LBUTTONUP || message == WM_RBUTTONUP ||
+         message == WM_MBUTTONUP) &&
+        content::g_mousemux_caption_press &&
+        content::g_mousemux_caption_press->erase(GetAcceleratedWidget()) > 0) {
+      MMTRACE_VIEWS("NATIVE/PreHandleMSG",
+                    "release after caption press passes msg=0x%04x hwnd=%p",
+                    message, (void*)GetAcceleratedWidget());
+      return false;  // The caption button gets its release.
+    }
     switch (message) {
+      // Keyboard.  Blocked native means blocked native: the page already
+      // dropped native keys (its event handler checks the same flag), but a
+      // views text field - the address bar, the find bar - took them, so a
+      // keyboard whose native input the server had not stopped typed every
+      // character twice there (2026-09-05 13:07, MouseMux in switched mode
+      // without multi-keyboard).  Our own WM_MOUSEMUX_KEY* messages are
+      // different ids and pass.  WM_SYSKEY* included: Alt+F4 from a
+      // keyboard this window does not belong to is still not its business.
+      case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR: case WM_DEADCHAR:
+      case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_SYSCHAR: case WM_SYSDEADCHAR:
+      case WM_UNICHAR:
       // Client-area mouse buttons.
       case WM_LBUTTONDOWN: case WM_LBUTTONUP:
       case WM_RBUTTONDOWN: case WM_RBUTTONUP:
       case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+      // Double clicks and the side buttons too (2026-09-04).  A fast second
+      // press arrives as WM_LBUTTONDBLCLK, not WM_LBUTTONDOWN, and views
+      // treats it as a press: 16 of them reached a blocked window's tab strip
+      // and switched tabs while every single press was dropped.
+      case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK:
+      case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+      // Moves and wheel too (2026-09-04).  Windows re-posts an idle mouse's
+      // position to the window holding capture - a menu - and every such
+      // move reset the selection under an injected pointer.  Blocked means
+      // blocked.
+      case WM_MOUSEMOVE:
+      case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
 #ifdef MOUSEMUX_EXPERIMENT_PEN_TOUCH_BLOCK
       // Pen and touch.  Windows delivers these as WM_POINTER*/WM_TOUCH
       // rather than mouse messages, so the cases above never catch them —
@@ -1511,8 +1718,6 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
       // Mouse movement (prevents hover/highlight from other mice).
       case WM_MOUSEMOVE:
       case WM_NCMOUSEMOVE:
-      // Keyboard (other keyboards). WM_SYSKEY* left unblocked for Alt+F4.
-      case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
 #endif
         MMTRACE_VIEWS("NATIVE/PreHandleMSG",
                       "BLOCKED msg=0x%04x hwnd=%p", message,
@@ -1525,11 +1730,106 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
   }
 #endif
 
+#ifdef MOUSEMUX_DEBUG_TRACE
+  // Diagnostic: does the OS still deliver native mouse moves while a menu is
+  // open?  The menu's window holds mouse capture, and a native move there
+  // would move the selection to wherever the real cursor sits.
+  if (message == WM_MOUSEMOVE && views::MenuController::GetActiveInstance()) {
+    MouseMuxTraceViews("NATIVE/MoveUnderMenu", "hwnd=%p client(%d,%d) wparam=0x%x",
+                       static_cast<void*>(GetAcceleratedWidget()),
+                       static_cast<int>(static_cast<int16_t>(LOWORD(l_param))),
+                       static_cast<int>(static_cast<int16_t>(HIWORD(l_param))),
+                       static_cast<unsigned>(w_param));
+  }
+#endif
+
+  // MouseMux keyboard messages: an SDK keystroke enters here as a real one
+  // would.  Two things make it behave like native input rather than a test
+  // event:
+  //
+  //  - The window may not be OS-active.  With several users typing at once
+  //    at most one window is, and a window that lost activation has had its
+  //    focused view stored away and its aura focus cleared, so a key sent to
+  //    it lands nowhere.  Re-activating the views side - exactly what the OS
+  //    activation path runs - restores that view without touching the OS
+  //    foreground, so the other users' windows are left alone.
+  //  - Modifiers travel in the message.  GetKeyState() would report one
+  //    keyboard's Shift for everybody.
+  //
+  // The character is inserted straight into the focused TextInputClient.
+  // That is what the input method's WM_CHAR handler does, minus the input
+  // method itself, which would rebuild the event from OS key state and lose
+  // the EF_IS_SYNTHESIZED flag that lets it past native blocking.  Key
+  // presses and releases go through the sink like WM_KEYDOWN/UP: the aura
+  // dispatcher skips the input method for synthesized events and hands them
+  // to the focus manager, so accelerators fire and the focused view gets
+  // them.
+  if (message == WM_MOUSEMUX_KEYDOWN || message == WM_MOUSEMUX_KEYUP ||
+      message == WM_MOUSEMUX_CHAR) {
+    base::AutoReset<bool> synthetic_key(&content::g_mousemux_synthetic_key, true);
+    if (wm::ActivationClient* activation = wm::GetActivationClient(window());
+        activation && !activation->GetActiveWindow()) {
+      HandleActivationChanged(true);
+    }
+    const int flags =
+        static_cast<int>(HIWORD(w_param)) | ui::EF_IS_SYNTHESIZED;
+    const ui::DomCode dom_code = static_cast<ui::DomCode>(
+        static_cast<uint32_t>(l_param & 0xFFFFFFFF));
+#ifdef MOUSEMUX_DEBUG_TRACE
+    // Where this key is about to go.  "Keys arrive, nothing happens" is
+    // this line: a window with no focused view swallows them silently.
+    {
+      aura::Window* active = nullptr;
+      if (wm::ActivationClient* activation =
+              wm::GetActivationClient(window())) {
+        active = activation->GetActiveWindow();
+      }
+      aura::Window* focused = nullptr;
+      if (aura::client::FocusClient* focus_client =
+              aura::client::GetFocusClient(window())) {
+        focused = focus_client->GetFocusedWindow();
+      }
+      views::View* focused_view = nullptr;
+      if (GetWidget() && GetWidget()->GetFocusManager()) {
+        focused_view = GetWidget()->GetFocusManager()->GetFocusedView();
+      }
+      MouseMuxTraceViews(
+          "KEY/In", "msg=0x%04x hwnd=%p active_window=%p focused_window=%p "
+          "focused_view=%s",
+          message, static_cast<void*>(GetAcceleratedWidget()),
+          static_cast<void*>(active), static_cast<void*>(focused),
+          focused_view ? std::string(focused_view->GetClassName()).c_str()
+                       : "(none)");
+    }
+#endif
+    if (message == WM_MOUSEMUX_CHAR) {
+      ui::InputMethod* input_method = GetInputMethod();
+      ui::TextInputClient* target =
+          input_method ? input_method->GetTextInputClient() : nullptr;
+      if (target) {
+        const ui::KeyboardCode vkey = ui::KeyboardCodeForWindowsKeyCode(
+            static_cast<WORD>((l_param >> 32) & 0xFFFF));
+        ui::KeyEvent event = ui::KeyEvent::FromCharacter(
+            static_cast<char16_t>(LOWORD(w_param)), vkey, dom_code, flags);
+        target->InsertChar(event);
+      }
+    } else {
+      ui::KeyEvent event(message == WM_MOUSEMUX_KEYDOWN
+                             ? ui::EventType::kKeyPressed
+                             : ui::EventType::kKeyReleased,
+                         ui::KeyboardCodeForWindowsKeyCode(LOWORD(w_param)),
+                         dom_code, flags, base::TimeTicks::Now());
+      SendEventToSink(&event);
+    }
+    *result = 0;
+    return true;
+  }
+
   // MouseMux custom messages: convert to native mouse events and process.
   // The controller posts WM_MOUSEMUX_* instead of WM_LBUTTONDOWN etc. so
   // SDK clicks never collide with native mouse messages.
   if (message >= WM_MOUSEMUX_LBUTTONDOWN &&
-      message <= WM_MOUSEMUX_MBUTTONUP) {
+      message <= WM_MOUSEMUX_MOUSELEAVE) {
     // A switch rather than an indexed lookup table: Chromium 151 applies
     // -Wunsafe-buffer-usage to ui/views, and `kNativeMsg[message - base]`
     // trips it.  The index was in range (the condition above bounds it), but
@@ -1543,15 +1843,48 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
       case WM_MOUSEMUX_RBUTTONUP:   native_msg = WM_RBUTTONUP;   break;
       case WM_MOUSEMUX_MBUTTONDOWN: native_msg = WM_MBUTTONDOWN; break;
       case WM_MOUSEMUX_MBUTTONUP:   native_msg = WM_MBUTTONUP;   break;
+      case WM_MOUSEMUX_MOUSEMOVE:   native_msg = WM_MOUSEMOVE;   break;
+      case WM_MOUSEMUX_MOUSELEAVE:  native_msg = WM_MOUSELEAVE;  break;
       default:
-        // Unreachable: the range check above admits only the six above.
+        // Unreachable: the range check above admits only the messages above.
         return false;
     }
 
     HWND hwnd = GetAcceleratedWidget();
-    bool is_down = (native_msg == WM_LBUTTONDOWN ||
+    [[maybe_unused]] const bool is_down = (native_msg == WM_LBUTTONDOWN ||
                     native_msg == WM_RBUTTONDOWN ||
                     native_msg == WM_MBUTTONDOWN);
+
+    // Only the client area is a user's to click: tabs, the new-tab button,
+    // the toolbar, the page.  The caption buttons, the drag strip beside
+    // the tabs and the resize edges are window management, the operator's
+    // job with the real mouse, and an injected click there used to reach
+    // Chrome's painted caption buttons as an ordinary press and minimize or
+    // close somebody's window.  The frame's own hit test - the one Windows
+    // consults for WM_NCHITTEST - says which is which; anything but HTCLIENT
+    // is dropped, moves included, so those buttons do not even highlight.
+    // (2026-09-04)
+    if (native_msg != WM_MOUSELEAVE) {
+      if (views::Widget* widget = GetWidget();
+          widget && widget->non_client_view()) {
+        gfx::Point client_point(CR_GET_X_LPARAM(l_param),
+                                CR_GET_Y_LPARAM(l_param));
+        ConvertPixelsToDIP(&client_point);
+        const int hit = widget->non_client_view()->NonClientHitTest(client_point);
+        if (hit != HTCLIENT) {
+#ifdef MOUSEMUX_DEBUG_TRACE
+          MouseMuxTraceViews("NATIVE/CustomMouse",
+                             "DROPPED non-client hit=%d msg=0x%x hwnd=%p "
+                             "client(%d,%d)",
+                             hit, native_msg,
+                             static_cast<void*>(GetAcceleratedWidget()),
+                             client_point.x(), client_point.y());
+#endif
+          *result = 0;
+          return true;
+        }
+      }
+    }
 
     // Convert client coords (lParam) to screen coords.
     POINT screen_pt = {CR_GET_X_LPARAM(l_param), CR_GET_Y_LPARAM(l_param)};
@@ -1606,12 +1939,40 @@ bool DesktopWindowTreeHostWin::PreHandleMSG(UINT message,
 
     // On mousedown, raise the window — normal WM_LBUTTONDOWN does this via
     // DefWindowProc, but our custom path bypasses that.
-    if (is_down) {
-      ::SetForegroundWindow(hwnd);
-    }
+#ifdef MOUSEMUX_DEBUG_TRACE
+    const HWND fg_before = ::GetForegroundWindow();
+    const bool menu_before = views::MenuController::GetActiveInstance() != nullptr;
+#endif
+    // No OS activation on a synthetic click (2026-09-04).  This used to
+    // SetForegroundWindow(hwnd) on every down, from the days when keys went
+    // straight to the renderer and needed the window OS-active.  Keys now
+    // enter through the window's own focus manager, so activation buys
+    // nothing, and it cost the menus: activating a menu's popup window
+    // deactivates the browser window that owns it, and the menu closes under
+    // the click (measured: menu_before=1, menu_after=0).  Left out entirely
+    // for now; if clicked windows need raising, SetWindowPos(HWND_TOP,
+    // SWP_NOACTIVATE) is the call, not this.
+    // if (is_down) {
+    //   ::SetForegroundWindow(hwnd);
+    // }
 
     ui::MouseEvent event = ui::MouseEventFromMSG(fake_msg);
-    SendEventToSink(&event);
+    {
+      base::AutoReset<bool> dispatching(&content::g_mousemux_in_custom_dispatch,
+                                        true);
+      SendEventToSink(&event);
+    }
+#ifdef MOUSEMUX_DEBUG_TRACE
+    MouseMuxTraceViews(
+        "NATIVE/CustomMouse",
+        "msg=0x%x hwnd=%p client(%d,%d) flags=0x%x handled=%d fg_before=%p "
+        "fg_after=%p menu_before=%d menu_after=%d",
+        native_msg, static_cast<void*>(hwnd), static_cast<int>(static_cast<int16_t>(LOWORD(l_param))),
+        static_cast<int>(static_cast<int16_t>(HIWORD(l_param))), event.flags(),
+        event.handled() ? 1 : 0, static_cast<void*>(fg_before),
+        static_cast<void*>(::GetForegroundWindow()), menu_before ? 1 : 0,
+        views::MenuController::GetActiveInstance() != nullptr ? 1 : 0);
+#endif
     *result = 0;
     return true;  // Consumed — do not pass to default handler.
   }

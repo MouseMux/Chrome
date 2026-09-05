@@ -5,7 +5,9 @@
 #include "chrome/browser/ui/views/mouse_mux/mouse_mux_control_dialog.h"
 
 #ifdef MOUSEMUX_DEBUG
+#include <algorithm>
 #include <array>
+#include <set>
 #include <fstream>
 #endif
 #include <utility>
@@ -28,20 +30,37 @@
 // now goes through BrowserWindowInterface; Browser and BrowserWindow are no
 // longer needed here at all, since the only use was reading window bounds.
 #include "base/files/file_path.h"
+#include "base/files/file_util.h"
+#include "base/json/json_reader.h"
+#include "base/json/json_writer.h"
+#include "base/task/thread_pool.h"
+#include "base/values.h"
 #include "base/process/launch.h"
 #include "base/strings/utf_string_conversions.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/lifetime/application_lifetime.h"
 #include "chrome/browser/lifetime/browser_shutdown.h"
 #include "chrome/browser/ui/browser_commands.h"
+#include "chrome/browser/ui/navigator/browser_navigator.h"
+#include "chrome/browser/ui/navigator/browser_navigator_params.h"
+#include "ui/base/window_open_disposition.h"
+#include "chrome/browser/ui/browser.h"
+#include "chrome/browser/ui/browser_window.h"
+#include "chrome/browser/ui/views/frame/browser_view.h"
+#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+#include "chrome/browser/ui/views/mouse_mux/mouse_mux_window_number.h"
 #include "chrome/browser/ui/tabs/tab_strip_model.h"
 #include "chrome/browser/ui/views/chrome_layout_provider.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_input_controller.h"
 #include "content/browser/renderer_host/render_widget_host_view_aura.h"
 #include "content/public/browser/render_widget_host_view.h"
+#include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/web_contents.h"
+#include "content/public/common/referrer.h"
+#include "ui/base/page_transition_types.h"
+#include "url/gurl.h"
 #include "ui/base/base_window.h"
 #include "ui/display/screen.h"
 #include "ui/base/metadata/metadata_impl_macros.h"
@@ -53,10 +72,10 @@
 #include "ui/views/border.h"
 #include "ui/views/controls/button/md_text_button.h"
 #include "ui/views/controls/button/checkbox.h"
-#include "ui/views/controls/button/toggle_button.h"
 #include "ui/views/controls/combobox/combobox.h"
 #include "ui/views/controls/image_view.h"
 #include "ui/views/controls/label.h"
+#include "ui/views/controls/separator.h"
 #include "ui/views/controls/label.h"
 #include "ui/views/controls/scroll_view.h"
 #include "ui/views/window/non_client_view.h"
@@ -126,12 +145,9 @@ class HotkeyComboboxModel : public ui::ComboboxModel {
   }
 };
 
-// Shown in the dialog footer.  MUST track the release version — 2.2.59 is
-// build #59 — and MUST be bumped with it.  It sat at 54 through the 2.2.55 and
-// 2.2.56 releases, so the dialog reported a build three versions older than the
-// binary it was part of, which makes it impossible to tell by looking whether
-// someone is running what you think they are.
-constexpr int kBuildNumber = 59;
+// Shown in the dialog footer.  Stamped in mouse_mux_config.h with the
+// version the client reports, so the two cannot drift.
+constexpr int kBuildNumber = MOUSEMUX_BUILD_NUMBER;
 
 // Product name, used for the window title.  The build number lives in the
 // footer with the build date rather than the title, which should read as a
@@ -149,32 +165,31 @@ constexpr char kProductName[] = "MouseMux Multi-Seat Chrome Control";
 // of the dialog title.
 constexpr int kWindowIconSize = 24;
 
-#ifdef MOUSEMUX_DEBUG
-// The same size as the release dialog: with the log panel gone there is
-// nothing left that a debug build needs extra room for.
-constexpr int kDialogWidth = 660;
-constexpr int kDialogHeight = 520;
-constexpr int kLogFlushThreshold = 5;
-const char kLogFilePath[] = MOUSEMUX_DEBUG_LOG_PATH;
-#else
+// One dialog, whatever the build.  Debug and release used to differ in size
+// and in what they showed; they no longer do, and the build date is the same
+// date for both.
+//
 // Wider than it was: the screen-and-page column is the one an operator
 // actually reads, and at 560 the fixed columns and three row controls left it
 // about 120px, so it elided to "(un...".
-constexpr int kDialogWidth = 660;
+// 740: the users list gained a window column right after the name and lines
+// between its columns (2026-09-04); with the fixed columns that leaves the
+// window title about 190px, enough to read.
+constexpr int kDialogWidth = 740;
 // Measured, not guessed: the contents view comes out about 84px shorter than
 // this, because the frame's button row is taken out of it.  At 424 everything
 // was already at its minimum height with nothing left over, which is how the
 // user list ended up 42px tall holding two rows.
 constexpr int kDialogHeight = 520;
 
-// How much of the list is shown before it scrolls.  Four users fit; a fifth
-// scrolls rather than squeezing everybody.
+// Date only, from the stamp.  Build flavour belongs in kProductName above,
+// where it is #ifdef-guarded and cannot lie.
+const char kBuildDate[] = MOUSEMUX_BUILD_DATE;
 
-// Date only.  A "TRACE" suffix was hardcoded here on 2026-08-04 and left in,
-// so ordinary builds claimed to be trace builds that log input to disk.  The
-// trace warning belongs in kProductName above, where it is #ifdef-guarded and
-// cannot lie.  Do not put build flavour in this string.
-const char kBuildDate[] = "2026-09-03";
+#ifdef MOUSEMUX_DEBUG
+constexpr int kLogFlushThreshold = 5;
+// A function, not a constant: the path is resolved at runtime into %TEMP%.
+std::string LogFilePath() { return MOUSEMUX_DEBUG_LOG_PATH; }
 #endif
 
 // How much of the user list is shown before it scrolls.  Outside the debug
@@ -258,6 +273,63 @@ gfx::ImageSkia LoadAppIcon(int size) {
 // every one of these has two callers.  Written as free functions rather than
 // duplicated in both: the two drifting apart would show as a row that says one
 // thing when it appears and another a second later.
+// The users list is a list of records: one table definition shared by the
+// header row and every user row, so the columns line up down the list and the
+// vertical lines between them read as continuous.  All widths are fixed
+// except the window column, which takes the rest; a checkbox or button that
+// wants more than its column is clipped rather than pushing the others.
+//
+// Columns: status dot | name || window || keyboard || typing || Capture |
+// Block native | Release | x.  "||" is a one-pixel line with 3px either side.
+void AddOwnerColumns(views::TableLayout* table) {
+  auto fixed = [table](int width, views::LayoutAlignment h) {
+    table->AddColumn(h, views::LayoutAlignment::kCenter, 0,
+                     views::TableLayout::ColumnSize::kFixed, width, width);
+  };
+  auto line = [table]() {
+    table->AddPaddingColumn(0, 3)
+        .AddColumn(views::LayoutAlignment::kCenter,
+                   views::LayoutAlignment::kStretch, 0,
+                   views::TableLayout::ColumnSize::kFixed, 1, 1)
+        .AddPaddingColumn(0, 3);
+  };
+  fixed(14, views::LayoutAlignment::kCenter);  // dot
+  table->AddPaddingColumn(0, 6);
+  fixed(72, views::LayoutAlignment::kStart);  // name
+  line();
+  table->AddColumn(views::LayoutAlignment::kStretch,
+                   views::LayoutAlignment::kCenter, 1.0f,
+                   views::TableLayout::ColumnSize::kFixed, 0, 0);  // window
+  line();
+  fixed(84, views::LayoutAlignment::kStart);  // keyboard
+  line();
+  fixed(52, views::LayoutAlignment::kStart);  // typing
+  line();
+  fixed(76, views::LayoutAlignment::kStart);   // Capture
+  table->AddPaddingColumn(0, 4);
+  fixed(100, views::LayoutAlignment::kStart);  // Block native
+  table->AddPaddingColumn(0, 4);
+  fixed(60, views::LayoutAlignment::kEnd);     // Release
+  table->AddPaddingColumn(0, 2);
+  fixed(24, views::LayoutAlignment::kEnd);     // x
+  table->AddRows(1, 0, kRowButtonHeight);
+}
+
+views::Separator* AddColumnLine(views::View* row) {
+  auto* line = row->AddChildView(std::make_unique<views::Separator>());
+  line->SetOrientation(views::Separator::Orientation::kVertical);
+  line->SetPreferredLength(kRowButtonHeight);
+  return line;
+}
+
+views::Label* AddHeaderCell(views::View* header, const std::u16string& text) {
+  auto* label = header->AddChildView(std::make_unique<views::Label>(
+      text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+      views::style::STYLE_SECONDARY));
+  label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  return label;
+}
+
 namespace row_text {
 
 SkColor DotColor(const content::MouseMuxInputController::OwnerInfo& owner) {
@@ -323,20 +395,44 @@ std::u16string KeyboardTip(
 // The screen leads, because on a desk of several monitors that is how an
 // operator identifies a person, and because a window title changes as they
 // browse while a screen does not.
+// The window's number in the order the windows were opened: the first
+// window is 1, the one made with "+ Window" is 2, and so on.  Stable for as
+// long as the window exists, and what a person counting windows would say.
+// 0 when the window is not a browser window.
+int WindowNumberOf(gfx::AcceleratedWidget window) {
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    ui::BaseWindow* base_window = browser->GetWindow();
+    aura::Window* native =
+        base_window ? base_window->GetNativeWindow() : nullptr;
+    if (native && native->GetHost() &&
+        native->GetHost()->GetAcceleratedWidget() == window) {
+      // The same number the window's caption shows; see the header.
+      return WindowNumberForSession(browser->GetSessionID());
+    }
+  }
+  return 0;
+}
+
+// "Window 2 \u00b7 Gmail".  Two windows on the same page used to read
+// identically (the title is the active tab's); the number tells them apart.
+// The screen is not shown: it does not help tell windows apart, and the
+// operator can see where a window is.
 std::u16string Where(
     const content::MouseMuxInputController::OwnerInfo& owner) {
   if (!owner.has_window) {
     return u"\u2014 not in a window yet";
   }
   std::u16string where;
-  if (owner.screen_index > 0) {
-    where = u"Screen ";
-    where += base::ASCIIToUTF16(
-        base::StringPrintf("%d", owner.screen_index));
+  if (const int number = WindowNumberOf(owner.window); number > 0) {
+    where = u"Window ";
+    where += base::ASCIIToUTF16(base::StringPrintf("%d", number));
     where += u" \u00b7 ";
   }
   where += owner.window_title.empty() ? std::u16string(u"(untitled window)")
                                       : owner.window_title;
+  if (owner.extra_windows > 0) {
+    where += base::ASCIIToUTF16(base::StringPrintf(" +%d", owner.extra_windows));
+  }
   return where;
 }
 
@@ -435,6 +531,8 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
         views::BoxLayout::CrossAxisAlignment::kStretch);
 
     AddSection(body.get(), u"Getting started");
+    AddStep(body.get(), u"0.", u"In MouseMux: Switched mode, Multi-keyboard "
+                                u"ON. Both - see below.");
     AddStep(body.get(), u"1.", u"Press Connect. Everything else stays greyed "
                                 u"out until MouseMux is connected.");
     AddStep(body.get(), u"2.", u"Sign in to the site everyone will share, in "
@@ -449,6 +547,20 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
                                 u"Users list.");
     AddStep(body.get(), u"6.", u"Tick Capture on every row. This is required, "
                                 u"not optional - see below.");
+
+    AddSection(body.get(), u"Why Multi-keyboard is required");
+    AddBody(body.get(),
+            u"Chrome receives every user's keystrokes over the MouseMux "
+            u"connection. Whether Windows ALSO delivers them to whatever "
+            u"program is in the foreground is decided by MouseMux, not by "
+            u"Chrome. In Switched mode without Multi-keyboard the keyboard "
+            u"stays a normal Windows keyboard, so each key typed into a "
+            u"Chrome window is typed a second time into the foreground "
+            u"program - which may be somebody else's. With Multi-keyboard "
+            u"on, MouseMux keeps the keyboard's input to itself and Chrome "
+            u"is the only place it arrives. Block native stops the duplicate "
+            u"inside Chrome's own windows; nothing in Chrome can stop it in "
+            u"other programs.");
 
     AddSection(body.get(), u"Why Capture is required");
     AddBody(body.get(),
@@ -471,10 +583,15 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
     AddItem(body.get(), u"kb 0x.. \u2713",
             u"The keyboard MouseMux has attached to this user. The tick means "
             u"something has actually arrived from it.");
-    AddItem(body.get(), u"Screen 2 \u00b7 title",
-            u"Which screen they are on, and the page they are looking at.");
+    AddItem(body.get(), u"Window 2 \u00b7 title",
+            u"Which window they are working in - numbered in the order the "
+            u"windows were opened - and the page it is showing.");
     AddItem(body.get(), u"Capture",
             u"Stops this one device producing ordinary Windows input.");
+    AddItem(body.get(), u"Block native",
+            u"Drops the real mouse's input inside this user's windows. On by "
+            u"default - an owned window is somebody's workplace. Untick it to "
+            u"let the operator's own mouse work inside them.");
     AddItem(body.get(), u"Release",
             u"Hands their window back. They stop driving Chrome until "
             u"somebody clicks to claim it again.");
@@ -493,15 +610,6 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
             u"sign in as themselves.");
 
     AddSection(body.get(), u"Options");
-    AddItem(body.get(), u"Keep each user in their own window",
-            u"Clicks outside a person's own window are ignored. Cursors still "
-            u"move everywhere; only clicks are blocked. Usually what you want "
-            u"with several people side by side.");
-    AddItem(body.get(), u"Block native mouse input",
-            u"A blunt fallback for when capture is not available. It applies "
-            u"to every device at once: Windows mouse messages carry no device "
-            u"identity, so this cannot be done per person. Capture, on each "
-            u"row, is the per-person version.");
     AddItem(body.get(), u"Release hotkey",
             u"Releases capture from the keyboard, for when injected input is "
             u"not working and the mice cannot reach this dialog. The way out "
@@ -533,7 +641,18 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
 
   MouseMuxHelpDialog(const MouseMuxHelpDialog&) = delete;
   MouseMuxHelpDialog& operator=(const MouseMuxHelpDialog&) = delete;
-  ~MouseMuxHelpDialog() override = default;
+  ~MouseMuxHelpDialog() override {
+#ifdef MOUSEMUX_NATIVE_BLOCK
+    // The exemption goes with the window: Windows reuses handles, and a
+    // browser window that inherited this one would be exempt from blocking.
+    if (GetWidget() && GetWidget()->GetNativeWindow() &&
+        GetWidget()->GetNativeWindow()->GetHost() &&
+        content::g_mousemux_help_hwnd ==
+            GetWidget()->GetNativeWindow()->GetHost()->GetAcceleratedWidget()) {
+      content::g_mousemux_help_hwnd = nullptr;
+    }
+#endif
+  }
 
   gfx::Size CalculatePreferredSize(
       const views::SizeBounds& available_size) const override {
@@ -619,6 +738,39 @@ class MouseMuxHelpDialog : public views::DialogDelegateView {
     label->SetMultiLine(true);
     label->SetMaximumWidth(kHelpWidth - 66);
     row_layout->SetFlexForView(label, 1);
+  }
+};
+
+// A message from the MouseMux server (timeout warning, session ended) that
+// the operator should see.  A window of its own and non-modal: a MessageBox
+// would spin a nested message loop on the UI thread and stall every user's
+// input until the operator dismissed it.
+class MouseMuxNoticeDialog : public views::DialogDelegateView {
+ public:
+  MouseMuxNoticeDialog(const std::u16string& text, bool error) {
+    SetTitle(error ? u"MouseMux - session ended" : u"MouseMux - warning");
+    SetButtons(static_cast<int>(ui::mojom::DialogButton::kOk));
+    SetButtonLabel(ui::mojom::DialogButton::kOk, u"Close");
+    SetModalType(ui::mojom::ModalType::kNone);
+    set_use_custom_frame(false);
+    SetShowTitle(true);
+    SetShowCloseButton(true);
+    SetBackground(views::CreateSolidBackground(SK_ColorWHITE));
+    SetLayoutManager(std::make_unique<views::BoxLayout>(
+        views::BoxLayout::Orientation::kVertical, gfx::Insets::VH(16, 20), 0));
+    auto* label = AddChildView(std::make_unique<views::Label>(
+        text, views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    label->SetMultiLine(true);
+    label->SetMaximumWidth(360);
+    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    label->SetEnabledColor(SkColorSetRGB(0x20, 0x21, 0x24));
+  }
+  ~MouseMuxNoticeDialog() override = default;
+
+  gfx::Size CalculatePreferredSize(
+      const views::SizeBounds& available_size) const override {
+    return gfx::Size(400, 110);
   }
 };
 
@@ -735,8 +887,8 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
                           base::Unretained(this)));
 
   // Register native blocking state callback (for control server updates).
-  controller->SetNativeBlockingChangedCallback(
-      base::BindRepeating(&MouseMuxControlDialog::OnNativeBlockingChanged,
+  controller->SetNoticeCallback(
+      base::BindRepeating(&MouseMuxControlDialog::ShowNotice,
                           base::Unretained(this)));
 
   // Register keyboard event callback for hotkey detection.
@@ -760,25 +912,29 @@ MouseMuxControlDialog::MouseMuxControlDialog() {
   // The deeper limit remains and cannot be fixed here: one active menu per
   // process means two users cannot have two dropdowns open at once.
   controller->SetMenuDismissCallback(base::BindRepeating(
-      [](int* menu_owner_hwid, int* pending_menu_hwid, int hwid) {
+      [](int* menu_owner_hwid, int* pending_menu_hwid, int hwid,
+         bool page_press) {
         auto* menu = views::MenuController::GetActiveInstance();
         if (!menu) {
-          // Nothing open.  If THIS click opens a menu, it belongs to this
-          // device.
+          // Nothing open.  If THIS press opens a menu, it belongs to this
+          // device.  Every press counts here, page or Chrome UI: the ...
+          // button is UI.
           *menu_owner_hwid = -1;
           *pending_menu_hwid = hwid;
           return;
         }
         if (*menu_owner_hwid == -1) {
-          // First click seen since this menu appeared: attribute it to
-          // whoever clicked last while nothing was open.
+          // First press seen since this menu appeared: attribute it to
+          // whoever pressed last while nothing was open.
           *menu_owner_hwid = *pending_menu_hwid;
         }
-        if (*menu_owner_hwid == hwid) {
+        // Only the owner's press on a PAGE closes it: their press on the
+        // menu itself is a UI press and picks an item.  Anybody else's
+        // press, anywhere, leaves it alone.
+        if (page_press && *menu_owner_hwid == hwid) {
           menu->Cancel(views::MenuController::ExitType::kAll);
           *menu_owner_hwid = -1;
         }
-        // Otherwise it is another user's menu — leave it alone.
       },
       &menu_owner_hwid_, &pending_menu_hwid_));
 
@@ -795,6 +951,10 @@ MouseMuxControlDialog::~MouseMuxControlDialog() {
 #ifdef MOUSEMUX_DEBUG
   LogDebug("MouseMux Control Dialog destroyed");
 #endif
+  // Every callback registered in the constructor points at this object.  The
+  // browser windows outlive the dialog during exit and each closing tab
+  // reports an ownership change, so the controller must forget us first.
+  content::MouseMuxInputController::GetInstance()->ClearUiCallbacks();
 #ifdef MOUSEMUX_NATIVE_BLOCK
   content::g_mousemux_dialog_hwnd = nullptr;
 #endif
@@ -987,7 +1147,7 @@ void MouseMuxControlDialog::FlushLogBuffer() {
   if (log_buffer_.empty()) {
     return;
   }
-  std::ofstream file(kLogFilePath, std::ios::app);
+  std::ofstream file(LogFilePath(), std::ios::app);
   if (file.is_open()) {
     for (const auto& msg : log_buffer_) {
       file << msg << "\n";
@@ -998,7 +1158,7 @@ void MouseMuxControlDialog::FlushLogBuffer() {
 }
 
 void MouseMuxControlDialog::WriteToLogFile(const std::string& message) {
-  std::ofstream file(kLogFilePath, std::ios::app);
+  std::ofstream file(LogFilePath(), std::ios::app);
   if (file.is_open()) {
     file << message << std::endl;
     file.close();
@@ -1144,6 +1304,32 @@ void MouseMuxControlDialog::SetupContents() {
       u"Launch a separate Chrome with its OWN profile and its own dialog. "
       u"Isolated: shares no logins with this one.");
 
+  // Column titles above the list, on the same table definition as the rows
+  // so the lines between the columns continue through the header.  The
+  // control columns have no title: the checkboxes and buttons name
+  // themselves.
+  {
+    auto* header = users_pane->AddChildView(std::make_unique<views::View>());
+    AddOwnerColumns(
+        header->SetLayoutManager(std::make_unique<views::TableLayout>()));
+    header->SetBorder(views::CreateEmptyBorder(gfx::Insets::TLBR(0, 8, 0, 8)));
+    // Titles only; the lines between the columns start with the rows.  In
+    // the header they looked like a fence.
+    AddHeaderCell(header, u"");  // dot
+    AddHeaderCell(header, u"User");
+    AddHeaderCell(header, u"");  // line column, empty here
+    AddHeaderCell(header, u"Window");
+    AddHeaderCell(header, u"");
+    AddHeaderCell(header, u"Keyboard");
+    AddHeaderCell(header, u"");
+    AddHeaderCell(header, u"Typing");
+    AddHeaderCell(header, u"");
+    AddHeaderCell(header, u"");  // Capture
+    AddHeaderCell(header, u"");  // Block native
+    AddHeaderCell(header, u"");  // Release
+    AddHeaderCell(header, u"");  // x
+  }
+
   // The list scrolls rather than shrinking.
   //
   // It used to be a plain view given whatever vertical space was left over,
@@ -1177,33 +1363,6 @@ void MouseMuxControlDialog::SetupContents() {
   MakePane(options_pane);
   options_pane->SetLayoutManager(std::make_unique<views::BoxLayout>(
       views::BoxLayout::Orientation::kVertical, gfx::Insets(), 6));
-
-  hard_lock_checkbox_ = options_pane->AddChildView(
-      std::make_unique<views::Checkbox>(
-          u"Keep each user in their own window",
-          base::BindRepeating(&MouseMuxControlDialog::OnHardLockToggled,
-                              base::Unretained(this))));
-  hard_lock_checkbox_->SetTooltipText(
-      u"Off: a user who clicks another window moves there.\n"
-      u"On: clicks outside a user's own window are ignored, so each user is "
-      u"confined to one window. Cursors still move freely; only clicks are "
-      u"blocked. A user with no window claims the first one they click, and "
-      u"closing a window frees its user to claim another.");
-
-  // Native blocking is global on purpose, and cannot sensibly be otherwise:
-  // it drops Windows mouse messages, and those carry no device identity -
-  // which is the entire reason MouseMux exists.  The per-user equivalent is
-  // Capture, on each row, which stops one device producing native input at
-  // the server where the device IS known.
-  native_input_checkbox_ =
-      options_pane->AddChildView(std::make_unique<views::Checkbox>(
-          u"Block native mouse input (all devices)",
-          base::BindRepeating(&MouseMuxControlDialog::OnNativeInputToggled,
-                              base::Unretained(this))));
-  native_input_checkbox_->SetTooltipText(
-      u"A blunt fallback for when capture is not available. Windows mouse "
-      u"messages carry no device identity, so this cannot be done per user - "
-      u"capture, on each user's row, is the per-user version of it.");
 
   // Settings row: the hotkey, and the way out of everything.
   auto* settings_row =
@@ -1245,8 +1404,10 @@ void MouseMuxControlDialog::SetupContents() {
       u"Hand every window back. Their devices stop driving Chrome until "
       u"somebody clicks to claim again.");
 
-#ifndef MOUSEMUX_DEBUG
   // Footer, in the frame's button row beside Close: build info and Collapse.
+  // In every build: it used to be release-only, from the days the debug
+  // dialog kept a log panel in this spot; the panel is long gone, and a debug
+  // build without Help and Collapse was just a worse dialog (2026-09-04).
   // Collapse is window management, so it belongs next to the other window
   // control rather than among the operating controls above.
   auto footer = std::make_unique<views::View>();
@@ -1263,6 +1424,56 @@ void MouseMuxControlDialog::SetupContents() {
       views::style::CONTEXT_DIALOG_BODY_TEXT,
       views::style::STYLE_DISABLED));
   build_text->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+
+  save_layout_button_ =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnSaveLayoutClicked,
+                              base::Unretained(this)),
+          u"Save layout"));
+  save_layout_button_->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  save_layout_button_->SetTooltipText(
+      u"Remember every window: where it is, what it shows, and whose it is. "
+      u"One file in the profile folder.");
+
+  // Remote seats.  Greyed out when this Chrome has no control server (no
+  // --mousemux-control-port): the pages come from it.
+  const bool has_control_port =
+      !base::CommandLine::ForCurrentProcess()
+           ->GetSwitchValueASCII("mousemux-control-port")
+           .empty();
+  auto* host_button =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnHostClicked,
+                              base::Unretained(this)),
+          u"Host"));
+  host_button->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  host_button->SetEnabled(has_control_port);
+  host_button->SetTooltipText(
+      u"Share windows of this Chrome with remote people: each shared window "
+      u"gets a code, and the remote person becomes its user. Needs "
+      u"--mousemux-control-port.");
+  auto* view_button =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnViewClicked,
+                              base::Unretained(this)),
+          u"View"));
+  view_button->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  view_button->SetEnabled(has_control_port);
+  view_button->SetTooltipText(
+      u"Join a window shared from another machine by its code, and work in "
+      u"it with your own mouse and keyboard.");
+
+  load_layout_button_ =
+      footer->AddChildView(std::make_unique<views::MdTextButton>(
+          base::BindRepeating(&MouseMuxControlDialog::OnLoadLayoutClicked,
+                              base::Unretained(this)),
+          u"Load layout"));
+  load_layout_button_->SetMinSize(gfx::Size(0, kRowButtonHeight));
+  load_layout_button_->SetTooltipText(
+      u"Put the saved windows back: position, page, and owner. Needs the "
+      u"connection: owners are matched by their MouseMux name. Users whose "
+      u"devices are connected get their window at once; the others claim by "
+      u"clicking, as usual.");
 
   // Shrinks the dialog to a strip rather than hiding it, so there is always
   // something on screen to click to get back.
@@ -1287,7 +1498,6 @@ void MouseMuxControlDialog::SetupContents() {
   // Kept so collapse can hide it — the extra view sits in the frame's button
   // row, which SetButtons(kNone) does not remove on its own.
   build_label_ = SetExtraView(std::move(footer));
-#endif
 
   // No in-dialog log panel, even in debug builds.  It duplicated the log file,
   // and as a second flex child it fought the users pane for height until the
@@ -1335,27 +1545,11 @@ ui::ImageModel MouseMuxControlDialog::GetWindowIcon() {
 }
 
 
-void MouseMuxControlDialog::OnHardLockToggled() {
-  const bool on = hard_lock_checkbox_ && hard_lock_checkbox_->GetChecked();
-  content::MouseMuxInputController::GetInstance()->SetHardLock(on);
-  LogDebug(std::string("Hard lock: ") + (on ? "ON" : "OFF"));
+void MouseMuxControlDialog::OnOwnerBlockToggled(int hwid,
+                                                views::Checkbox* box) {
+  content::MouseMuxInputController::GetInstance()->SetOwnerBlockNative(
+      hwid, box && box->GetChecked());
   RebuildOwnerList();
-}
-
-void MouseMuxControlDialog::OnNativeInputToggled() {
-  bool is_on = native_input_checkbox_ && native_input_checkbox_->GetChecked();
-  LogDebug(std::string("Native input blocking: ") + (is_on ? "ENABLED" : "DISABLED"));
-
-  // Apply immediately to controller.
-  auto* controller = content::MouseMuxInputController::GetInstance();
-  controller->SetNativeInputBlocked(is_on);
-}
-
-void MouseMuxControlDialog::OnNativeBlockingChanged(bool blocked) {
-  if (native_input_checkbox_ &&
-      native_input_checkbox_->GetChecked() != blocked) {
-    native_input_checkbox_->SetChecked(blocked);
-  }
 }
 
 void MouseMuxControlDialog::OnConnectClicked() {
@@ -1429,14 +1623,16 @@ void MouseMuxControlDialog::UpdateEnabledState() {
   if (new_seat_button_) {
     new_seat_button_->SetEnabled(on);
   }
+  if (load_layout_button_) {
+    load_layout_button_->SetEnabled(on);
+  }
+  // Save too: without the connection there are no owners to save, and a
+  // layout saved then would overwrite one that had them.
+  if (save_layout_button_) {
+    save_layout_button_->SetEnabled(on);
+  }
   if (release_all_button_) {
     release_all_button_->SetEnabled(on);
-  }
-  if (hard_lock_checkbox_) {
-    hard_lock_checkbox_->SetEnabled(on);
-  }
-  if (native_input_checkbox_) {
-    native_input_checkbox_->SetEnabled(on);
   }
   if (hotkey_dropdown_) {
     hotkey_dropdown_->SetEnabled(on);
@@ -1469,9 +1665,6 @@ void MouseMuxControlDialog::OnOwnerCaptureToggled(int hwid,
   const bool want = box && box->GetChecked();
   if (want) {
     controller->CaptureOwnerHwid(hwid);
-    // Capture gave this dialog OS focus by way of the click that started it;
-    // hand it back, or the first thing that user types goes nowhere.
-    controller->FocusKeyboardTargetView();
   } else {
     controller->ReleaseCaptureHwid(hwid);
   }
@@ -1486,14 +1679,7 @@ void MouseMuxControlDialog::OnConnectionStateChanged(bool connected) {
   }
   if (!connected) {
     // Clear all stale UI state — controller already reset its side.
-    owner_hwid_ = -1;
-    owner_name_.clear();
     is_captured_ = false;
-    UpdateTitle();
-    // Controller unblocked native input on disconnect — sync the toggle.
-    if (native_input_checkbox_ && native_input_checkbox_->GetChecked()) {
-      native_input_checkbox_->SetChecked(false);
-    }
   }
   UpdateStatusLine();
   ScheduleRebuild();
@@ -1503,8 +1689,16 @@ void MouseMuxControlDialog::OnCaptureStateChanged(bool captured) {
   is_captured_ = captured;
   UpdateStatusLine();
   ScheduleRebuild();
-  UpdateTitle();
   LogDebug(std::string("Capture state changed: ") + (captured ? "CAPTURED" : "RELEASED"));
+}
+
+void MouseMuxControlDialog::ShowNotice(const std::string& text, bool error) {
+  LogDebug("Notice: " + text);
+  views::Widget* notice = views::DialogDelegate::CreateDialogWidget(
+      std::make_unique<MouseMuxNoticeDialog>(base::UTF8ToUTF16(text), error),
+      /*context=*/gfx::NativeWindow(),
+      GetWidget() ? GetWidget()->GetNativeView() : gfx::NativeView());
+  notice->Show();
 }
 
 void MouseMuxControlDialog::OnHelpClicked() {
@@ -1625,11 +1819,12 @@ std::string MouseMuxControlDialog::OwnerSignature() const {
   for (const auto& owner :
        content::MouseMuxInputController::GetInstance()->GetOwners()) {
     sig += base::StringPrintf(
-        "%x|%s|%x|%d|%d|%d|%d|%s;", owner.hwid, owner.name.c_str(),
+        "%x|%s|%x|%d|%d|%d|%s;", owner.hwid, owner.name.c_str(),
         owner.keyboard_hwid, owner.keyboard_typed ? 1 : 0,
-        owner.captured ? 1 : 0, owner.has_window ? 1 : 0, owner.screen_index,
+        owner.captured ? 1 : 0, owner.has_window ? 1 : 0,
         base::UTF16ToUTF8(owner.window_title).c_str());
-    sig += base::StringPrintf("%d;", owner.typing);
+    sig += base::StringPrintf("%d;%d;", owner.typing,
+                              owner.block_native ? 1 : 0);
   }
   return sig;
 }
@@ -1688,6 +1883,9 @@ void MouseMuxControlDialog::RebuildOwnerList() {
       if (row.capture && row.capture->GetChecked() != owner.captured) {
         row.capture->SetChecked(owner.captured);
       }
+      if (row.block && row.block->GetChecked() != owner.block_native) {
+        row.block->SetChecked(owner.block_native);
+      }
       if (row.close) {
         row.close->SetEnabled(owner.has_window);
       }
@@ -1735,39 +1933,8 @@ void MouseMuxControlDialog::RebuildOwnerList() {
     }
     alternate = !alternate;
 
-    auto* table = row->SetLayoutManager(std::make_unique<views::TableLayout>());
-    table->AddColumn(views::LayoutAlignment::kCenter,
-                     views::LayoutAlignment::kCenter, 0,
-                     views::TableLayout::ColumnSize::kFixed, 14, 14)
-        .AddPaddingColumn(0, 6)
-        .AddColumn(views::LayoutAlignment::kStart,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kFixed, 78, 78)
-        .AddPaddingColumn(0, 8)
-        .AddColumn(views::LayoutAlignment::kStart,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kFixed, 88, 88)
-        .AddPaddingColumn(0, 6)
-        .AddColumn(views::LayoutAlignment::kStart,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kFixed, 54, 54)
-        .AddPaddingColumn(0, 6)
-        .AddColumn(views::LayoutAlignment::kStretch,
-                   views::LayoutAlignment::kCenter, 1.0f,
-                   views::TableLayout::ColumnSize::kFixed, 0, 0)
-        .AddPaddingColumn(0, 8)
-        .AddColumn(views::LayoutAlignment::kStart,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
-        .AddPaddingColumn(0, 4)
-        .AddColumn(views::LayoutAlignment::kEnd,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
-        .AddPaddingColumn(0, 2)
-        .AddColumn(views::LayoutAlignment::kEnd,
-                   views::LayoutAlignment::kCenter, 0,
-                   views::TableLayout::ColumnSize::kUsePreferred, 0, 0)
-        .AddRows(1, 0, kRowButtonHeight);
+    AddOwnerColumns(
+        row->SetLayoutManager(std::make_unique<views::TableLayout>()));
 
     // Status, as one glyph.  Green: captured, which is the only state in
     // which several users actually work.  Amber: an owner, but not captured,
@@ -1790,19 +1957,7 @@ void MouseMuxControlDialog::RebuildOwnerList() {
           u"the single-owner API.");
     }
 
-    entry.keyboard = row->AddChildView(std::make_unique<views::Label>(
-        row_text::Keyboard(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
-        row_text::KeyboardStyle(owner)));
-    entry.keyboard->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-    entry.keyboard->SetElideBehavior(gfx::ELIDE_TAIL);
-    entry.keyboard->SetTooltipText(row_text::KeyboardTip(owner));
-
-    entry.typing = row->AddChildView(std::make_unique<views::Label>(
-        row_text::Typing(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
-        views::style::STYLE_PRIMARY));
-    entry.typing->SetEnabledColor(row_text::TypingColor(owner));
-    entry.typing->SetTooltipText(row_text::TypingTip(owner));
-
+    AddColumnLine(row);
     entry.where = row->AddChildView(std::make_unique<views::Label>(
         row_text::Where(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
         row_text::WhereStyle(owner)));
@@ -1813,10 +1968,26 @@ void MouseMuxControlDialog::RebuildOwnerList() {
     // which the table adds up and the window then grows to fit - one long
     // title took the dialog to 1857px.
     entry.where->SetPreferredSize(gfx::Size(0, kRowButtonHeight));
+    AddColumnLine(row);
+    entry.keyboard = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Keyboard(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        row_text::KeyboardStyle(owner)));
+    entry.keyboard->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+    entry.keyboard->SetElideBehavior(gfx::ELIDE_TAIL);
+    entry.keyboard->SetTooltipText(row_text::KeyboardTip(owner));
+
+    AddColumnLine(row);
+    entry.typing = row->AddChildView(std::make_unique<views::Label>(
+        row_text::Typing(owner), views::style::CONTEXT_DIALOG_BODY_TEXT,
+        views::style::STYLE_PRIMARY));
+    entry.typing->SetEnabledColor(row_text::TypingColor(owner));
+    entry.typing->SetTooltipText(row_text::TypingTip(owner));
+
 
     // Capture is a STATE, so it is a checkbox rather than a button whose
     // label flips.  That also frees the word "Release" for the other action,
     // which is what it should always have meant: hand the window back.
+    AddColumnLine(row);
     entry.capture = row->AddChildView(std::make_unique<views::Checkbox>(
         u"Capture", views::Button::PressedCallback()));
     entry.capture->SetChecked(owner.captured);
@@ -1825,8 +1996,21 @@ void MouseMuxControlDialog::RebuildOwnerList() {
         owner.hwid, base::Unretained(entry.capture.get())));
     entry.capture->SetTooltipText(
         u"Stop this user's device producing native Windows input. Required "
-        u"for several users to work at once, and the per-user version of the "
-        u"global blocking option below.");
+        u"for several users to work at once.");
+
+    // Native blocking is per owner: the real mouse's input is dropped inside
+    // this user's windows.  On by default; off lets the operator's own mouse
+    // work inside them.
+    entry.block = row->AddChildView(std::make_unique<views::Checkbox>(
+        u"Block native", views::Button::PressedCallback()));
+    entry.block->SetChecked(owner.block_native);
+    entry.block->SetCallback(base::BindRepeating(
+        &MouseMuxControlDialog::OnOwnerBlockToggled, base::Unretained(this),
+        owner.hwid, base::Unretained(entry.block.get())));
+    entry.block->SetTooltipText(
+        u"Drop the real mouse's input inside this user's windows. On by "
+        u"default: an owned window is somebody's workplace. Untick to let "
+        u"the operator's own mouse work inside them.");
 
     auto* release_btn = row->AddChildView(std::make_unique<views::MdTextButton>(
         base::BindRepeating(&MouseMuxControlDialog::OnOwnerReleaseClicked,
@@ -1968,6 +2152,10 @@ void MouseMuxControlDialog::OnOwnerCloseWindowClicked(int hwid) {
 }
 
 void MouseMuxControlDialog::OnNewWindowClicked() {
+  OpenWindowCopy();
+}
+
+BrowserWindowInterface* MouseMuxControlDialog::OpenWindowCopy() {
   // Hand out a window that is ALREADY SIGNED IN, by duplicating the current
   // tab and moving the copy out -- not by opening a blank one.
   //
@@ -1996,16 +2184,31 @@ void MouseMuxControlDialog::OnNewWindowClicked() {
       break;
     }
   }
+  // Whatever gets created below is found by elimination: neither the
+  // duplicate-and-move path nor NewEmptyWindow hands the new window back.
+  std::set<BrowserWindowInterface*> before;
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    before.insert(browser);
+  }
+  auto newcomer = [&before]() -> BrowserWindowInterface* {
+    for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+      if (!before.count(browser)) {
+        return browser;
+      }
+    }
+    return nullptr;
+  };
+
   if (!source) {
     // Nothing to copy from -- first run, or every window already closed.
     for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
       if (Profile* profile = browser->GetProfile()) {
         chrome::NewEmptyWindow(profile);
-        return;
+        return newcomer();
       }
     }
     LogDebug("New window: no existing browser to take a profile from");
-    return;
+    return nullptr;
   }
 
   TabStripModel* model = source->GetTabStripModel();
@@ -2014,13 +2217,13 @@ void MouseMuxControlDialog::OnNewWindowClicked() {
     // Some tabs cannot be duplicated -- a crashed one, for instance.  A blank
     // window is not what was asked for, but it is still a window.
     chrome::NewEmptyWindow(source->GetProfile());
-    return;
+    return newcomer();
   }
 
   content::WebContents* duplicate = chrome::DuplicateTabAt(source, index);
   if (!duplicate) {
     chrome::NewEmptyWindow(source->GetProfile());
-    return;
+    return newcomer();
   }
 
   // Find the copy by identity rather than by assuming where it landed:
@@ -2031,9 +2234,241 @@ void MouseMuxControlDialog::OnNewWindowClicked() {
     // The duplicate exists and is signed in where it is; leaving it as a tab
     // loses nothing, and the operator can still drag it out by hand.
     LogDebug("New window: duplicated tab could not be moved out");
-    return;
+    return nullptr;
   }
   chrome::MoveTabsToNewWindow(source, {duplicate_index});
+  return newcomer();
+}
+
+namespace {
+
+// Where the layout lives: next to the profile it describes, so a seat with
+// its own profile has its own layout.
+base::FilePath LayoutPath() {
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if (Profile* profile = browser->GetProfile()) {
+      return profile->GetPath().Append(FILE_PATH_LITERAL("mousemux-layout.json"));
+    }
+  }
+  return base::FilePath();
+}
+
+gfx::AcceleratedWidget WindowOf(BrowserWindowInterface* browser) {
+  Browser* b = browser->GetBrowserForMigrationOnly();
+  BrowserView* view = b ? BrowserView::GetBrowserViewForBrowser(b) : nullptr;
+  if (!view) {
+    return gfx::kNullAcceleratedWidget;
+  }
+  aura::Window* native = view->GetNativeWindow();
+  return native && native->GetHost() ? native->GetHost()->GetAcceleratedWidget()
+                                     : gfx::kNullAcceleratedWidget;
+}
+
+}  // namespace
+
+void MouseMuxControlDialog::OnSaveLayoutClicked() {
+  auto* controller = content::MouseMuxInputController::GetInstance();
+  const std::vector<content::MouseMuxInputController::OwnerInfo> owners =
+      controller->GetOwners();
+
+  // One entry per normal window, in window-number order, which is the order
+  // the windows were opened - the same numbers the Users list shows.
+  std::vector<std::pair<int, base::DictValue>> entries;
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
+        !browser->GetWindow() || !browser->GetTabStripModel()) {
+      continue;
+    }
+    const gfx::AcceleratedWidget window = WindowOf(browser);
+    base::DictValue entry;
+    entry.Set("number", WindowNumberForSession(browser->GetSessionID()));
+    const gfx::Rect bounds = browser->GetWindow()->GetRestoredBounds();
+    entry.Set("x", bounds.x());
+    entry.Set("y", bounds.y());
+    entry.Set("width", bounds.width());
+    entry.Set("height", bounds.height());
+    entry.Set("maximized", browser->GetWindow()->IsMaximized());
+    if (content::WebContents* active =
+            browser->GetTabStripModel()->GetActiveWebContents()) {
+      entry.Set("url", active->GetLastCommittedURL().spec());
+    }
+    const int owner_hwid = controller->OwnerOfWindow(window);
+    for (const auto& owner : owners) {
+      if (owner.hwid == owner_hwid) {
+        entry.Set("owner", owner.name);
+        entry.Set("captured", owner.captured);
+        entry.Set("block_native", owner.block_native);
+        break;
+      }
+    }
+    entries.emplace_back(WindowNumberForSession(browser->GetSessionID()),
+                         std::move(entry));
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  base::ListValue windows;
+  for (auto& [number, entry] : entries) {
+    windows.Append(std::move(entry));
+  }
+  base::DictValue layout;
+  layout.Set("version", 1);
+  layout.Set("windows", std::move(windows));
+
+  const base::FilePath path = LayoutPath();
+  if (path.empty()) {
+    LogDebug("Save layout: no profile to save next to");
+    return;
+  }
+  std::string json;
+  base::JSONWriter::WriteWithOptions(
+      layout, base::JSONWriter::OPTIONS_PRETTY_PRINT, &json);
+  LogDebug(base::StringPrintf("Save layout: %zu windows -> %s", entries.size(),
+                              path.AsUTF8Unsafe().c_str()));
+  // Disk is not the UI thread's business.
+  base::ThreadPool::PostTask(
+      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+      base::BindOnce(
+          [](const base::FilePath& path, const std::string& json) {
+            base::WriteFile(path, json);
+          },
+          path, std::move(json)));
+}
+
+void MouseMuxControlDialog::OnHostClicked() {
+  OpenControlPage("host.html");
+}
+
+void MouseMuxControlDialog::OnViewClicked() {
+  OpenControlPage("view.html");
+}
+
+void MouseMuxControlDialog::OpenControlPage(const char* file) {
+  const std::string port =
+      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+          "mousemux-control-port");
+  if (port.empty()) {
+    LogDebug("Remote seats: no --mousemux-control-port, nothing to open");
+    return;
+  }
+  Profile* profile = nullptr;
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if ((profile = browser->GetProfile())) {
+      break;
+    }
+  }
+  if (!profile) {
+    return;
+  }
+  // A window of its own: the page must not sit in a window somebody owns,
+  // or that user's clicks would land in it.
+  NavigateParams params(profile,
+                        GURL("http://127.0.0.1:" + port + "/" + file),
+                        ui::PAGE_TRANSITION_TYPED);
+  params.disposition = WindowOpenDisposition::NEW_WINDOW;
+  Navigate(&params);
+}
+
+void MouseMuxControlDialog::OnLoadLayoutClicked() {
+  const base::FilePath path = LayoutPath();
+  if (path.empty()) {
+    LogDebug("Load layout: no profile to load from");
+    return;
+  }
+  base::ThreadPool::PostTaskAndReplyWithResult(
+      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+      base::BindOnce([](const base::FilePath& path)
+                         -> std::optional<base::DictValue> {
+        std::string json;
+        if (!base::ReadFileToString(path, &json)) {
+          return std::nullopt;
+        }
+        return base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
+      }, path),
+      base::BindOnce(&MouseMuxControlDialog::ApplyLayout,
+                     weak_factory_.GetWeakPtr()));
+}
+
+void MouseMuxControlDialog::ApplyLayout(std::optional<base::DictValue> layout) {
+  if (!layout) {
+    LogDebug("Load layout: no layout file, or not JSON");
+    return;
+  }
+  const base::ListValue* windows = layout->FindList("windows");
+  if (!windows) {
+    LogDebug("Load layout: no windows in the file");
+    return;
+  }
+
+  // Saved entries are handed to the windows that exist, in window-number
+  // order (the order both were opened in), and the rest are opened as
+  // copies of the signed-in tab - the same window "+ Window" hands out, so
+  // the session carries over - and then navigated to the saved page.
+  // Navigating the copy keeps its session storage; opening the URL in a
+  // fresh window would be a new sign-in.
+  std::vector<BrowserWindowInterface*> existing;
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    if (browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+        browser->GetWindow() && browser->GetTabStripModel()) {
+      existing.push_back(browser);
+    }
+  }
+  std::sort(existing.begin(), existing.end(),
+            [](BrowserWindowInterface* a, BrowserWindowInterface* b) {
+              return WindowNumberForSession(a->GetSessionID()) <
+                     WindowNumberForSession(b->GetSessionID());
+            });
+
+  auto* controller = content::MouseMuxInputController::GetInstance();
+  size_t used = 0;
+  int applied = 0;
+  int assigned = 0;
+  for (const base::Value& value : *windows) {
+    const base::DictValue* entry = value.GetIfDict();
+    if (!entry) {
+      continue;
+    }
+    BrowserWindowInterface* target =
+        used < existing.size() ? existing[used++] : OpenWindowCopy();
+    if (!target || !target->GetWindow() || !target->GetTabStripModel()) {
+      LogDebug("Load layout: no window for an entry");
+      continue;
+    }
+    ++applied;
+
+    const std::optional<int> x = entry->FindInt("x");
+    const std::optional<int> y = entry->FindInt("y");
+    const std::optional<int> width = entry->FindInt("width");
+    const std::optional<int> height = entry->FindInt("height");
+    if (x && y && width && height && *width > 0 && *height > 0) {
+      target->GetWindow()->SetBounds(gfx::Rect(*x, *y, *width, *height));
+    }
+    if (entry->FindBool("maximized").value_or(false)) {
+      target->GetWindow()->Maximize();
+    }
+
+    if (const std::string* url = entry->FindString("url")) {
+      content::WebContents* active =
+          target->GetTabStripModel()->GetActiveWebContents();
+      const GURL gurl(*url);
+      if (active && gurl.is_valid() && active->GetLastCommittedURL() != gurl) {
+        active->GetController().LoadURL(gurl, content::Referrer(),
+                                        ui::PAGE_TRANSITION_TYPED,
+                                        std::string());
+      }
+    }
+
+    if (const std::string* owner = entry->FindString("owner")) {
+      if (controller->AssignWindow(*owner, WindowOf(target),
+                                   entry->FindBool("captured").value_or(false),
+                                   entry->FindBool("block_native").value_or(true))) {
+        ++assigned;
+      }
+    }
+  }
+  LogDebug(base::StringPrintf("Load layout: %d windows applied, %d assigned",
+                              applied, assigned));
+  ScheduleRebuild();
 }
 
 void MouseMuxControlDialog::OnNewSeatClicked() {
@@ -2071,34 +2506,69 @@ void MouseMuxControlDialog::OnReleaseOwnerClicked() {
 }
 
 void MouseMuxControlDialog::OnOwnershipChanged(int hwid, const std::string& name) {
-  owner_hwid_ = hwid;
-  owner_name_ = name;
-
-  UpdateStatusLine();
-  ScheduleRebuild();
-
-  // Update title.
-  UpdateTitle();
-
   if (hwid != -1) {
     LogDebug(base::StringPrintf("Ownership changed: hwid=0x%x name=%s",
                                  hwid, name.empty() ? "(unknown)" : name.c_str()));
   } else {
     LogDebug("Ownership released - waiting for first click");
   }
+
+  // The UI work is posted, not done here.  This is raised from inside
+  // injected input (a press claiming a window) and from inside a page's
+  // destructor (a closing tab releasing its user), and it walks every
+  // browser window updating captions and toolbars.  One claim raises it
+  // twice (AddOwner, then AdoptWindow); a pending flag folds those into one
+  // refresh.
+  if (ownership_refresh_pending_) {
+    return;
+  }
+  ownership_refresh_pending_ = true;
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+      FROM_HERE, base::BindOnce(&MouseMuxControlDialog::RefreshOwnershipUi,
+                                weak_factory_.GetWeakPtr()));
 }
 
-void MouseMuxControlDialog::UpdateTitle() {
-  // The title no longer carries owner or capture state.  Both are per-user
-  // now, and a single title can only ever describe one of them — it would show
-  // the primary owner and quietly misrepresent everyone else.  The owner list
-  // says it properly, one row per user.
-  SetTitle(base::ASCIIToUTF16(std::string(kProductName)));
+void MouseMuxControlDialog::RefreshOwnershipUi() {
+  ownership_refresh_pending_ = false;
 
-  // Force widget to update title.
-  if (GetWidget()) {
-    GetWidget()->UpdateWindowTitle();
+  // Window captions and toolbar chips carry the owner's name; every one may
+  // have changed.
+  const std::vector<content::MouseMuxInputController::OwnerInfo> owners =
+      content::MouseMuxInputController::GetInstance()->GetOwners();
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    Browser* b = browser->GetBrowserForMigrationOnly();
+    if (!b || !b->window()) {
+      continue;
+    }
+    b->window()->UpdateTitleBar();
+    BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(b);
+    if (!browser_view || !browser_view->toolbar()) {
+      continue;
+    }
+    std::u16string chip_name;
+    SkColor chip_color = SK_ColorBLACK;
+    if (aura::Window* native = browser_view->GetNativeWindow();
+        native && native->GetHost()) {
+      const gfx::AcceleratedWidget window =
+          native->GetHost()->GetAcceleratedWidget();
+      const int owner_hwid =
+          content::MouseMuxInputController::GetInstance()->OwnerOfWindow(
+              window);
+      for (const auto& owner : owners) {
+        if (owner.hwid == owner_hwid) {
+          chip_name = base::UTF8ToUTF16(owner.name.empty() ? "(unnamed)"
+                                                            : owner.name);
+          chip_color = row_text::DotColor(owner);
+          break;
+        }
+      }
+    }
+    browser_view->toolbar()->SetMouseMuxOwner(chip_name, chip_color);
   }
+
+  UpdateStatusLine();
+  // Already on a fresh task; the rebuild can run inline.
+  RebuildOwnerList();
 }
 
 BEGIN_METADATA(MouseMuxControlDialog)

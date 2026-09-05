@@ -5,8 +5,8 @@
 #ifndef CONTENT_BROWSER_RENDERER_HOST_INPUT_MOUSE_MUX_MOUSE_MUX_INPUT_CONTROLLER_H_
 #define CONTENT_BROWSER_RENDERER_HOST_INPUT_MOUSE_MUX_MOUSE_MUX_INPUT_CONTROLLER_H_
 
-// Compile-time defines (MOUSEMUX_DEBUG, MOUSEMUX_AURA_UI_CLICK_THROUGH)
-// live in mouse_mux_config.h — a tiny header that rarely changes.
+// Compile-time defines (MOUSEMUX_DEBUG, MOUSEMUX_NATIVE_BLOCK, the version
+// stamp) live in mouse_mux_config.h — a tiny header that rarely changes.
 // This prevents cascade rebuilds when only the controller header changes.
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_config.h"
 
@@ -25,6 +25,7 @@
 #include "base/timer/timer.h"
 #include "content/browser/renderer_host/input/mouse_mux/mouse_mux_client.h"
 #include "content/common/content_export.h"
+#include "content/public/browser/render_widget_host.h"
 #include "third_party/blink/public/common/input/web_input_event.h"
 #include "ui/gfx/native_ui_types.h"
 
@@ -43,7 +44,9 @@ class RenderWidgetHostViewAura;
 
 // Singleton controller that coordinates MouseMux integration.
 // Manages the WebSocket connection and event injection into registered views.
-class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
+class CONTENT_EXPORT MouseMuxInputController
+    : public MouseMuxClient::Observer,
+      public RenderWidgetHost::InputEventObserver {
  public:
   // Debug logging callback type.
   using DebugLogCallback = base::RepeatingCallback<void(const std::string&)>;
@@ -65,7 +68,12 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Menu dismiss callback type. Called to dismiss any active context menu
   // before injecting a mouse down event. Implemented by the chrome layer
   // since content cannot depend on ui/views.
-  using MenuDismissCallback = base::RepeatingCallback<void(int hwid)>;
+  // Every injected press, with whether it landed on a page.  The dialog
+  // uses it to attribute the open menu to the user who opened it (any
+  // press counts for that) and to close it when that user presses a page
+  // outside it (only a page press may cancel).
+  using MenuDismissCallback =
+      base::RepeatingCallback<void(int hwid, bool page_press)>;
 
   // Returns the singleton instance.
   static MouseMuxInputController* GetInstance();
@@ -86,6 +94,14 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // views, so this is a string it hands over rather than anything structured.
   using DiagnosticsCallback = base::RepeatingCallback<std::string()>;
   void SetDiagnosticsCallback(DiagnosticsCallback callback);
+
+  // A message from the server the operator should see: a timeout warning,
+  // the session ending.  The dialog shows it in a window of its own; a
+  // MessageBox from here would spin a nested loop on the UI thread and stall
+  // every user's input until dismissed.
+  using NoticeCallback =
+      base::RepeatingCallback<void(const std::string& text, bool error)>;
+  void SetNoticeCallback(NoticeCallback callback);
   std::string GetDialogDiagnostics() const;
 
   // The MouseMux version we are connected to, empty when not connected or
@@ -114,8 +130,6 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   void SetKeyboardEventCallback(KeyboardEventCallback callback);
 
   // Set a callback for native input blocking state changes.
-  using NativeBlockingChangedCallback = base::RepeatingCallback<void(bool blocked)>;
-  void SetNativeBlockingChangedCallback(NativeBlockingChangedCallback callback);
 
   // Set a callback to dismiss active context menus before mouse down.
   void SetMenuDismissCallback(MenuDismissCallback callback);
@@ -124,6 +138,14 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // content cannot depend on ui/views.
   using VisibilityChangedCallback = base::RepeatingCallback<void(bool visible)>;
   void SetVisibilityChangedCallback(VisibilityChangedCallback callback);
+
+  // Drops every callback the dialog registered.  The dialog binds them to
+  // itself with raw pointers and dies before the browser windows do (closing
+  // it is what ends the seat), while each tab that closes after it still
+  // notifies ownership changes through here.  Called from the dialog's
+  // destructor; after it, notifications go nowhere instead of into freed
+  // memory.
+  void ClearUiCallbacks();
 
   // Show or hide the control dialog.  Hiding leaves the seat fully
   // functional — only the window goes away — so it can always be brought
@@ -136,6 +158,26 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Set owner by name (e.g. "user1:mouse1"). Returns false if not found.
   bool SetOwnerByName(const std::string& name);
+
+  // Gives `window` to the user MouseMux calls `name`, as if they had clicked
+  // in it, and applies their two flags.  For loading a saved layout and for
+  // putting things back after a reconnect: the name is the stable identity,
+  // device ids change with the hardware.  False when the name is not in the
+  // user list (that device is not connected yet) or the window is another
+  // user's; nothing is changed then.
+  bool AssignWindow(const std::string& name,
+                    gfx::AcceleratedWidget window,
+                    bool captured,
+                    bool block_native);
+  // The same for a device already known by id (a virtual user the host page
+  // just created, for instance).
+  bool AssignWindowToHwid(int hwid,
+                          gfx::AcceleratedWidget window,
+                          bool captured,
+                          bool block_native);
+
+  // Every top-level window that has a page of ours in it, owned or not.
+  std::vector<gfx::AcceleratedWidget> KnownWindows() const;
 
   // Release ALL ownership, allowing new users to claim.
   void ReleaseOwnership();
@@ -175,6 +217,8 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     bool captured = false;
     bool is_primary = false;      // the one the single-owner API reports
     bool has_window = false;      // false until they have clicked somewhere
+    int extra_windows = 0;        // owned windows beyond the current one
+    bool block_native = true;     // real-mouse input dropped in their windows
 
     // Which keyboard MouseMux has attached to this user, and whether anything
     // has ever arrived from it.
@@ -194,16 +238,21 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // there is only one.  Operators of a four-monitor desk think in screens
     // rather than window titles, and a title changes as people browse.
     //
-    // This is an index into the display list, which is not necessarily the
-    // number Windows shows in its own display settings.  It is consistent
-    // within one session, which is what it is for: telling one user's row
-    // from another's at a glance.
-    int screen_index = 0;
   };
 
   // Every current owner, in hwid order so rows do not jump around between
   // refreshes.
   std::vector<OwnerInfo> GetOwners() const;
+
+  // The MouseMux user name of the user who owns `window`, or "" when
+  // nobody does.  Shown in the window's caption.
+  std::string OwnerNameOfWindow(gfx::AcceleratedWidget window) const;
+  // The hwid whose set contains `window`, or -1.
+  int OwnerOfWindow(gfx::AcceleratedWidget window) const;
+
+  // Per owner: whether the real mouse's input is dropped inside their
+  // windows (default on).  See ApplyNativeBlocking().
+  void SetOwnerBlockNative(int hwid, bool block);
 
   // Where recent keystrokes WENT — never what they were.  Nothing recorded
   // here identifies a key, which is why it can stay on in release builds
@@ -280,26 +329,18 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // first one they click, and closing a window frees its user to claim again,
   // so nobody can be locked out with no way back.
   void ClaimOwnSeat(int control_port);
-  void SetHardLock(bool enabled);
-  bool IsHardLock() const { return hard_lock_; }
 
   // Whether |view| should keep renderer page focus even though aura says its
-  // window just lost focus.
+  // window just lost focus: while anyone is captured, or when the view sits
+  // in an owned window.
   //
-  // While captured, the OS foreground window is meaningless: every device
-  // producing input has been stopped at the server, so all input arrives by
-  // injection and reaches a view chosen by hit-test, not by OS focus.  Letting
-  // an activation change blur the view would kill the caret of a user who is
-  // still working — which happens every time the operator so much as clicks
-  // the control dialog.
-  //
-  // Deliberately conditioned on capture: with capture off, native input is
-  // live, OS focus means what it always meant, and normal blur must resume.
+  // In both cases the OS foreground window says nothing about who is working
+  // where.  Captured devices produce no native input, and an owned window
+  // gets its input by ownership, not by focus.  Letting an activation change
+  // blur the view would kill the caret of a user who is still typing - which
+  // happens every time the operator so much as clicks the control dialog.
+  // With nobody captured and nothing owned, normal blur behaviour is intact.
   bool ShouldSuppressBlur(RenderWidgetHostViewAura* view) const;
-
-  // Focus the keyboard target view's browser window so keyboard injection
-  // reaches the renderer.  Called by the dialog after capture starts.
-  void FocusKeyboardTargetView();
 
   // Get current owner hwid (-1 if no owner).
   int GetOwnerHwid() const { return owner_hwid_; }
@@ -331,6 +372,10 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // For testing.
   MouseMuxClient* client_for_testing() { return client_.get(); }
 
+  // Debug logging, to the same file as everything else.  Public so the
+  // control server can log what it is asked and what it answered.
+  void LogDebug(const std::string& message);
+
  private:
   friend class base::NoDestructor<MouseMuxInputController>;
   friend class MouseMuxInputControllerTest;
@@ -338,16 +383,10 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   MouseMuxInputController();
   ~MouseMuxInputController() override;
 
-  // Internal debug logging.
-  void LogDebug(const std::string& message);
-
   // Finds the view under the given screen coordinates.
   // Set verbose_log=true for debugging (only use for button events, not motion).
   RenderWidgetHostViewAura* FindViewAtPoint(float screen_x, float screen_y,
                                             bool verbose_log = false);
-
-  // Checks if screen coordinates are over any Chrome view.
-  bool IsPointOverChrome(float screen_x, float screen_y);
 
   // Injects a mouse event into the given view.  |hwid| is the MOUSE hwid the
   // event came from and selects which device's state applies.
@@ -370,10 +409,14 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // given screen coordinates.  If found, dispatches the event through aura
   // and returns true.  Returns false if the topmost window is a web content
   // host (normal injection should handle it).
+  // `owner`: consider only popups owned by that window (a user's own menu),
+  // or any popup when null.
   bool TryDispatchToOverlayWindow(blink::WebInputEvent::Type type,
                                    float screen_x,
                                    float screen_y,
-                                   int button_flags);
+                                   int button_flags,
+                                   gfx::AcceleratedWidget owner =
+                                       gfx::kNullAcceleratedWidget);
 
   // The toplevel Chrome window under the given screen point, chosen by Win32
   // Z-order so the topmost one wins.  Null when the point is over nothing of
@@ -437,9 +480,6 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
                            int scan,
                            bool is_down);
 
-  // Gets the keyboard hwid for the current owner (from user info).
-  int GetOwnerKeyboardHwid() const;
-
   // Schedules the next reconnect attempt with exponential backoff, and runs
   // one attempt.  Without this a dropped MouseMux server leaves the seat dead
   // until somebody re-toggles it by hand — the main unattended failure mode.
@@ -462,10 +502,13 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   bool native_input_blocked_ = false;
 
-  // Confine each user to their own window.  See SetHardLock().
-  bool hard_lock_ = false;
   std::unique_ptr<MouseMuxClient> client_;
   std::set<raw_ptr<RenderWidgetHostViewAura>> registered_views_;
+
+  // Views registered before their window existed, to be looked at again
+  // shortly.  Pointers only live here while registered: UnregisterView
+  // erases, so the retry never dereferences a dead view.
+  std::set<raw_ptr<RenderWidgetHostViewAura>> adopt_pending_;
 
   // Everything that belongs to ONE device pair.
   //
@@ -485,7 +528,9 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     // and drag break.
     raw_ptr<RenderWidgetHostViewAura> drag_target_view = nullptr;
 
-    // The view this device's keys go to: the one it last clicked in.
+    // The page this device last clicked in.  A fallback only: keys go to
+    // the active page of claimed_window, and this is consulted when that
+    // window has no active page to offer.  Nothing else reads it.
     raw_ptr<RenderWidgetHostViewAura> keyboard_target_view = nullptr;
 
     // Blink button mask for the buttons this device is holding.
@@ -521,20 +566,35 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
     std::array<uint8_t, 256> pending_dead_key_state{};
 #endif
 
-    // The window this device is confined to while hard lock is on.  Claimed by
-    // the device's first click and kept until the window closes.
-    //
-    // A WINDOW, not a view: RenderWidgetHostViewAura is recreated on a
-    // cross-process navigation, so a view pointer would go stale the moment
-    // the user followed a link, and the lock would silently release.
-    gfx::AcceleratedWidget locked_window = gfx::kNullAcceleratedWidget;
-
     // The toplevel window this device last clicked in, kept alongside
     // keyboard_target_view because the view dies with a tab while the window
     // outlives it.  Without it there is no way, once a view is gone, to tell
     // "they closed a tab" from "their whole window went away" - and those want
     // opposite answers.
     gfx::AcceleratedWidget claimed_window = gfx::kNullAcceleratedWidget;
+
+    // Every window this user owns; claimed_window is the CURRENT one, the
+    // one all their input goes to.  A press inside another window of this
+    // set makes that one current.  Windows join the set by being claimed,
+    // or by being opened from one of them (see MaybeAdoptNewWindow).  Nobody
+    // else can claim a window in somebody's set.  Most recent last.
+    std::vector<gfx::AcceleratedWidget> owned_windows;
+
+    // When any injected input from this device last arrived.  A window that
+    // appears with no opener is attributed to the user whose input is the
+    // most recent: their keystroke or click created it.
+    base::TimeTicks last_input_time;
+
+    // Whether the real mouse's input is dropped inside this user's windows.
+    // On by default: an owned window is somebody's workplace.  The dialog
+    // row's "Block native" checkbox turns it off for one user.
+    bool block_native = true;
+
+    // Where this device's last wheel notch went, so the scroll gesture can
+    // be ended there (SendWheelEnd) once the notches stop.
+    raw_ptr<RenderWidgetHostViewAura> last_wheel_view = nullptr;
+    float last_wheel_x = 0;
+    float last_wheel_y = 0;
 
     // When this pair last typed, and whether that keystroke was delivered.
     // Read by the dialog to show typing activity per user - a sentence
@@ -546,9 +606,59 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   std::map<int, DeviceState> device_state_;
 
+  // One per device: fires 100 ms after its last wheel notch (SendWheelEnd).
+  std::map<int, std::unique_ptr<base::OneShotTimer>> wheel_end_timers_;
+
   // Returns the state for a mouse hwid, creating it if this is the first
   // event from that device.
   DeviceState& StateFor(int mouse_hwid);
+
+  // RenderWidgetHost::InputEventObserver: Chrome's answer to every input
+  // event of every registered view, ours and native alike.  Logged under
+  // MOUSEMUX_DEBUG as "ACK ..." lines; a no-op otherwise.
+  void OnInputEventAck(const RenderWidgetHost& host,
+                       blink::mojom::InputEventResultSource source,
+                       blink::mojom::InputEventResultState state,
+                       const blink::WebInputEvent& event) override;
+  // Every event forwarded to a page, with its origin: injected-page,
+  // injected-ui, or native.  Logged as "FWD ..." under MOUSEMUX_DEBUG.
+  void OnInputEvent(const RenderWidgetHost& host,
+                    const blink::WebInputEvent& event,
+                    InputEventSource source) override;
+
+  // The MouseMux user name a mouse or keyboard hwid belongs to, or "?".
+  std::string UserNameOf(int hwid) const;
+
+  // Adds `window` to this user's set (no-op if present).
+  void AdoptWindow(int hwid, gfx::AcceleratedWidget window);
+  // A press by this user on `window`: refused (false) when another user
+  // owns it; otherwise the window is theirs, current, and their keyboard
+  // follows it - to `page` when the press landed on one, else the window's
+  // active page.  The one place a press changes what a user owns.
+  bool ClaimForPress(int hwid,
+                     gfx::AcceleratedWidget window,
+                     RenderWidgetHostViewAura* page);
+  // Second look at the views in adopt_pending_.
+  void RetryPendingAdoptions();
+  // A view has just registered: if its window is nobody's, give it to the
+  // owner of the window that opened it, else to the user whose injected
+  // input is the most recent.  Retries once if the window has no HWND yet.
+  void MaybeAdoptNewWindow(RenderWidgetHostViewAura* view, bool retry);
+  // Drops windows that no longer exist from a user's set and, if the current
+  // one went, makes the most recent survivor current.  False if none is left.
+  bool PruneOwnedWindows(int hwid);
+
+  // Recomputes which windows drop native input: every window of every owner
+  // whose block_native is set, plus everything while the legacy global flag
+  // (control server) is on.  Applied to each registered view's event
+  // handler and published to the views layer as a set of HWNDs.
+  void ApplyNativeBlocking();
+
+  // Ends the scroll gesture this device's wheel started: a wheel event with
+  // phase kPhaseEnded and zero delta to the page the last notch went to.
+  void SendWheelEnd(int hwid);
+  // Publishes whether any injected mouse holds a button; see the .cc.
+  void NoteSdkButtonState();
 
   // Resolves a KEYBOARD hwid to the mouse hwid of its pair, which is the key
   // device_state_ uses.  Returns -1 when the pairing is unknown.
@@ -581,9 +691,7 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
 
   // Owner tracking.
   //
-  // owners_ is authoritative: every device allowed to drive Chrome.  Without
-  // MOUSEMUX_MULTI_OWNER it never holds more than one entry, so
-  // behaviour is unchanged.
+  // owners_ is authoritative: every device allowed to drive Chrome.
   //
   // owner_hwid_ is the PRIMARY owner — the first to claim, and the one the
   // single-owner API still reports: GetOwnerHwid(), the dialog title, the
@@ -604,16 +712,6 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Removes one owner, promoting another to primary if the primary left.
   void RemoveOwner(int hwid);
 
-  // Track last known position for each hwid.
-  struct UserPosition {
-    float x = 0;
-    float y = 0;
-  };
-  std::map<int, UserPosition> user_positions_;
-
-  // Motion event counter for throttled logging.
-  int motion_count_ = 0;
-
   // Motion throttling (~60fps, to avoid flooding the UI thread) is per device
   // now — see DeviceState.
 
@@ -632,8 +730,6 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // Keyboard event callback.
   KeyboardEventCallback keyboard_event_callback_;
 
-  // Native blocking changed callback.
-  NativeBlockingChangedCallback native_blocking_changed_callback_;
 
   // Menu dismiss callback.
   MenuDismissCallback menu_dismiss_callback_;
@@ -643,10 +739,8 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   VisibilityChangedCallback visibility_changed_callback_;
   DiagnosticsCallback diagnostics_callback_;
   ActiveViewForWindowCallback active_view_for_window_callback_;
+  NoticeCallback notice_callback_;
   bool dialog_visible_ = true;
-
-  // Whether the owner's mouse is currently captured.
-  bool is_captured_ = false;
 
   // User info cache (hwid_mouse -> UserInfo).
   std::map<int, MouseMuxClient::UserInfo> user_info_;
@@ -662,12 +756,12 @@ class CONTENT_EXPORT MouseMuxInputController : public MouseMuxClient::Observer {
   // different faults with different fixes, and indistinguishable without it.
   std::set<int> keyboards_seen_;
 
-  // See GetInjectionStats().
+  // See GetInjectionStats().  Keys go into the window as WM_MOUSEMUX_KEY*
+  // messages, so the counters say what was posted, not what a renderer did.
   struct InjectionStats {
-    int forwarded = 0;       // ForwardKeyboardEvent calls
-    int inserted = 0;        // InsertChar calls
+    int posted_keys = 0;     // WM_MOUSEMUX_KEYDOWN/KEYUP posted
+    int posted_chars = 0;    // WM_MOUSEMUX_CHAR posted
     int no_host = 0;         // view had no RenderWidgetHostImpl
-    int host_ignoring = 0;   // host said it was ignoring web input
     int renderer_dead = 0;   // no live renderer to send to
     bool last_view_focused = false;
     bool last_page_focused = false;

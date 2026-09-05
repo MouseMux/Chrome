@@ -28,6 +28,16 @@
 // never fires and enabling it here does nothing.  Flip both together.
 
 // ---------------------------------------------------------------------------
+// VERSION STAMP — the one place.  Release 2.2.N is build #N; bump all three
+// together for a release.  The client reports the version to the server, the
+// dialog shows build and date in its footer.  They used to live in those two
+// files separately and had already drifted apart.
+// ---------------------------------------------------------------------------
+#define MOUSEMUX_VERSION "2.2.62"
+#define MOUSEMUX_BUILD_NUMBER 62
+#define MOUSEMUX_BUILD_DATE "2026-09-05"
+
+// ---------------------------------------------------------------------------
 // SHIPPED FEATURES — verified, on by default.
 // ---------------------------------------------------------------------------
 
@@ -79,8 +89,7 @@
 //
 // Verified 2026-09-01 on hardware: two users, two mice, two keyboards, two
 // windows, typing simultaneously with two blinking carets and no crossover.
-// Content layer only — not mirrored in the views file.
-#define MOUSEMUX_MULTI_OWNER
+// No longer a switch (2026-09-04): the single-owner code it replaced is gone.
 
 // Keyboard layout translation.  Injected characters come from ToUnicodeEx
 // against the layout actually in use — the same call Windows makes to turn
@@ -106,6 +115,68 @@
 // tilde and circumflex accents all composing correctly, with ordinary Latin
 // typing and Ctrl shortcuts unaffected.  Content layer only.
 #define MOUSEMUX_KEYBOARD_LAYOUT
+
+// Anonymous keys in the logs.  With MOUSEMUX_DEBUG on, every key event is
+// logged, and key codes are letters and digits in all but name: a log sent
+// in from the field could be read back as what was typed.  With this on,
+// keys that produce text - letters, digits, space, numpad, punctuation - are
+// logged as 'X' (vkey 0x58, scan 0, character U+0058).  Which device typed,
+// when, into which window, accepted or dropped: all still there.  Modifier,
+// navigation and function keys are logged as they are; they carry no text.
+// Raw MouseMux keyboard messages are not logged at all.  ON for builds that
+// leave this machine; OFF (comment out) for rich logging on the bench.
+#define MOUSEMUX_ANONYMOUS_KEYS
+
+static inline bool MouseMuxIsTextKey(int vkey) {
+  return vkey == 0x20 || (vkey >= 0x30 && vkey <= 0x39) ||
+         (vkey >= 0x41 && vkey <= 0x5A) || (vkey >= 0x60 && vkey <= 0x6F) ||
+         (vkey >= 0xBA && vkey <= 0xE2);
+}
+#ifdef MOUSEMUX_ANONYMOUS_KEYS
+static inline int MouseMuxLogVkey(int vkey) {
+  return MouseMuxIsTextKey(vkey) ? 0x58 : vkey;
+}
+static inline int MouseMuxLogScan(int vkey, int scan) {
+  return MouseMuxIsTextKey(vkey) ? 0 : scan;
+}
+static inline unsigned MouseMuxLogChar(unsigned) {
+  return 0x58;
+}
+static inline int MouseMuxLogDomKey(int vkey, int dom_key) {
+  return MouseMuxIsTextKey(vkey) ? 0 : dom_key;
+}
+static inline bool MouseMuxLogRawKeys() {
+  return false;
+}
+#else
+static inline int MouseMuxLogVkey(int vkey) {
+  return vkey;
+}
+static inline int MouseMuxLogScan(int, int scan) {
+  return scan;
+}
+static inline unsigned MouseMuxLogChar(unsigned ch) {
+  return ch;
+}
+static inline int MouseMuxLogDomKey(int, int dom_key) {
+  return dom_key;
+}
+static inline bool MouseMuxLogRawKeys() {
+  return true;
+}
+#endif
+
+// Keyboard through the window, not straight into the renderer.
+//
+// Off, an SDK keystroke is handed to the active tab's RenderWidgetHost and
+// the character to RenderWidgetHostViewAura::InsertChar.  That reaches the
+// page and nothing else: the omnibox, the find bar and every browser shortcut
+// live in the views focus manager, which that path never visits.  On, the
+// controller posts WM_MOUSEMUX_KEYDOWN/KEYUP/CHAR to the user's window and
+// DesktopWindowTreeHostWin::PreHandleMSG feeds them in where a real
+// WM_KEYDOWN enters - through the focus manager to whichever view holds
+// focus - so keys land wherever the user last clicked, page or chrome.
+// No longer a switch (2026-09-04): the InsertChar path it replaced is gone.
 
 // ---------------------------------------------------------------------------
 // EXPERIMENTS — unverified or known-broken.  All OFF.
@@ -151,14 +222,35 @@
 // mouse events are written to disk, which means release binaries would log
 // every keystroke the user types.  All logging in the MouseMux code is
 // guarded by this define — nothing writes to disk without it.
-// #define MOUSEMUX_DEBUG
+#define MOUSEMUX_DEBUG  // ON for the 2026-09-03 field debug build
 
 // Log file paths.  Deliberately declared INSIDE the debug guard: any logging
 // that escapes the #ifdef then fails to compile rather than quietly shipping.
 // Do not move these out of the guard.
+#if defined(MOUSEMUX_DEBUG) || defined(MOUSEMUX_DEBUG_TRACE)
+#include <string>
+#include <windows.h>
+
+// Every debug log goes to %TEMP%.
+//
+// The paths used to be hardcoded to O:\, which exists on exactly one machine.
+// On any other, the file open failed silently and a debug build sent out to
+// reproduce a bug came back with no log at all - which is worse than no debug
+// build, because it looks like the bug left no trace.
+static inline std::string MouseMuxLogPath(const char* name) {
+  std::string dir(MAX_PATH, '\0');
+  const DWORD n = GetTempPathA(MAX_PATH, dir.data());
+  if (n == 0 || n >= MAX_PATH) {
+    return std::string(name);  // Current directory: still better than nothing.
+  }
+  dir.resize(n);
+  return dir + name;
+}
+#endif
+
 #ifdef MOUSEMUX_DEBUG
-#define MOUSEMUX_DIAG_LOG_PATH  "O:/tmp/mousemux_diag.log"
-#define MOUSEMUX_DEBUG_LOG_PATH "O:/tmp/mousemux_debug.log"
+#define MOUSEMUX_DIAG_LOG_PATH  MouseMuxLogPath("mousemux_diag.log")
+#define MOUSEMUX_DEBUG_LOG_PATH MouseMuxLogPath("mousemux_debug.log")
 #endif
 
 // Traces the whole input pipeline to a file, stage by stage, including every
@@ -168,10 +260,10 @@
 // COMMENT OUT FOR RELEASE.  It writes input coordinates and key codes to disk
 // and reopens the file on every line, so it is slow as well as sensitive.
 // Mirrored in the views file.
-// #define MOUSEMUX_DEBUG_TRACE
+#define MOUSEMUX_DEBUG_TRACE  // ON for the 2026-09-03 field debug build
 
 #ifdef MOUSEMUX_DEBUG_TRACE
-#define MOUSEMUX_DEBUG_TRACE_PATH "O:\\chrome-log.txt"
+#define MOUSEMUX_DEBUG_TRACE_PATH MouseMuxLogPath("chrome-log.txt")
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -192,7 +284,7 @@
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage-in-libc-call"
 static inline void MouseMuxTrace(const char* stage, const char* fmt, ...) {
-  FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH, "a");
+  FILE* f = fopen(MOUSEMUX_DEBUG_TRACE_PATH.c_str(), "a");
   if (!f) {
     char fallback[MAX_PATH];
     DWORD n = GetTempPathA(MAX_PATH, fallback);
@@ -240,5 +332,19 @@ static inline void MouseMuxTrace(const char* stage, const char* fmt, ...) {
 #define WM_MOUSEMUX_RBUTTONUP    (WM_APP + 0x103)
 #define WM_MOUSEMUX_MBUTTONDOWN  (WM_APP + 0x104)
 #define WM_MOUSEMUX_MBUTTONUP    (WM_APP + 0x105)
+// Hover for Chrome UI and menus: moves over anything that is not page
+// content, and a leave when the pointer goes back to the page or to another
+// window, so a highlight does not stick.
+#define WM_MOUSEMUX_MOUSEMOVE    (WM_APP + 0x106)
+#define WM_MOUSEMUX_MOUSELEAVE   (WM_APP + 0x107)
+// Keyboard, on the same principle.  wParam: low word the virtual key
+// (KEYDOWN/KEYUP) or the UTF-16 unit (CHAR); high word the ui::EventFlags
+// modifiers of the device that typed it, carried in the message because
+// GetKeyState() knows one keyboard and there are several.  lParam: low 32
+// bits the ui::DomCode, bits 32-47 the virtual key (CHAR only).  lParam is
+// 64 bits wide on x64, which is the only place this runs.
+#define WM_MOUSEMUX_KEYDOWN      (WM_APP + 0x110)
+#define WM_MOUSEMUX_KEYUP        (WM_APP + 0x111)
+#define WM_MOUSEMUX_CHAR         (WM_APP + 0x112)
 
 #endif  // CONTENT_BROWSER_RENDERER_HOST_INPUT_MOUSE_MUX_MOUSE_MUX_CONFIG_H_

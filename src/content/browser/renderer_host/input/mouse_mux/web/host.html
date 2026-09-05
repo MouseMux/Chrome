@@ -1,0 +1,202 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MouseMux Chrome - share a window</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; background: #1e1e1e; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #333; }
+  th { color: #999; font-weight: normal; }
+  button { font: inherit; padding: 4px 10px; }
+  .code { font: 22px monospace; color: #8f8; letter-spacing: 2px; }
+  video { width: 240px; background: #000; border: 1px solid #444; }
+  #log { white-space: pre-wrap; font: 12px monospace; color: #9c9; margin-top: 12px; max-height: 40vh; overflow: auto; }
+  .muted { color: #888; }
+</style>
+<h1>Share a window</h1>
+<p class="muted">Each shared window gets a code. The remote person opens <b>view.html</b> in their MouseMux Chrome and enters it. They become a user of that window on this machine.</p>
+<table id="windows"><tr><th>Window</th><th>Owner</th><th></th><th>Code</th><th>Preview</th></tr></table>
+<div id="log"></div>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// One page, three sockets:
+//   control  ws://<this host>          our Chrome: windows, capture ids, assign
+//   mousemux ws://localhost:41001       the MouseMux server: virtual user + input
+//   signal   wss://signal.mousemux.com  session codes and WebRTC signalling
+// The frames go peer to peer over WebRTC; input comes back on a data channel
+// and is handed to MouseMux as the virtual user, which owns the window in
+// this Chrome like anybody else.
+// ---------------------------------------------------------------------------
+const SIGNAL_URL = 'wss://signal.mousemux.com/ws';
+const MOUSEMUX_URL = 'ws://localhost:41001/';
+const log = (m) => { const el = document.getElementById('log'); el.textContent += m + '\n'; el.scrollTop = el.scrollHeight; };
+
+// A unique URL for this tab, so the control server ties capture ids to it.
+if (!location.hash) history.replaceState(null, '', location.pathname + '#' + Math.random().toString(36).slice(2));
+
+// --- control server (this Chrome) -------------------------------------------
+const control = new WebSocket(`ws://${location.host}/`);
+const controlWaiters = [];
+function controlAsk(msg) {
+  return new Promise((resolve) => { controlWaiters.push({ type: msg.type, resolve }); control.send(JSON.stringify(msg)); });
+}
+control.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  const i = controlWaiters.findIndex(w => w.type === msg.type || msg.type === 'error' || msg.type === 'ok');
+  if (i >= 0) controlWaiters.splice(i, 1)[0].resolve(msg);
+};
+control.onopen = async () => { log('control server connected'); refreshWindows(); setInterval(refreshWindows, 3000); };
+control.onerror = () => log('control server: connection failed');
+
+const shares = new Map();  // hwnd -> share
+async function refreshWindows() {
+  const msg = await controlAsk({ type: 'sources' });
+  if (msg.type !== 'sources') return;
+  const table = document.getElementById('windows');
+  for (const w of msg.windows) {
+    let row = document.getElementById('w' + w.hwnd);
+    if (!row) {
+      row = document.createElement('tr'); row.id = 'w' + w.hwnd;
+      row.innerHTML = `<td class="title"></td><td class="owner"></td><td><button>Share</button></td><td class="code"></td><td class="preview"></td>`;
+      row.querySelector('button').onclick = () => share(w.hwnd, row);
+      table.appendChild(row);
+    }
+    row.querySelector('.title').textContent = w.title || '(untitled)';
+    row.querySelector('.owner').textContent = w.owner || '';
+  }
+  for (const row of [...table.querySelectorAll('tr[id^=w]')]) {
+    if (!msg.windows.some(w => 'w' + w.hwnd === row.id)) row.remove();
+  }
+}
+
+// --- MouseMux server: one connection, one virtual user per share -------------
+let mmx = null, mmxReady = null;
+const mmxWaiters = [];
+function mmxConnect() {
+  if (mmxReady) return mmxReady;
+  mmxReady = new Promise((resolve, reject) => {
+    mmx = new WebSocket(MOUSEMUX_URL);
+    mmx.onopen = () => {
+      mmx.send(JSON.stringify({ type: 'client.login.request.A2M', appName: 'Chrome MouseMux host page', appVersion: '1', appBuildDate: '2026-09-05', sdkVersion: '2.2.35', sdkBuildDate: '2026-09-05' }));
+      log('mousemux connected'); resolve();
+    };
+    mmx.onerror = () => { log('mousemux: connection failed (is MouseMux running?)'); reject(new Error('mousemux')); };
+    mmx.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      for (let i = 0; i < mmxWaiters.length; i++) {
+        if (mmxWaiters[i].match(msg)) { mmxWaiters.splice(i, 1)[0].resolve(msg); return; }
+      }
+    };
+  });
+  return mmxReady;
+}
+function mmxSend(msg) { if (mmx && mmx.readyState === WebSocket.OPEN) mmx.send(JSON.stringify(msg)); }
+function mmxWait(match, ms = 3000) {
+  return new Promise((resolve, reject) => {
+    const w = { match, resolve }; mmxWaiters.push(w);
+    setTimeout(() => { const i = mmxWaiters.indexOf(w); if (i >= 0) { mmxWaiters.splice(i, 1); reject(new Error('mousemux: no reply')); } }, ms);
+  });
+}
+async function createVirtualUser() {
+  await mmxConnect();
+  const ids = mmxWait(m => m.hwid_ms !== undefined && m.hwid_kb !== undefined && /hwid/.test(m.type || ''));
+  mmxSend({ type: 'user.hwid.request.A2M' });
+  const got = await ids;
+  const created = mmxWait(m => /user\.create/.test(m.type || '') && (m.hwid_ms === got.hwid_ms || m.ok !== undefined));
+  mmxSend({ type: 'user.create.request.A2M', hwid_ms: got.hwid_ms, hwid_kb: got.hwid_kb });
+  await created;
+  log(`virtual user: mouse 0x${got.hwid_ms.toString(16)} keyboard 0x${got.hwid_kb.toString(16)}`);
+  return { hwid_ms: got.hwid_ms, hwid_kb: got.hwid_kb };
+}
+
+// --- signalling ---------------------------------------------------------------
+function connectSignalling(onPeer, onSignal) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(SIGNAL_URL);
+    let ice = { iceServers: [{ urls: ['stun:turn.mousemux.com:3478'] }] };
+    let myId = null;
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', userId: crypto.randomUUID(), systemId: '00000000-00000000-00000000-00000000-000000000000000000000000-000' }));
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      switch (msg.type) {
+        case 'welcome':
+          myId = msg.clientId;
+          if (Array.isArray(msg.iceServers) && msg.iceServers.length) ice = { iceServers: msg.iceServers };
+          ws.send(JSON.stringify({ type: 'create-session' }));
+          break;
+        case 'session-created': resolve({ ws, code: msg.sessionId, ice: () => ice, myId: () => myId }); break;
+        case 'auth-denied': reject(new Error('signalling: auth denied ' + (msg.reason || ''))); break;
+        case 'peer-connected': onPeer(msg.clientId); break;
+        case 'signal': onSignal(msg.fromId, msg.payload); break;
+      }
+    };
+    ws.onerror = () => reject(new Error('signalling: connection failed'));
+  });
+}
+
+// --- share one window -----------------------------------------------------------
+async function share(hwnd, row) {
+  const button = row.querySelector('button'); button.disabled = true;
+  try {
+    // 1. frames: a capture id for this window, then getUserMedia on it.
+    const cap = await controlAsk({ type: 'capture', hwnd, page: location.href });
+    if (cap.type !== 'capture') throw new Error('capture: ' + (cap.msg || 'refused'));
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: cap.id, maxWidth: 1920, maxHeight: 1200, maxFrameRate: 30 } }
+    });
+    const track = stream.getVideoTracks()[0];
+    if (track.contentHint !== undefined) track.contentHint = 'detail';  // text stays sharp
+    const preview = document.createElement('video'); preview.autoplay = true; preview.muted = true; preview.srcObject = stream;
+    row.querySelector('.preview').replaceChildren(preview);
+
+    // 2. the remote person's hands: a virtual user that owns this window.
+    const user = await createVirtualUser();
+    const assigned = await controlAsk({ type: 'assign', hwnd, hwid: user.hwid_ms });
+    if (assigned.type !== 'ok') throw new Error('assign: ' + (assigned.msg || 'refused'));
+
+    // 3. where the window is, kept fresh for coordinate mapping.
+    let rect = { x: cap.x, y: cap.y, width: cap.width, height: cap.height };
+    setInterval(async () => { const r = await controlAsk({ type: 'rect', hwnd }); if (r.type === 'rect') rect = r; }, 1000);
+
+    // 4. the session and, per viewer, a peer connection with the track and an input channel.
+    const peers = new Map();
+    const sig = await connectSignalling(async (peerId) => {
+      const pc = new RTCPeerConnection(sig.ice());
+      peers.set(peerId, pc);
+      pc.addTrack(track, stream);
+      const channel = pc.createDataChannel('input');
+      channel.onmessage = (ev) => onInput(JSON.parse(ev.data));
+      pc.onicecandidate = (ev) => { if (ev.candidate) sig.ws.send(JSON.stringify({ type: 'signal', targetId: peerId, payload: { type: 'ice-candidate', candidate: ev.candidate } })); };
+      pc.onconnectionstatechange = () => log(`viewer ${peerId}: ${pc.connectionState}`);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sig.ws.send(JSON.stringify({ type: 'signal', targetId: peerId, payload: { type: 'offer', sdp: pc.localDescription } }));
+    }, async (fromId, payload) => {
+      const pc = peers.get(fromId); if (!pc) return;
+      if (payload.type === 'answer') await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      else if (payload.type === 'ice-candidate' && payload.candidate) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+    });
+    row.querySelector('.code').textContent = sig.code;
+    log(`sharing "${row.querySelector('.title').textContent}" as ${sig.code}`);
+
+    // 5. viewer input -> MouseMux, as the virtual user.  Coordinates arrive
+    //    normalized to the video frame, which is the window rect.
+    const buttonFlag = (b, down) => (b === 2 ? (down ? 0x04 : 0x08) : b === 1 ? (down ? 0x10 : 0x20) : (down ? 0x01 : 0x02));
+    function onInput(m) {
+      switch (m.t) {
+        case 'm': mmxSend({ type: 'pointer.motion.request.A2M', hwid: user.hwid_ms, x: Math.round(rect.x + m.x * rect.width), y: Math.round(rect.y + m.y * rect.height) }); break;
+        case 'b': mmxSend({ type: 'pointer.motion.request.A2M', hwid: user.hwid_ms, x: Math.round(rect.x + m.x * rect.width), y: Math.round(rect.y + m.y * rect.height) });
+                  mmxSend({ type: 'pointer.button.request.A2M', hwid: user.hwid_ms, button: buttonFlag(m.b, m.d) }); break;
+        case 'w': mmxSend({ type: 'pointer.wheel.request.A2M', hwid: user.hwid_ms, delta: m.d }); break;
+        case 'k': mmxSend({ type: 'keyboard.key.request.A2M', hwid: user.hwid_kb, message: m.d ? 256 : 257, vkey: m.v, scan: 0, flags: 0 }); break;
+      }
+    }
+    shares.set(hwnd, { user, sig, peers });
+  } catch (e) {
+    log('share failed: ' + e.message);
+    button.disabled = false;
+  }
+}
+</script>

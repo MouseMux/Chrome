@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <fstream>
 #include <tuple>
+#include <algorithm>
 #include <vector>
 
 #include "base/command_line.h"
@@ -14,6 +15,7 @@
 #include "base/path_service.h"
 #include "base/process/launch.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/auto_reset.h"
 #include "base/functional/bind.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
@@ -37,7 +39,14 @@
 #include "ui/events/keycodes/dom/keycode_converter.h"
 #include "ui/events/keycodes/keyboard_code_conversion.h"
 #include "ui/events/keycodes/keyboard_codes.h"
+#include "base/task/single_thread_task_runner.h"
+#include "content/browser/web_contents/web_contents_impl.h"
+#include "content/public/browser/render_frame_host.h"
+#include "third_party/blink/public/mojom/input/input_event_result.mojom.h"
+#include "ui/aura/client/screen_position_client.h"
 #include "ui/aura/env.h"
+#include "ui/display/win/screen_win.h"
+#include "ui/gfx/geometry/point_conversions.h"
 #include "content/public/common/widget_type.h"
 #include "ui/aura/window.h"
 #include "ui/aura/window_tree_host.h"
@@ -48,6 +57,53 @@
 #include "ui/latency/latency_info.h"
 
 namespace content {
+
+// Defined in desktop_window_tree_host_win.cc, set by the dialog.  The
+// dialog and the help window belong to nobody: every user must be able to
+// click them, whatever window they own.
+extern HWND g_mousemux_dialog_hwnd;
+extern HWND g_mousemux_help_hwnd;
+
+// Defined in desktop_window_tree_host_win.cc.  While true, the views side
+// treats focus changes as ours: Activate() and ClearNativeFocus() do
+// nothing, so giving a page focus does not activate its OS window.
+extern bool g_mousemux_synthetic_key;
+
+// Defined in ui/display/win/screen_win.cc; see the comment there.  The
+// injected pointer position Chrome reports as "the mouse", per window.
+void MouseMuxVirtualCursorMoved(HWND window, int x, int y);
+void MouseMuxVirtualCursorForget(HWND window);
+void MouseMuxVirtualCursorsClear();
+
+// One rounding for every SDK position: floor.  Truncation rounds toward
+// zero, so on a monitor left of or above the primary (negative coordinates)
+// a point half a pixel from an edge landed on different sides of it in
+// different tests.
+gfx::Point ScreenPixelPoint(float x, float y) {
+  return gfx::ToFlooredPoint(gfx::PointF(x, y));
+}
+POINT ScreenPixelPOINT(float x, float y) {
+  const gfx::Point p = ScreenPixelPoint(x, y);
+  return {p.x(), p.y()};
+}
+
+// A MouseMux screen position (physical pixels, Windows' virtual screen) in
+// Chrome's scaled screen coordinates - the space GetViewBounds() reports.
+//
+// Not "pixels / scale".  Chrome lays monitors out edge to edge in scaled
+// units, so a monitor whose scaling differs from the primary's has a scaled
+// origin that is not its pixel origin divided by anything.  Dividing put a
+// pointer on a 100% monitor next to a 125% primary a few hundred units to
+// the right of where Chrome had it: the page hovered a menu the pointer was
+// nowhere near (customer screenshot, 2026-09-03), and the wheel scrolled
+// whatever sat at the shifted spot.  Right with one monitor, or with all
+// monitors at one scaling - which is why it took a third user on a third
+// monitor to show.
+static gfx::PointF ScreenPixelsToDIP(float screen_x, float screen_y) {
+  return display::win::GetScreenWin()->ScreenToDIPPoint(
+      gfx::PointF(screen_x, screen_y));
+}
+
 
 namespace {
 
@@ -150,11 +206,6 @@ void MouseMuxInputController::SetKeyboardEventCallback(
   keyboard_event_callback_ = std::move(callback);
 }
 
-void MouseMuxInputController::SetNativeBlockingChangedCallback(
-    NativeBlockingChangedCallback callback) {
-  native_blocking_changed_callback_ = std::move(callback);
-}
-
 void MouseMuxInputController::SetMenuDismissCallback(
     MenuDismissCallback callback) {
   menu_dismiss_callback_ = std::move(callback);
@@ -185,6 +236,9 @@ void MouseMuxInputController::ForgetViewEverywhere(
     if (state.drag_target_view == view) {
       state.drag_target_view = nullptr;
     }
+    if (state.last_wheel_view == view) {
+      state.last_wheel_view = nullptr;
+    }
     if (state.keyboard_target_view != view) {
       continue;
     }
@@ -206,12 +260,22 @@ void MouseMuxInputController::ForgetViewEverywhere(
     if (!IsOwner(hwid)) {
       continue;
     }
+    // The window is closing, but its HWND is still there: Chrome takes the
+    // pages down first and the frame after.  Judging the window by IsWindow
+    // here would keep the owner on an empty frame, so drop it explicitly and
+    // let the prune pick whatever else they own.
+    DeviceState& closing = StateFor(hwid);
+    std::erase(closing.owned_windows, closing.claimed_window);
+    closing.claimed_window = gfx::kNullAcceleratedWidget;
+    // Another window of theirs survives: that one becomes current.
+    if (PruneOwnedWindows(hwid)) {
+      continue;
+    }
     LogDebug(base::StringPrintf(
         "Window closed - releasing owner 0x%x", hwid));
     ReleaseOwnerHwid(hwid);
     DeviceState& state = StateFor(hwid);
     state.claimed_window = gfx::kNullAcceleratedWidget;
-    state.locked_window = gfx::kNullAcceleratedWidget;
   }
 }
 
@@ -269,6 +333,23 @@ void MouseMuxInputController::SetVisibilityChangedCallback(
   visibility_changed_callback_ = std::move(callback);
 }
 
+void MouseMuxInputController::SetNoticeCallback(NoticeCallback callback) {
+  notice_callback_ = std::move(callback);
+}
+
+void MouseMuxInputController::ClearUiCallbacks() {
+  notice_callback_.Reset();
+  debug_log_callback_.Reset();
+  ownership_changed_callback_.Reset();
+  connection_changed_callback_.Reset();
+  capture_changed_callback_.Reset();
+  keyboard_event_callback_.Reset();
+  menu_dismiss_callback_.Reset();
+  visibility_changed_callback_.Reset();
+  diagnostics_callback_.Reset();
+  active_view_for_window_callback_.Reset();
+}
+
 void MouseMuxInputController::SetDialogVisible(bool visible) {
   if (visible == dialog_visible_) {
     return;
@@ -303,10 +384,9 @@ bool MouseMuxInputController::CaptureOwnerHwid(int hwid) {
   }
   client_->SendCaptureRequest(hwid);
   state.captured = true;
-  is_captured_ = IsCaptured();
   LogDebug(base::StringPrintf("CaptureOwnerHwid: captured 0x%x", hwid));
   if (capture_changed_callback_) {
-    capture_changed_callback_.Run(is_captured_);
+    capture_changed_callback_.Run(IsCaptured());
   }
   return true;
 }
@@ -321,10 +401,9 @@ bool MouseMuxInputController::ReleaseCaptureHwid(int hwid) {
   }
   client_->SendCaptureRelease(hwid);
   state.captured = false;
-  is_captured_ = IsCaptured();
   LogDebug(base::StringPrintf("ReleaseCaptureHwid: released 0x%x", hwid));
   if (capture_changed_callback_) {
-    capture_changed_callback_.Run(is_captured_);
+    capture_changed_callback_.Run(IsCaptured());
   }
   return true;
 }
@@ -496,42 +575,24 @@ gfx::AcceleratedWidget ToplevelWindowOf(RenderWidgetHostViewAura* view) {
   return toplevel->GetHost()->GetAcceleratedWidget();
 }
 
-// Which monitor a window is on, as WINDOWS numbers them - the number in
-// Display Settings, which is the only one an operator can act on.
-//
-// The obvious approach, indexing into display::Screen::GetAllDisplays(), gives
-// a position in an arbitrarily ordered list: it reported "Screen 2" for a
-// window plainly sitting on screen 1.  The device name Windows attaches to the
-// monitor ("\\.\\DISPLAY2") carries the real number.
-//
-// Returns 0 when there is only one monitor, which is when the number is noise
-// rather than information.
-int ScreenNumberOf(gfx::AcceleratedWidget window) {
-  if (!window || !::IsWindow(window) || ::GetSystemMetrics(SM_CMONITORS) < 2) {
-    return 0;
+// The Win32 caption of a window: what the taskbar shows.  Empty when the
+// window is gone.
+std::u16string WindowCaptionOf(HWND hwnd) {
+  if (!hwnd || !::IsWindow(hwnd)) {
+    return std::u16string();
   }
-  HMONITOR monitor = ::MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
-  if (!monitor) {
-    return 0;
+  const int length = ::GetWindowTextLengthW(hwnd);
+  if (length <= 0) {
+    return std::u16string();
   }
-  MONITORINFOEXW info = {};
-  info.cbSize = sizeof(info);
-  if (!::GetMonitorInfoW(monitor, &info)) {
-    return 0;
+  std::wstring caption(static_cast<size_t>(length) + 1, L'\0');
+  const int copied = ::GetWindowTextW(hwnd, caption.data(),
+                                      static_cast<int>(caption.size()));
+  if (copied <= 0) {
+    return std::u16string();
   }
-  // "\\.\\DISPLAY3" -> 3.  Read from the end: the digits are the only part
-  // that varies, and the prefix is not worth parsing.
-  std::wstring device(info.szDevice);
-  size_t digits = device.find_last_not_of(L"0123456789");
-  if (digits == std::wstring::npos || digits + 1 >= device.size()) {
-    return 0;
-  }
-  int number = 0;
-  if (!base::StringToInt(base::WideToUTF8(device.substr(digits + 1)),
-                         &number)) {
-    return 0;
-  }
-  return number;
+  caption.resize(static_cast<size_t>(copied));
+  return base::WideToUTF16(caption);
 }
 
 // The title of the window a view lives in, for the operator to read.  Empty
@@ -563,22 +624,7 @@ std::u16string ToplevelTitleOf(RenderWidgetHostViewAura* view) {
   if (!host) {
     return title;
   }
-  HWND hwnd = host->GetAcceleratedWidget();
-  if (!hwnd || !::IsWindow(hwnd)) {
-    return title;
-  }
-  const int length = ::GetWindowTextLengthW(hwnd);
-  if (length <= 0) {
-    return title;
-  }
-  std::wstring caption(static_cast<size_t>(length) + 1, L'\0');
-  const int copied = ::GetWindowTextW(hwnd, caption.data(),
-                                      static_cast<int>(caption.size()));
-  if (copied <= 0) {
-    return title;
-  }
-  caption.resize(static_cast<size_t>(copied));
-  return base::WideToUTF16(caption);
+  return WindowCaptionOf(host->GetAcceleratedWidget());
 }
 
 }  // namespace
@@ -657,29 +703,18 @@ bool MouseMuxInputController::LaunchAdditionalSeat() {
   return true;
 }
 
-void MouseMuxInputController::SetHardLock(bool enabled) {
-  if (hard_lock_ == enabled) {
-    return;
-  }
-  hard_lock_ = enabled;
-  if (!enabled) {
-    // Forget assignments on the way out, so turning it back on re-locks people
-    // to where they ARE rather than to a window they left long ago.
-    for (auto& [hwid, state] : device_state_) {
-      state.locked_window = gfx::kNullAcceleratedWidget;
-    }
-  }
-  LogDebug(base::StringPrintf("SetHardLock(%s)", enabled ? "true" : "false"));
-}
-
 bool MouseMuxInputController::ShouldSuppressBlur(
     RenderWidgetHostViewAura* view) const {
   if (!view || !registered_views_.count(view)) {
     return false;
   }
-  // Only while someone is captured — see the header for why capture is the
-  // right condition and OS focus is not.
-  return IsCaptured();
+  // While someone is captured, or when the view sits in an owned window.
+  // Under ownership routing, OS activation carries no information about who
+  // is working where - it moves with whichever real mouse last clicked
+  // something - and every change of it blurred the deactivated window's page
+  // and killed a caret somebody was typing behind (2026-09-04 21:12, nobody
+  // captured: thirteen blurs in three minutes).
+  return IsCaptured() || OwnerOfWindow(ToplevelWindowOf(view)) != -1;
 }
 
 std::vector<MouseMuxInputController::OwnerInfo>
@@ -714,24 +749,24 @@ MouseMuxInputController::GetOwners() const {
         }
       }
 
-      // Report the window this user is TYPING in — the keyboard target — which
-      // is what "where is this user working" means to an operator.
-      RenderWidgetHostViewAura* view = state_it->second.keyboard_target_view;
-      if (view && registered_views_.count(view)) {
-        if (aura::Window* native = view->GetNativeView()) {
-          if (aura::Window* toplevel = native->GetToplevelWindow()) {
-            // Through the helper, which falls back to the Win32 caption: a
-            // browser window's aura title is empty, and reading it directly
-            // here is why every row still said "(untitled window)" after the
-            // fallback was written.  One title function, not two.
-            info.window_title = ToplevelTitleOf(view);
-            info.has_window = true;
-            if (aura::WindowTreeHost* host = toplevel->GetHost()) {
-              info.window = host->GetAcceleratedWidget();
-            }
-            info.screen_index = ScreenNumberOf(info.window);
+      info.block_native = state_it->second.block_native;
+
+      // The window this user's input goes to - the current one - which is
+      // what "where is this user working" means to an operator.  Read from
+      // the window itself: the view they last clicked is a tab, and a tab
+      // can be gone or in another window while the user is still here.
+      const gfx::AcceleratedWidget window = state_it->second.claimed_window;
+      if (window && ::IsWindow(window)) {
+        info.window = window;
+        info.window_title = WindowCaptionOf(window);
+        info.has_window = true;
+        int alive = 0;
+        for (gfx::AcceleratedWidget owned : state_it->second.owned_windows) {
+          if (owned && ::IsWindow(owned)) {
+            ++alive;
           }
         }
+        info.extra_windows = alive > 1 ? alive - 1 : 0;
       }
     }
     out.push_back(std::move(info));
@@ -852,11 +887,10 @@ std::string MouseMuxInputController::GetInjectionStats() const {
   std::string out;
   for (const auto& [hwid, s] : injection_stats_) {
     out += base::StringPrintf(
-        " | inject 0x%x fwd=%d ins=%d no_host=%d ignoring=%d dead=%d "
+        " | inject 0x%x keys=%d chars=%d no_host=%d dead=%d "
         "view_focus=%d page_focus=%d",
-        hwid, s.forwarded, s.inserted, s.no_host, s.host_ignoring,
-        s.renderer_dead, s.last_view_focused ? 1 : 0,
-        s.last_page_focused ? 1 : 0);
+        hwid, s.posted_keys, s.posted_chars, s.no_host, s.renderer_dead,
+        s.last_view_focused ? 1 : 0, s.last_page_focused ? 1 : 0);
   }
   return out;
 }
@@ -894,7 +928,7 @@ bool MouseMuxInputController::CaptureOwner() {
     LogDebug("CaptureOwner: No owner to capture");
     return false;
   }
-  if (is_captured_) {
+  if (IsCaptured()) {
     LogDebug("CaptureOwner: Already captured");
     return false;
   }
@@ -910,7 +944,6 @@ bool MouseMuxInputController::CaptureOwner() {
         StateFor(hwid).captured = true;
       }
     }
-    is_captured_ = true;
     // Capture tells the server to stop sending native input for the captured
     // device.  SDK WebSocket events keep flowing as before, so we do NOT
     // change native-input blocking here.
@@ -924,16 +957,8 @@ bool MouseMuxInputController::CaptureOwner() {
 }
 
 bool MouseMuxInputController::ReleaseCapture() {
-  if (!is_captured_) {
+  if (!IsCaptured()) {
     LogDebug("ReleaseCapture: Not captured");
-    return false;
-  }
-  if (!HasAnyOwner()) {
-    // Edge case: owner was released but capture state wasn't cleared.
-    is_captured_ = false;
-    if (capture_changed_callback_) {
-      capture_changed_callback_.Run(false);
-    }
     return false;
   }
   if (client_) {
@@ -943,7 +968,6 @@ bool MouseMuxInputController::ReleaseCapture() {
         StateFor(hwid).captured = false;
       }
     }
-    is_captured_ = false;
     // Release tells the server to resume native input for the device.
     // SDK WebSocket events keep flowing throughout, so no blocking changes.
     LogDebug(base::StringPrintf("ReleaseCapture: Released hwid=0x%x", owner_hwid_));
@@ -959,10 +983,6 @@ void MouseMuxInputController::AddOwner(int hwid) {
   if (hwid == -1 || IsOwner(hwid)) {
     return;
   }
-#ifndef MOUSEMUX_MULTI_OWNER
-  // Single-owner: claiming replaces whoever held it.
-  owners_.clear();
-#endif
   owners_.insert(hwid);
   if (owner_hwid_ == -1) {
     owner_hwid_ = hwid;
@@ -970,6 +990,7 @@ void MouseMuxInputController::AddOwner(int hwid) {
   // Clear only the incoming owner's button state: another device's held
   // buttons are none of this owner's business.
   StateFor(hwid).button_state = 0;
+  NoteSdkButtonState();
   LogDebug(base::StringPrintf("AddOwner: hwid=0x%x (owners now %zu, primary 0x%x)",
                               hwid, owners_.size(), owner_hwid_));
   NotifyOwnershipChanged();
@@ -980,7 +1001,14 @@ void MouseMuxInputController::RemoveOwner(int hwid) {
     return;
   }
   owners_.erase(hwid);
+  for (gfx::AcceleratedWidget owned : StateFor(hwid).owned_windows) {
+    MouseMuxVirtualCursorForget(owned);
+  }
+  if (owners_.empty()) {
+    MouseMuxVirtualCursorsClear();
+  }
   StateFor(hwid).button_state = 0;
+  NoteSdkButtonState();
   // The primary leaving promotes someone else rather than reporting "no
   // owner" while other users are still working.
   if (owner_hwid_ == hwid) {
@@ -1012,6 +1040,72 @@ bool MouseMuxInputController::SetOwnerByName(const std::string& name) {
   return false;
 }
 
+bool MouseMuxInputController::AssignWindow(const std::string& name,
+                                           gfx::AcceleratedWidget window,
+                                           bool captured,
+                                           bool block_native) {
+  if (!window || !::IsWindow(window)) {
+    LogDebug("AssignWindow: no such window for '" + name + "'");
+    return false;
+  }
+  int hwid = -1;
+  for (const auto& [mouse_hwid, info] : user_info_) {
+    if (info.name == name) {
+      hwid = mouse_hwid;
+      break;
+    }
+  }
+  if (hwid == -1) {
+    LogDebug("AssignWindow: user '" + name + "' is not in the user list");
+    return false;
+  }
+  return AssignWindowToHwid(hwid, window, captured, block_native);
+}
+
+bool MouseMuxInputController::AssignWindowToHwid(int hwid,
+                                                 gfx::AcceleratedWidget window,
+                                                 bool captured,
+                                                 bool block_native) {
+  if (!window || !::IsWindow(window) || hwid == -1) {
+    return false;
+  }
+  const int other = OwnerOfWindow(window);
+  if (other != -1 && other != hwid) {
+    LogDebug(base::StringPrintf(
+        "AssignWindow: window %p is owned by 0x%x, not given to 0x%x",
+        static_cast<void*>(window), other, hwid));
+    return false;
+  }
+  AddOwner(hwid);
+  if (!ClaimForPress(hwid, window, nullptr)) {
+    return false;
+  }
+  LogDebug(base::StringPrintf("AssignWindow: '%s' (0x%x) -> %p captured=%d block=%d",
+                              UserNameOf(hwid).c_str(), hwid,
+                              static_cast<void*>(window), captured ? 1 : 0,
+                              block_native ? 1 : 0));
+  SetOwnerBlockNative(hwid, block_native);
+  if (captured) {
+    CaptureOwnerHwid(hwid);
+  } else {
+    ReleaseCaptureHwid(hwid);
+  }
+  return true;
+}
+
+std::vector<gfx::AcceleratedWidget> MouseMuxInputController::KnownWindows()
+    const {
+  std::vector<gfx::AcceleratedWidget> out;
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    const gfx::AcceleratedWidget window = ToplevelWindowOf(view);
+    if (window && ::IsWindow(window) &&
+        std::find(out.begin(), out.end(), window) == out.end()) {
+      out.push_back(window);
+    }
+  }
+  return out;
+}
+
 void MouseMuxInputController::ReleaseOwnerHwid(int hwid) {
   if (!IsOwner(hwid)) {
     return;
@@ -1021,13 +1115,17 @@ void MouseMuxInputController::ReleaseOwnerHwid(int hwid) {
   // nothing driving it.
   ReleaseCaptureHwid(hwid);
   RemoveOwner(hwid);
+  DeviceState& state = StateFor(hwid);
+  state.owned_windows.clear();
+  state.claimed_window = gfx::kNullAcceleratedWidget;
+  state.keyboard_target_view = nullptr;
 }
 
 void MouseMuxInputController::ReleaseOwnership() {
   LogDebug(base::StringPrintf("ReleaseOwnership: hwid=0x%x", owner_hwid_));
 
   // Release capture first if captured.
-  if (is_captured_) {
+  if (IsCaptured()) {
     ReleaseCapture();
   }
 
@@ -1035,9 +1133,15 @@ void MouseMuxInputController::ReleaseOwnership() {
   // server's owner:null, both of which mean "hand Chrome back", not "drop one
   // of several users".  Per-owner release is RemoveOwner().
   for (int hwid : owners_) {
-    StateFor(hwid).button_state = 0;
+    DeviceState& state = StateFor(hwid);
+    state.button_state = 0;
+    state.owned_windows.clear();
+    state.claimed_window = gfx::kNullAcceleratedWidget;
+    state.keyboard_target_view = nullptr;
+    NoteSdkButtonState();
   }
   owners_.clear();
+  MouseMuxVirtualCursorsClear();
   owner_hwid_ = -1;
   NotifyOwnershipChanged();
 }
@@ -1054,6 +1158,8 @@ std::string MouseMuxInputController::GetOwnerName() const {
 }
 
 void MouseMuxInputController::NotifyOwnershipChanged() {
+  // Ownership decides which windows drop native input.
+  ApplyNativeBlocking();
   if (ownership_changed_callback_) {
     std::string name = GetOwnerName();
     ownership_changed_callback_.Run(owner_hwid_, name);
@@ -1072,10 +1178,6 @@ void MouseMuxInputController::LogDebug(const std::string& message) {
 void MouseMuxInputController::SetNativeInputBlocked(bool blocked) {
   native_input_blocked_ = blocked;
 
-  if (native_blocking_changed_callback_) {
-    native_blocking_changed_callback_.Run(blocked);
-  }
-
 #ifdef MOUSEMUX_NATIVE_BLOCK
   // Defined in desktop_window_tree_host_win.cc inside namespace content —
   // blocks native mouse button messages at the views/aura layer.
@@ -1087,16 +1189,69 @@ void MouseMuxInputController::SetNativeInputBlocked(bool blocked) {
                                blocked ? "true" : "false",
                                registered_views_.size()));
 
-  // Update all registered views - block both mouse and keyboard.
-  for (RenderWidgetHostViewAura* view : registered_views_) {
-    if (view && view->event_handler()) {
-      view->event_handler()->SetNativeMouseInputBlocked(blocked);
-      view->event_handler()->SetNativeKeyboardInputBlocked(blocked);
-#ifdef MOUSEMUX_DEBUG
-      LogDebug("  - Updated view event handler (mouse + keyboard)");
-#endif
+  ApplyNativeBlocking();
+}
+
+void MouseMuxInputController::SetOwnerBlockNative(int hwid, bool block) {
+  StateFor(hwid).block_native = block;
+  LogDebug(base::StringPrintf("SetOwnerBlockNative: hwid=0x%x block=%d", hwid,
+                              block ? 1 : 0));
+  NotifyOwnershipChanged();  // applies the blocking
+}
+
+void MouseMuxInputController::ApplyNativeBlocking() {
+#ifdef MOUSEMUX_NATIVE_BLOCK
+  // Both defined in desktop_window_tree_host_win.cc inside namespace content.
+  extern bool g_mousemux_native_input_blocked;
+  extern std::set<HWND>* g_mousemux_blocked_windows;
+  if (!g_mousemux_blocked_windows) {
+    g_mousemux_blocked_windows = new std::set<HWND>();
+  }
+  g_mousemux_blocked_windows->clear();
+  for (const auto& entry : device_state_) {
+    if (!IsOwner(entry.first) || !entry.second.block_native) {
+      continue;
+    }
+    for (gfx::AcceleratedWidget owned : entry.second.owned_windows) {
+      if (owned && ::IsWindow(owned)) {
+        g_mousemux_blocked_windows->insert(owned);
+      }
     }
   }
+  const bool everything = g_mousemux_native_input_blocked;
+#else
+  const bool everything = native_input_blocked_;
+#endif
+  for (RenderWidgetHostViewAura* view : registered_views_) {
+    if (!view || !view->event_handler()) {
+      continue;
+    }
+    bool blocked = everything;
+#ifdef MOUSEMUX_NATIVE_BLOCK
+    if (!blocked) {
+      const gfx::AcceleratedWidget window = ToplevelWindowOf(view);
+      blocked = window && g_mousemux_blocked_windows->count(window) > 0;
+    }
+#endif
+    view->event_handler()->SetNativeMouseInputBlocked(blocked);
+    view->event_handler()->SetNativeKeyboardInputBlocked(blocked);
+#ifdef MOUSEMUX_DEBUG
+    LogDebug(base::StringPrintf(
+        "BLOCKING: view=%p host=%p window=%p blocked=%d",
+        static_cast<void*>(view), static_cast<void*>(view->GetRenderWidgetHost()),
+        static_cast<void*>(ToplevelWindowOf(view)), blocked ? 1 : 0));
+#endif
+  }
+#if defined(MOUSEMUX_DEBUG) && defined(MOUSEMUX_NATIVE_BLOCK)
+  std::string windows;
+  for (HWND w : *g_mousemux_blocked_windows) {
+    windows += base::StringPrintf(" %p(%s)", static_cast<void*>(w),
+                                  OwnerNameOfWindow(w).c_str());
+  }
+  LogDebug(base::StringPrintf("BLOCKING: global=%d blocked windows:%s",
+                              everything ? 1 : 0,
+                              windows.empty() ? " none" : windows.c_str()));
+#endif
 }
 
 void MouseMuxInputController::SetMouseMuxEnabled(bool enabled) {
@@ -1164,25 +1319,356 @@ void MouseMuxInputController::RegisterView(RenderWidgetHostViewAura* view) {
     return;
 
   registered_views_.insert(view);
-
-  // Don't call GetViewBounds() here - view may not be fully initialized.
-  // Just log the count.
-  LogDebug(base::StringPrintf("RegisterView: now %zu views", registered_views_.size()));
-
-  // Apply current blocking state for both mouse and keyboard.
-  if (view->event_handler()) {
-    view->event_handler()->SetNativeMouseInputBlocked(native_input_blocked_);
-    view->event_handler()->SetNativeKeyboardInputBlocked(native_input_blocked_);
+  if (RenderWidgetHost* host = view->GetRenderWidgetHost()) {
+    host->AddInputEventObserver(this);
   }
+  // Adopts the window if it is new and somebody's, and applies the blocking
+  // state to this view either way - now if its window exists, else when the
+  // retry finds it.
+  MaybeAdoptNewWindow(view, /*retry=*/true);
+
+  LogDebug(base::StringPrintf("RegisterView: now %zu views view=%p host=%p",
+                              registered_views_.size(),
+                              static_cast<void*>(view),
+                              static_cast<void*>(view->GetRenderWidgetHost())));
 }
 
 void MouseMuxInputController::UnregisterView(RenderWidgetHostViewAura* view) {
   registered_views_.erase(view);
+  if (view) {
+    if (RenderWidgetHost* host = view->GetRenderWidgetHost()) {
+      host->RemoveInputEventObserver(this);
+    }
+  }
   // Clear pointers that reference the unregistered view to prevent
   // dangling pointer access.
   ForgetViewEverywhere(view);
   pending_since_.erase(view);
+  adopt_pending_.erase(view);
   LogDebug(base::StringPrintf("UnregisterView: now %zu views", registered_views_.size()));
+}
+
+int MouseMuxInputController::OwnerOfWindow(
+    gfx::AcceleratedWidget window) const {
+  if (!window) {
+    return -1;
+  }
+  for (const auto& entry : device_state_) {
+    if (!IsOwner(entry.first)) {
+      continue;
+    }
+    for (gfx::AcceleratedWidget owned : entry.second.owned_windows) {
+      // A handle whose window is gone owns nothing: Windows reuses handles,
+      // and a new window with an old one must not report the old owner.
+      if (owned == window && ::IsWindow(owned)) {
+        return entry.first;
+      }
+    }
+  }
+  return -1;
+}
+
+std::string MouseMuxInputController::OwnerNameOfWindow(
+    gfx::AcceleratedWidget window) const {
+  const int hwid = OwnerOfWindow(window);
+  return hwid == -1 ? std::string() : UserNameOf(hwid);
+}
+
+void MouseMuxInputController::AdoptWindow(int hwid,
+                                          gfx::AcceleratedWidget window) {
+  if (!window) {
+    return;
+  }
+  DeviceState& state = StateFor(hwid);
+  for (gfx::AcceleratedWidget owned : state.owned_windows) {
+    if (owned == window) {
+      return;
+    }
+  }
+  state.owned_windows.push_back(window);
+  LogDebug(base::StringPrintf("ADOPT: hwid=0x%x user=%s window=%p (now %zu)",
+                              hwid, UserNameOf(hwid).c_str(),
+                              static_cast<void*>(window),
+                              state.owned_windows.size()));
+  // The dialog refreshes rows and window captions on this.
+  NotifyOwnershipChanged();
+}
+
+bool MouseMuxInputController::ClaimForPress(int hwid,
+                                            gfx::AcceleratedWidget window,
+                                            RenderWidgetHostViewAura* page) {
+  if (!window) {
+    return false;
+  }
+  const int other = OwnerOfWindow(window);
+  if (other != -1 && other != hwid) {
+    return false;
+  }
+  DeviceState& state = StateFor(hwid);
+  if (!page) {
+    page = ActiveWebViewInWindow(window);
+  }
+  if (page) {
+    state.keyboard_target_view = page;
+  }
+  state.claimed_window = window;
+  AdoptWindow(hwid, window);
+  return true;
+}
+
+bool MouseMuxInputController::PruneOwnedWindows(int hwid) {
+  DeviceState& state = StateFor(hwid);
+  std::vector<gfx::AcceleratedWidget> alive;
+  for (gfx::AcceleratedWidget owned : state.owned_windows) {
+    if (owned && ::IsWindow(owned)) {
+      alive.push_back(owned);
+    }
+  }
+  state.owned_windows = alive;
+  if (state.claimed_window && ::IsWindow(state.claimed_window)) {
+    return true;
+  }
+  const gfx::AcceleratedWidget was = state.claimed_window;
+  state.claimed_window = gfx::kNullAcceleratedWidget;
+  if (alive.empty()) {
+    return false;
+  }
+  state.claimed_window = alive.back();
+  if (RenderWidgetHostViewAura* page = ActiveWebViewInWindow(alive.back())) {
+    state.keyboard_target_view = page;
+  }
+  LogDebug(base::StringPrintf(
+      "CURRENT: hwid=0x%x window %p closed, now %p", hwid,
+      static_cast<void*>(was), static_cast<void*>(alive.back())));
+  return true;
+}
+
+void MouseMuxInputController::RetryPendingAdoptions() {
+  const auto pending = std::move(adopt_pending_);
+  adopt_pending_.clear();
+  for (RenderWidgetHostViewAura* view : pending) {
+    if (registered_views_.count(view)) {
+      MaybeAdoptNewWindow(view, /*retry=*/false);
+    }
+  }
+}
+
+void MouseMuxInputController::MaybeAdoptNewWindow(
+    RenderWidgetHostViewAura* view,
+    bool retry) {
+  if (!view || !registered_views_.count(view)) {
+    return;
+  }
+  const gfx::AcceleratedWidget window = ToplevelWindowOf(view);
+  if (!window) {
+    // The HWND is not there yet; look again shortly.  The view is remembered
+    // in a set the unregister path erases from, rather than bound into the
+    // task: a pointer held across the delay could be freed and reused by a
+    // different view in the meantime.
+    if (retry) {
+      const bool first = adopt_pending_.empty();
+      adopt_pending_.insert(view);
+      if (first) {
+        base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+            FROM_HERE,
+            base::BindOnce(&MouseMuxInputController::RetryPendingAdoptions,
+                           base::Unretained(this)),
+            base::Milliseconds(200));
+      }
+    }
+    return;
+  }
+  // The view has a window now, which it did not at RegisterView time when
+  // the view of a new tab is created before it is attached; the blocking
+  // state was computed then with window=(nil) and left the tab open to the
+  // real mouse (measured 2026-09-04 20:41: native wheel reaching the
+  // second tab of a blocked window).  Recompute now that it is known -
+  // here when nothing is adopted below; adoption recomputes on its own.
+  if (OwnerOfWindow(window) != -1) {
+    ApplyNativeBlocking();
+    return;
+  }
+  int owner = -1;
+  const char* reason = "";
+  // 1. The window that opened this one has an owner: it is theirs.  Login
+  //    popups, links into a new window, print windows.
+  if (RenderWidgetHostImpl* host =
+          RenderWidgetHostImpl::From(view->GetRenderWidgetHost())) {
+    if (WebContentsImpl* contents =
+            WebContentsImpl::FromRenderWidgetHostImpl(host)) {
+      if (RenderFrameHost* opener = contents->GetOpener()) {
+        if (RenderWidgetHostView* opener_view = opener->GetView()) {
+          owner = OwnerOfWindow(ToplevelWindowOf(
+              static_cast<RenderWidgetHostViewAura*>(opener_view)));
+          reason = "opener";
+        }
+      }
+    }
+  }
+  // 2. No opener (Ctrl+N, the menu): the user whose input arrived last, and
+  //    recently, made it.
+  if (owner == -1) {
+    const base::TimeTicks now = base::TimeTicks::Now();
+    base::TimeTicks best;
+    for (const auto& entry : device_state_) {
+      if (!IsOwner(entry.first) || entry.second.last_input_time.is_null()) {
+        continue;
+      }
+      if (now - entry.second.last_input_time > base::Seconds(2)) {
+        continue;
+      }
+      if (entry.second.last_input_time > best) {
+        best = entry.second.last_input_time;
+        owner = entry.first;
+        reason = "recent-input";
+      }
+    }
+  }
+  if (owner == -1) {
+    LogDebug(base::StringPrintf("ADOPT: window %p is nobody's (no opener, "
+                                "no recent input)",
+                                static_cast<void*>(window)));
+    ApplyNativeBlocking();
+    return;
+  }
+  LogDebug(base::StringPrintf("ADOPT: window %p -> hwid=0x%x (%s)",
+                              static_cast<void*>(window), owner, reason));
+  AdoptWindow(owner, window);
+}
+
+std::string MouseMuxInputController::UserNameOf(int hwid) const {
+  for (const auto& entry : user_info_) {
+    if (entry.second.hwid_mouse == hwid || entry.second.hwid_keyboard == hwid) {
+      return entry.second.name.empty() ? "(unnamed)" : entry.second.name;
+    }
+  }
+  return "?";
+}
+
+#ifdef MOUSEMUX_DEBUG
+namespace {
+
+// Every 50th mouse move per key, so the hot path stays cheap and the log
+// stays readable while still showing that moves flow.
+bool EveryFiftieth(std::map<intptr_t, int>& counters, intptr_t key) {
+  return (++counters[key] % 50) == 1;
+}
+std::map<intptr_t, int>& MoveLogCounters() {
+  static base::NoDestructor<std::map<intptr_t, int>> counters;
+  return *counters;
+}
+
+const char* AckStateName(blink::mojom::InputEventResultState state) {
+  switch (state) {
+    case blink::mojom::InputEventResultState::kConsumed:
+      return "consumed";
+    case blink::mojom::InputEventResultState::kNotConsumed:
+      return "not-consumed";
+    case blink::mojom::InputEventResultState::kNoConsumerExists:
+      return "NO-CONSUMER";
+    case blink::mojom::InputEventResultState::kIgnored:
+      return "IGNORED";
+    case blink::mojom::InputEventResultState::kSetNonBlocking:
+      return "non-blocking";
+    case blink::mojom::InputEventResultState::kUnknown:
+      return "unknown";
+    default:
+      return "other";
+  }
+}
+
+const char* AckSourceName(blink::mojom::InputEventResultSource source) {
+  switch (source) {
+    case blink::mojom::InputEventResultSource::kCompositorThread:
+      return "compositor";
+    case blink::mojom::InputEventResultSource::kMainThread:
+      return "main-thread";
+    case blink::mojom::InputEventResultSource::kBrowser:
+      return "browser";
+    default:
+      return "unknown";
+  }
+}
+
+// Cross-process frames in the page this host belongs to: input handed to
+// the main frame's host cannot reach content rendered by another process.
+int CrossProcessFrameCount(RenderWidgetHostImpl* host) {
+  WebContentsImpl* contents = WebContentsImpl::FromRenderWidgetHostImpl(host);
+  if (!contents) {
+    return -1;
+  }
+  int count = 0;
+  contents->ForEachRenderFrameHost([&count](RenderFrameHost* frame) {
+    if (frame->IsCrossProcessSubframe()) {
+      ++count;
+    }
+  });
+  return count;
+}
+
+}  // namespace
+#endif  // MOUSEMUX_DEBUG
+
+void MouseMuxInputController::OnInputEvent(const RenderWidgetHost& host,
+                                           const blink::WebInputEvent& event,
+                                           InputEventSource /*source*/) {
+#ifdef MOUSEMUX_DEBUG
+  extern bool g_mousemux_in_custom_dispatch;
+  const blink::WebInputEvent::Type type = event.GetType();
+  if (type == blink::WebInputEvent::Type::kMouseMove &&
+      !EveryFiftieth(MoveLogCounters(),
+                     reinterpret_cast<intptr_t>(&host) ^ 0x1)) {
+    return;
+  }
+  const char* origin =
+      (event.GetModifiers() & blink::WebInputEvent::kFromDebugger)
+          ? "injected-page"
+          : (g_mousemux_in_custom_dispatch ? "injected-ui" : "NATIVE");
+  std::string where;
+  if (blink::WebInputEvent::IsMouseEventType(type) ||
+      type == blink::WebInputEvent::Type::kMouseWheel) {
+    const auto& mouse = static_cast<const blink::WebMouseEvent&>(event);
+    where = base::StringPrintf(" widget=(%.1f,%.1f)",
+                               mouse.PositionInWidget().x(),
+                               mouse.PositionInWidget().y());
+  }
+  LogDebug(base::StringPrintf("FWD %s: %s host=%p%s",
+                              blink::WebInputEvent::GetName(type), origin,
+                              static_cast<const void*>(&host), where.c_str()));
+#endif
+}
+
+void MouseMuxInputController::OnInputEventAck(
+    const RenderWidgetHost& host,
+    blink::mojom::InputEventResultSource source,
+    blink::mojom::InputEventResultState state,
+    const blink::WebInputEvent& event) {
+#ifdef MOUSEMUX_DEBUG
+  const blink::WebInputEvent::Type type = event.GetType();
+  const bool ours =
+      (event.GetModifiers() & blink::WebInputEvent::kFromDebugger) != 0;
+  if (type == blink::WebInputEvent::Type::kMouseMove &&
+      !EveryFiftieth(MoveLogCounters(), reinterpret_cast<intptr_t>(&host))) {
+    return;
+  }
+  std::string where;
+  if (blink::WebInputEvent::IsMouseEventType(type)) {
+    const auto& mouse = static_cast<const blink::WebMouseEvent&>(event);
+    where = base::StringPrintf(" widget=(%.1f,%.1f)", mouse.PositionInWidget().x(),
+                               mouse.PositionInWidget().y());
+  } else if (type == blink::WebInputEvent::Type::kMouseWheel) {
+    const auto& wheel = static_cast<const blink::WebMouseWheelEvent&>(event);
+    where = base::StringPrintf(" widget=(%.1f,%.1f) delta=(%.1f,%.1f) phase=%d",
+                               wheel.PositionInWidget().x(),
+                               wheel.PositionInWidget().y(), wheel.delta_x,
+                               wheel.delta_y, static_cast<int>(wheel.phase));
+  }
+  LogDebug(base::StringPrintf(
+      "ACK %s: %s via %s host=%p ours=%d%s",
+      blink::WebInputEvent::GetName(type), AckStateName(state),
+      AckSourceName(source), static_cast<const void*>(&host), ours ? 1 : 0,
+      where.c_str()));
+#endif
 }
 
 void MouseMuxInputController::OnMouseMotion(int hwid, float x, float y) {
@@ -1193,9 +1679,6 @@ void MouseMuxInputController::OnMouseMotion(int hwid, float x, float y) {
   // loud failure.
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
 
-  // Update position tracking for this hwid.
-  user_positions_[hwid] = {x, y};
-  motion_count_++;
 
   // If no owner yet, don't inject motion events.
   if (!HasAnyOwner()) {
@@ -1270,8 +1753,6 @@ void MouseMuxInputController::OnPenMotion(int hwid,
 
   // From here this mirrors OnMouseMotion exactly — the pen metadata above is
   // applied later, at injection time, by ApplyPointerProperties.
-  user_positions_[hwid] = {x, y};
-  motion_count_++;
 
   // If no owner yet, don't inject motion events.
   if (!HasAnyOwner()) {
@@ -1349,20 +1830,12 @@ void MouseMuxInputController::OnMouseButton(int hwid,
       registered_views_.size()));
 #endif
 
-  // Update position tracking.
-  user_positions_[hwid] = {x, y};
 
   // Check if this is a click that should claim ownership.
   // Only left-down claims ownership.
-  //
-  // With MULTI_OWNER, ANY unclaimed device claims by clicking, so each user
-  // joins by clicking their own window.  Without it, only the very first
-  // device can claim, exactly as before.
-#ifdef MOUSEMUX_MULTI_OWNER
+  // Any device that is not yet an owner claims by clicking, so each user
+  // joins by clicking their own window.
   const bool may_claim = !IsOwner(hwid);
-#else
-  const bool may_claim = !HasAnyOwner();
-#endif
   if (may_claim && (data & kLeftDown)) {
     MMTRACE("CTRL/Claim", "attempting claim hwid=%d at (%.0f,%.0f) views=%zu",
             hwid, x, y, registered_views_.size());
@@ -1372,24 +1845,32 @@ void MouseMuxInputController::OnMouseButton(int hwid,
       return;
     }
 
-    // Check if cursor is over Chrome using hit-test.
-    RenderWidgetHostViewAura* hit_view = FindViewAtPoint(x, y);
-    MMTRACE("CTRL/Claim", "hit-test at (%.0f,%.0f) -> %s", x, y,
-            hit_view ? "view found" : "NO VIEW (will use fallback)");
-    if (hit_view) {
-      AddOwner(hwid);
-      LogDebug(base::StringPrintf("OWNER SET via hit-test: hwid=0x%x", hwid));
-    } else {
-      // Hit-test failed, but we have views. Log why and try alternative.
-      LogDebug("Hit-test failed. Trying coordinate-agnostic ownership claim...");
-
-      // Alternative: Check if we should claim ownership anyway.
-      // If the user has enabled MouseMux and is clicking, they probably want it to work.
-      // Claim ownership and use the first view.
-      AddOwner(hwid);
-      LogDebug(base::StringPrintf(
-          "OWNER SET via fallback (hit-test failed but views exist): hwid=0x%x", hwid));
+    // Same rule as the routing below: the window Windows would give a real
+    // click to.  A window of ours that nobody owns goes to this user; one
+    // that someone else owns, the desktop, another program, or our own
+    // dialog claims nothing.  The old rectangle test claimed on a miss too,
+    // which made an owner with no window who then hovered everyone's pages.
+    const POINT pt = ScreenPixelPOINT(x, y);
+    HWND under = ::WindowFromPoint(pt);
+    if (under) {
+      under = ::GetAncestor(under, GA_ROOT);
     }
+    if (!under || !WebViewInWindow(under)) {
+      LogDebug(base::StringPrintf(
+          "CLAIM IGNORED: hwid=0x%x pressed outside any Chrome window (%p)",
+          hwid, static_cast<void*>(under)));
+      return;
+    }
+    const int other = OwnerOfWindow(under);
+    if (other != -1 && other != hwid) {
+      LogDebug(base::StringPrintf(
+          "CLAIM REFUSED: hwid=0x%x clicked a window owned by 0x%x", hwid,
+          other));
+      return;
+    }
+    AddOwner(hwid);
+    LogDebug(base::StringPrintf("OWNER SET: hwid=0x%x window %p", hwid,
+                                static_cast<void*>(under)));
   }
 
   // If no owner, ignore.
@@ -1421,6 +1902,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting LEFT DOWN");
 #endif
     StateFor(hwid).button_state |= blink::WebMouseEvent::kLeftButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseDown, x, y,
                               blink::WebMouseEvent::kLeftButtonDown);
   }
@@ -1429,6 +1911,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting LEFT UP");
 #endif
     StateFor(hwid).button_state &= ~blink::WebMouseEvent::kLeftButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseUp, x, y,
                               blink::WebMouseEvent::kLeftButtonDown);
   }
@@ -1437,6 +1920,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting RIGHT DOWN");
 #endif
     StateFor(hwid).button_state |= blink::WebMouseEvent::kRightButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseDown, x, y,
                               blink::WebMouseEvent::kRightButtonDown);
   }
@@ -1445,6 +1929,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting RIGHT UP");
 #endif
     StateFor(hwid).button_state &= ~blink::WebMouseEvent::kRightButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseUp, x, y,
                               blink::WebMouseEvent::kRightButtonDown);
   }
@@ -1453,6 +1938,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting MIDDLE DOWN");
 #endif
     StateFor(hwid).button_state |= blink::WebMouseEvent::kMiddleButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseDown, x, y,
                               blink::WebMouseEvent::kMiddleButtonDown);
   }
@@ -1461,6 +1947,7 @@ void MouseMuxInputController::OnMouseButton(int hwid,
     LogDebug("Injecting MIDDLE UP");
 #endif
     StateFor(hwid).button_state &= ~blink::WebMouseEvent::kMiddleButtonDown;
+    NoteSdkButtonState();
     InjectMouseEventToAnyView(hwid, blink::WebInputEvent::Type::kMouseUp, x, y,
                               blink::WebMouseEvent::kMiddleButtonDown);
   }
@@ -1469,8 +1956,6 @@ void MouseMuxInputController::OnMouseButton(int hwid,
 void MouseMuxInputController::OnMouseWheel(int hwid, float x, float y, int delta, bool horizontal) {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
 
-  // Update position tracking.
-  user_positions_[hwid] = {x, y};
 
   // If no owner, ignore wheel events.
   if (!HasAnyOwner()) {
@@ -1486,19 +1971,40 @@ void MouseMuxInputController::OnMouseWheel(int hwid, float x, float y, int delta
   }
 
 #ifdef MOUSEMUX_DEBUG
-  LogDebug(base::StringPrintf("WHEEL: delta=%d horizontal=%d pos=(%.0f,%.0f)",
-                               delta, horizontal ? 1 : 0, x, y));
+  LogDebug(base::StringPrintf(
+      "IN wheel: hwid=0x%x user=%s px=(%.0f,%.0f) delta=%d horizontal=%d "
+      "owned=%p",
+      hwid, UserNameOf(hwid).c_str(), x, y, delta, horizontal ? 1 : 0,
+      static_cast<void*>(StateFor(hwid).claimed_window)));
 #endif
 
-  // Find view and inject wheel event.
-  RenderWidgetHostViewAura* view = FindViewAtPoint(x, y);
-  if (!view && !registered_views_.empty()) {
-    view = *registered_views_.begin();
+  // The owned window's page, wherever the pointer is - the same rule as
+  // clicks (2026-09-04).  Position picks a page only for a user who owns
+  // nothing yet.
+  RenderWidgetHostViewAura* view = nullptr;
+  {
+    DeviceState& state = StateFor(hwid);
+    state.last_input_time = base::TimeTicks::Now();
+    if (state.claimed_window && ::IsWindow(state.claimed_window)) {
+      view = ActiveWebViewInWindow(state.claimed_window);
+    }
+  }
+  if (!view) {
+    view = FindViewAtPoint(x, y);
+    // ...but never another user's page: without a window of their own the
+    // wheel has nothing to scroll, and the old fallback to the first
+    // registered view scrolled whichever user that happened to be.
+    if (view) {
+      const int other = OwnerOfWindow(ToplevelWindowOf(view));
+      if (other != -1 && other != hwid) {
+        view = nullptr;
+      }
+    }
   }
   if (view) {
     InjectWheelEvent(hwid, view, x, y, delta, horizontal);
   } else {
-    LogDebug("WHEEL FAILED: No view available");
+    LogDebug("WHEEL DROPPED: no page of this user's under the pointer");
   }
 }
 
@@ -1527,18 +2033,16 @@ void MouseMuxInputController::OnConnectionStateChanged(bool connected) {
 
     // Reset owner when reconnecting.
     owners_.clear();
+    MouseMuxVirtualCursorsClear();
     owner_hwid_ = -1;
     // Drops every device's buttons, held keys, targets and pending motion:
     // after a reconnect none of it can be trusted to match the hardware.
     device_state_.clear();
-    is_captured_ = false;
-    user_positions_.clear();
     user_info_.clear();
     keyboard_to_mouse_hwid_.clear();
 #ifdef MOUSEMUX_PEN_TOUCH_INJECT
     pen_state_.clear();
 #endif
-    motion_count_ = 0;
     LogDebug("Reset owner, button state, capture, keyboard, and user tracking on connect");
     NotifyOwnershipChanged();
     if (capture_changed_callback_) {
@@ -1553,10 +2057,9 @@ void MouseMuxInputController::OnConnectionStateChanged(bool connected) {
   } else {
     // Clear all state on disconnect.
     owners_.clear();
+    MouseMuxVirtualCursorsClear();
     owner_hwid_ = -1;
     device_state_.clear();
-    is_captured_ = false;
-    user_positions_.clear();
     user_info_.clear();
     keyboard_to_mouse_hwid_.clear();
 #ifdef MOUSEMUX_PEN_TOUCH_INJECT
@@ -1667,21 +2170,20 @@ void MouseMuxInputController::OnUserDisposed(int hwid_mouse, int hwid_keyboard) 
   LogDebug(base::StringPrintf("UserDisposed: mouse=0x%x kb=0x%x",
                                hwid_mouse, hwid_keyboard));
 
-  // A disposed device's state goes with it, whether or not it was the owner —
-  // the hardware is gone, so its held buttons and keys are stale, and leaving
-  // them would resurrect on an hwid reuse.
-  device_state_.erase(hwid_mouse);
-
   // Drop just this device's ownership.  Unplugging one user's mouse must not
   // evict the others; RemoveOwner promotes a new primary if this was it.
+  // Before the state goes: RemoveOwner touches it through StateFor, which
+  // would re-create an entry erased a line earlier.
   if (IsOwner(hwid_mouse)) {
     LogDebug("OWNER DISPOSED - removing from owners");
     RemoveOwner(hwid_mouse);
   }
 
-  // Remove from position tracking.
-  user_positions_.erase(hwid_mouse);
-  user_positions_.erase(hwid_keyboard);
+  // A disposed device's state goes with it, whether or not it was the owner —
+  // the hardware is gone, so its held buttons and keys are stale, and leaving
+  // them would resurrect on an hwid reuse.
+  device_state_.erase(hwid_mouse);
+
 
   // Remove from user info cache.
   user_info_.erase(hwid_mouse);
@@ -1696,7 +2198,8 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
 #ifdef MOUSEMUX_DEBUG
   LogDebug(base::StringPrintf(
       "SDK KEY IN: hwid=0x%x vkey=0x%x msg=0x%x scan=%d flags=0x%x",
-      hwid, vkey, message, scan, flags));
+      hwid, MouseMuxLogVkey(vkey), message, MouseMuxLogScan(vkey, scan),
+      flags));
 #endif
 
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
@@ -1784,12 +2287,24 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
         "KEY NOT AN OWNER: kb_hwid=0x%x pairs to 0x%x, which owns no window",
         hwid, pair_hwid));
 #endif
+    // The pairing may simply be stale.  The server sends the user list once,
+    // at connect, and said nothing when a keyboard was moved from one user
+    // to another during the session (2026-09-05: a keyboard re-mapped to
+    // Aqua kept arriving as Lime's, 128 keys dropped).  Ask again, at most
+    // every two seconds while this keeps happening; the reply refreshes the
+    // pairing and the next key routes.
+    const base::TimeTicks now = base::TimeTicks::Now();
+    if (client_ && now - last_user_list_request_ > base::Seconds(2)) {
+      last_user_list_request_ = now;
+      LogDebug("KEY NOT AN OWNER: re-requesting the user list");
+      client_->RequestUserList();
+    }
   }
 
 #ifdef MOUSEMUX_DEBUG
   LogDebug(base::StringPrintf(
       "KEY RECV: kb_hwid=0x%x vkey=0x%x owner=0x%x",
-      hwid, vkey, owner_hwid_));
+      hwid, MouseMuxLogVkey(vkey), owner_hwid_));
 #endif
 
   // Determine if key down or up based on Windows message.
@@ -1815,14 +2330,15 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
 #ifdef MOUSEMUX_DEBUG
       LogDebug(base::StringPrintf(
           "KEY ACCEPT REPEAT: kb=0x%x vkey=0x%x owner=0x%x",
-          hwid, vkey, owner_hwid_));
+          hwid, MouseMuxLogVkey(vkey), owner_hwid_));
 #endif
     } else {
       pressed_keys.insert(vkey);
 #ifdef MOUSEMUX_DEBUG
       LogDebug(base::StringPrintf(
           "KEY ACCEPT DOWN: kb=0x%x vkey=0x%x scan=%d owner=0x%x views=%zu",
-          hwid, vkey, scan, owner_hwid_,
+          hwid, MouseMuxLogVkey(vkey), MouseMuxLogScan(vkey, scan),
+          owner_hwid_,
           registered_views_.size()));
 #endif
     }
@@ -1831,7 +2347,8 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
 #ifdef MOUSEMUX_DEBUG
     LogDebug(base::StringPrintf(
         "KEY ACCEPT UP: kb=0x%x vkey=0x%x scan=%d owner=0x%x",
-        hwid, vkey, scan, owner_hwid_));
+        hwid, MouseMuxLogVkey(vkey), MouseMuxLogScan(vkey, scan),
+        owner_hwid_));
 #endif
   }
 
@@ -1856,7 +2373,8 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
     LogDebug(base::StringPrintf(
         "HOTKEY CHECK: vkey=0x%x sdk_shift=%d sdk_ctrl=%d sdk_alt=%d "
         "win32_shift=%d win32_ctrl=%d win32_alt=%d",
-        vkey, sdk_shift, sdk_ctrl, sdk_alt, win32_shift, win32_ctrl, win32_alt));
+        MouseMuxLogVkey(vkey), sdk_shift, sdk_ctrl, sdk_alt, win32_shift,
+        win32_ctrl, win32_alt));
 #endif
     if (keyboard_event_callback_.Run(vkey, shift, ctrl, alt, is_down)) {
 #ifdef MOUSEMUX_DEBUG
@@ -1946,28 +2464,20 @@ void MouseMuxInputController::OnKeyboardKey(int hwid, int vkey, int message,
 
 void MouseMuxInputController::OnTimeoutWarning(int minutes) {
   LogDebug(base::StringPrintf("Timeout warning: %d minutes", minutes));
-  std::wstring msg = L"MouseMux server will timeout in " +
-                     std::to_wstring(minutes) +
-                     (minutes == 1 ? L" minute." : L" minutes.");
-  ::MessageBoxW(nullptr, msg.c_str(), L"MouseMux", MB_OK | MB_ICONWARNING);
+  if (notice_callback_) {
+    notice_callback_.Run(
+        base::StringPrintf("The MouseMux server will time out in %d %s.",
+                           minutes, minutes == 1 ? "minute" : "minutes"),
+        /*error=*/false);
+  }
 }
 
 void MouseMuxInputController::OnTimeoutStopped(const std::string& reason) {
   LogDebug("Session stopped: " + reason);
-  std::wstring msg = L"MouseMux session ended: " +
-                     std::wstring(reason.begin(), reason.end());
-  ::MessageBoxW(nullptr, msg.c_str(), L"MouseMux", MB_OK | MB_ICONERROR);
-}
-
-int MouseMuxInputController::GetOwnerKeyboardHwid() const {
-  if (owner_hwid_ == -1) {
-    return -1;
+  if (notice_callback_) {
+    notice_callback_.Run("The MouseMux session has ended: " + reason,
+                         /*error=*/true);
   }
-  auto it = user_info_.find(owner_hwid_);
-  if (it != user_info_.end()) {
-    return it->second.hwid_keyboard;
-  }
-  return -1;
 }
 
 RenderWidgetHostViewAura* MouseMuxInputController::FindViewAtPoint(
@@ -1981,18 +2491,10 @@ RenderWidgetHostViewAura* MouseMuxInputController::FindViewAtPoint(
     return nullptr;
   }
 
-  // Use the first view's scale factor for coordinate conversion.
-  // This works well for single-monitor setups. For multi-monitor with
-  // different DPI, the fallback ownership claim handles mismatches.
-  float display_scale = 1.0f;
-  RenderWidgetHostViewAura* first_view = *registered_views_.begin();
-  if (first_view) {
-    display_scale = first_view->GetDeviceScaleFactor();
-  }
-
-  // Convert physical screen coordinates to DIP.
-  float dip_x = screen_x / display_scale;
-  float dip_y = screen_y / display_scale;
+  // Chrome's scaled screen coordinates, per monitor (see ScreenPixelsToDIP).
+  const gfx::PointF dip = ScreenPixelsToDIP(screen_x, screen_y);
+  const float dip_x = dip.x();
+  const float dip_y = dip.y();
 
   // Collect all visible views whose bounds contain the point.
   std::vector<RenderWidgetHostViewAura*> candidates;
@@ -2030,10 +2532,6 @@ RenderWidgetHostViewAura* MouseMuxInputController::FindViewAtPoint(
 
   // Fallback (shouldn't happen).
   return candidates[0];
-}
-
-bool MouseMuxInputController::IsPointOverChrome(float screen_x, float screen_y) {
-  return FindViewAtPoint(screen_x, screen_y) != nullptr;
 }
 
 #ifdef MOUSEMUX_PEN_TOUCH_INJECT
@@ -2108,7 +2606,7 @@ void MouseMuxInputController::InjectMouseEvent(
   // The callback is provided by the chrome layer which has access to
   // views::MenuController.
   if (type == blink::WebInputEvent::Type::kMouseDown && menu_dismiss_callback_) {
-    menu_dismiss_callback_.Run(hwid);
+    menu_dismiss_callback_.Run(hwid, /*page_press=*/true);
   }
 
   // Set aura mouse capture on mouse down, release on mouse up.
@@ -2130,40 +2628,33 @@ void MouseMuxInputController::InjectMouseEvent(
   // activates the window (changes Z-order) which makes a background window
   // jump to the front when the SDK cursor merely passes over it.
   if (type == blink::WebInputEvent::Type::kMouseDown) {
-#ifdef MOUSEMUX_MULTI_OWNER
-    // Renderer page focus only — see the matching block in
-    // InjectKeyboardEvent.  view->Focus() is the OS window and would activate
-    // this window, blurring whichever window another user is working in.
-    //
-    // Re-assert on EVERY registered view, not just the clicked one: a click
-    // must not take page focus away from a window somebody else is typing in.
-    // Doing it only for `view` here was an asymmetry with the keyboard path —
-    // a click blurred the other window and only the next keystroke restored it.
-    for (RenderWidgetHostViewAura* v : registered_views_) {
-      if (!v) {
-        continue;
-      }
-      if (RenderWidgetHostImpl* h =
-              RenderWidgetHostImpl::From(v->GetRenderWidgetHost())) {
-        h->Focus();
-      }
-    }
-#else
-    if (!view->HasFocus()) {
+    // Renderer page focus for the clicked page, and only that.  Other
+    // users' pages are not touched: their focus is held by ShouldSuppressBlur
+    // while their window is owned, and a focus pushed at them from here put
+    // a caret back in a page whose user was typing in the omnibox.
+    host->Focus();
+    // And Chrome's own focus.  A real click reaches the page through aura,
+    // which focuses the page's window on the way; an injected click goes
+    // straight to the renderer and skips that.  Where the window's focus had
+    // gone elsewhere - the omnibox, or nowhere: Chrome restores focus after
+    // a tab closes only when the window is active, and an owned window never
+    // is - keys posted to the window then found no focused view and were
+    // dropped (2026-09-05 15:11, 114 keys posted, none forwarded).  With
+    // the synthetic flag set, the views side does not activate the OS
+    // window for this, so nobody else's window is blurred.
+    {
+      base::AutoReset<bool> synthetic(&g_mousemux_synthetic_key, true);
       view->Focus();
     }
-    // Also set page-level focus directly (sends SetFocus IPC to renderer),
-    // matching what DevTools Input.dispatchMouseEvent does.
-    host->Focus();
-#endif  // MOUSEMUX_MULTI_OWNER
   }
 
   // Get device scale factor for coordinate transformation.
   float device_scale = view->GetDeviceScaleFactor();
 
-  // Convert physical screen coordinates to DIP.
-  float dip_screen_x = screen_x / device_scale;
-  float dip_screen_y = screen_y / device_scale;
+  // Chrome's scaled screen coordinates, per monitor (see ScreenPixelsToDIP).
+  const gfx::PointF dip_screen = ScreenPixelsToDIP(screen_x, screen_y);
+  float dip_screen_x = dip_screen.x();
+  float dip_screen_y = dip_screen.y();
 
   // Get view bounds to calculate widget-relative coordinates.
   gfx::Rect view_bounds = view->GetViewBounds();
@@ -2238,30 +2729,41 @@ void MouseMuxInputController::InjectMouseEvent(
 #endif
 
 #ifdef MOUSEMUX_DEBUG
-  // Log ALL injection details for button events.
-  if (type == blink::WebInputEvent::Type::kMouseDown ||
-      type == blink::WebInputEvent::Type::kMouseUp) {
-    const char* type_str = (type == blink::WebInputEvent::Type::kMouseDown) ? "DOWN" : "UP";
+  // Every button event; moves every 50th per view.
+  if (type != blink::WebInputEvent::Type::kMouseMove ||
+      EveryFiftieth(MoveLogCounters(), reinterpret_cast<intptr_t>(view))) {
+    const char* type_str = (type == blink::WebInputEvent::Type::kMouseDown)
+                               ? "DOWN"
+                               : (type == blink::WebInputEvent::Type::kMouseUp)
+                                     ? "UP"
+                                     : "MOVE";
     const char* btn_str = "?";
     if (event.button == blink::WebPointerProperties::Button::kLeft) btn_str = "LEFT";
     else if (event.button == blink::WebPointerProperties::Button::kRight) btn_str = "RIGHT";
     else if (event.button == blink::WebPointerProperties::Button::kMiddle) btn_str = "MIDDLE";
     else if (event.button == blink::WebPointerProperties::Button::kNoButton) btn_str = "NONE";
 
-    LogDebug(base::StringPrintf(">>> INJECT %s %s: widget(%.1f,%.1f) screen(%.1f,%.1f) mods=0x%x click=%d",
-                                 type_str, btn_str,
-                                 widget_x, widget_y,
-                                 dip_screen_x, dip_screen_y,
-                                 event.GetModifiers(),
-                                 event.click_count));
-    // Log host state for click debugging.
-    LogDebug(base::StringPrintf("    host: focused=%d active=%d process_ready=%d view_bounds=(%d,%d,%d,%d) scale=%.2f",
-                                 host->is_focused(),
-                                 host->is_active(),
-                                 host->GetProcess()->IsReady(),
-                                 view_bounds.x(), view_bounds.y(),
-                                 view_bounds.width(), view_bounds.height(),
-                                 device_scale));
+    LogDebug(base::StringPrintf(
+        "OUT mouse %s %s: hwid=0x%x user=%s view=%p host=%p px=(%.0f,%.0f) "
+        "dip=(%.1f,%.1f) scale=%.2f bounds=(%d,%d,%dx%d) widget=(%.1f,%.1f) "
+        "inside=%d mods=0x%x click=%d focused=%d active=%d ready=%d "
+        "pending=%d ignoring=%d%s",
+        type_str, btn_str, hwid, UserNameOf(hwid).c_str(),
+        static_cast<void*>(view), static_cast<void*>(host), screen_x, screen_y,
+        dip_screen_x, dip_screen_y, device_scale, view_bounds.x(),
+        view_bounds.y(), view_bounds.width(), view_bounds.height(), widget_x,
+        widget_y,
+        (widget_x >= 0 && widget_y >= 0 && widget_x < view_bounds.width() &&
+         widget_y < view_bounds.height()) ? 1 : 0,
+        event.GetModifiers(), event.click_count, host->is_focused() ? 1 : 0,
+        host->is_active() ? 1 : 0, host->GetProcess()->IsReady() ? 1 : 0,
+        host->input_router()->HasPendingEvents() ? 1 : 0,
+        host->IsIgnoringWebInputEvents(event) ? 1 : 0,
+        type == blink::WebInputEvent::Type::kMouseMove
+            ? ""
+            : base::StringPrintf(" cross_process_frames=%d",
+                                 CrossProcessFrameCount(host))
+                  .c_str()));
   }
 
   // Log move events during drag (when a button is held).
@@ -2285,10 +2787,11 @@ void MouseMuxInputController::InjectMouseEvent(
   bool is_ignoring = host->IsIgnoringWebInputEvents(event);
 
   // Log diagnostics for button events always, motion every 120th (~2s at 60fps).
+  static int diag_motion_count = 0;
   bool should_log_diag = (type == blink::WebInputEvent::Type::kMouseDown ||
                           type == blink::WebInputEvent::Type::kMouseUp ||
                           (type == blink::WebInputEvent::Type::kMouseMove &&
-                           motion_count_ % 120 == 0));
+                           ++diag_motion_count % 120 == 0));
   if (should_log_diag) {
     DiagLog(base::StringPrintf(
         "DIAG MOUSE: ignoring=%d pending=%d views=%zu view=%p",
@@ -2307,6 +2810,40 @@ void MouseMuxInputController::InjectMouseEvent(
   host->ForwardMouseEvent(event);
 }
 
+// The Chrome UI window the injected pointer last hovered; see
+// PrepareUiHoverMove() below.
+static HWND g_ui_hover_hwnd = nullptr;
+
+// Whether the page is what is on top at this screen point.  A child widget
+// drawn over the page - the find bar, a permission panel - sits above the
+// web view in the window's aura tree, and the page's rectangle cannot show
+// that.  Ask the tree.
+static bool PageIsTopmostAt(RenderWidgetHostViewAura* view,
+                            float screen_x,
+                            float screen_y) {
+  aura::Window* window = view->GetNativeView();
+  if (!window) {
+    return true;
+  }
+  aura::Window* root = window->GetRootWindow();
+  if (!root || !root->GetHost()) {
+    return true;
+  }
+  // Host-local scaled coordinates, which are root-window coordinates.
+  gfx::Point point = ScreenPixelPoint(screen_x, screen_y);
+  root->GetHost()->ConvertScreenInPixelsToDIP(&point);
+  aura::Window* top = root->GetEventHandlerForPoint(point);
+  return !top || window->Contains(top);
+}
+
+// Whether the page view contains this screen point (pixels).
+static bool PageContainsPoint(RenderWidgetHostViewAura* view,
+                              float screen_x,
+                              float screen_y) {
+  return view->GetViewBounds().Contains(
+      gfx::ToFlooredPoint(ScreenPixelsToDIP(screen_x, screen_y)));
+}
+
 void MouseMuxInputController::InjectMouseEventToAnyView(
     int hwid,
     blink::WebInputEvent::Type type,
@@ -2316,14 +2853,219 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
   RenderWidgetHostViewAura* view = nullptr;
   DeviceState& state = StateFor(hwid);
 
+  // Every press, before routing, so the dialog knows who opened the menu
+  // that is about to appear.  Menus open from Chrome-UI presses (the ...
+  // button) which never reach the page path, so the attribution there
+  // named the last user to press a PAGE - somebody else - and that user's
+  // next click closed a menu that was not theirs (2026-09-05 15:30).  A
+  // press here never cancels; the page path does that.
+  if (type == blink::WebInputEvent::Type::kMouseDown && menu_dismiss_callback_) {
+    menu_dismiss_callback_.Run(hwid, /*page_press=*/false);
+  }
+
   // During drag (button held), route all events to THIS device's drag target.
   // Critical for text selection — Chrome's selection handler requires every
   // event in a drag sequence to reach the same view — and per device, or one
   // user's drag would capture another user's movement.
-  if (state.button_state != 0 && state.drag_target_view &&
-      registered_views_.count(state.drag_target_view)) {
+  const bool is_button_event =
+      type == blink::WebInputEvent::Type::kMouseDown ||
+      type == blink::WebInputEvent::Type::kMouseUp ||
+      type == blink::WebInputEvent::Type::kMouseMove;
+
+#ifdef MOUSEMUX_DEBUG
+  // ROUTE: which branch this event takes and why.  Moves every 50th per
+  // device.
+  const bool log_this =
+      type != blink::WebInputEvent::Type::kMouseMove ||
+      EveryFiftieth(MoveLogCounters(), static_cast<intptr_t>(hwid));
+  auto route_log = [&](const char* branch, gfx::AcceleratedWidget target) {
+    if (!log_this) {
+      return;
+    }
+    LogDebug(base::StringPrintf(
+        "ROUTE %s: hwid=0x%x user=%s type=%d px=(%.0f,%.0f) owned=%p "
+        "target=%p buttons=0x%x",
+        branch, hwid, UserNameOf(hwid).c_str(), static_cast<int>(type),
+        screen_x, screen_y, static_cast<void*>(state.claimed_window),
+        static_cast<void*>(target), state.button_state));
+  };
+#else
+  auto route_log = [](const char*, gfx::AcceleratedWidget) {};
+#endif
+  const bool dragging = state.button_state != 0 && state.drag_target_view &&
+                        registered_views_.count(state.drag_target_view);
+  state.last_input_time = base::TimeTicks::Now();
+
+  // Ownership routes (2026-09-04).  A user who owns a window sends every
+  // event to that window, and position only decides where inside it: one of
+  // its own popups, its page, or its Chrome UI.  Nothing else is consulted,
+  // so what overlaps what no longer matters - the old search by position
+  // put a click on this window's toolbar into the page of the window
+  // behind it.  Outside the window, moves and releases still reach the page,
+  // as under Windows mouse capture; a press outside has nothing of this
+  // user's to press.  The search over all windows survives below only for a
+  // user who owns nothing yet.
+  // Where the point is, as Windows sees it: the top-level window under it,
+  // the one a real click would go to.  One call, and the answer already
+  // accounts for what is on top of what - the thing a rectangle test cannot
+  // know, and the reason two overlapping windows of one user took two clicks
+  // per click (2026-09-04).  A menu popup resolves to the browser window
+  // that owns it; our dialog and help window resolve to themselves.
+  // Nothing about position is consulted for moves, wheel or keys beyond
+  // this; they go to the current window.
+  const POINT pt = ScreenPixelPOINT(screen_x, screen_y);
+  HWND under = nullptr;
+  HWND under_owner = nullptr;
+  if (!dragging) {
+    under = ::WindowFromPoint(pt);
+    if (under) {
+      under = ::GetAncestor(under, GA_ROOT);
+      under_owner = ::GetAncestor(under, GA_ROOTOWNER);
+    }
+  }
+
+  // Where "the mouse" is, for code in the window this event is headed for
+  // that asks Windows: this pointer.  Keyed by that window, so two users'
+  // pointers do not answer for each other's menus and tooltips.
+  {
+    HWND cursor_window = state.claimed_window;
+    if (dragging && state.drag_target_view) {
+      cursor_window = ToplevelWindowOf(state.drag_target_view);
+    }
+    if (under &&
+        (under == g_mousemux_dialog_hwnd || under == g_mousemux_help_hwnd)) {
+      cursor_window = under;
+    }
+    if (!cursor_window) {
+      cursor_window = under_owner;
+    }
+    const gfx::Point pixel = ScreenPixelPoint(screen_x, screen_y);
+    MouseMuxVirtualCursorMoved(cursor_window, pixel.x(), pixel.y());
+  }
+
+  // 1. The MouseMux dialog and its help window: nobody's, everybody's.
+  if (is_button_event && !dragging && under &&
+      (under == g_mousemux_dialog_hwnd || under == g_mousemux_help_hwnd)) {
+    route_log("dialog", under);
+    DispatchToAuraHost(under, type, screen_x, screen_y, button_flags);
+    return;
+  }
+
+  if (state.claimed_window && !::IsWindow(state.claimed_window)) {
+    if (!PruneOwnedWindows(hwid)) {
+      // Their last window is gone and nothing reported it (the frame died
+      // without a page of ours in it).  Same outcome as a reported close:
+      // the seat is handed back and this event has nowhere to go.
+      LogDebug(base::StringPrintf(
+          "Window gone - releasing owner 0x%x", hwid));
+      ReleaseOwnerHwid(hwid);
+      return;
+    }
+  }
+  if (state.claimed_window && !dragging) {
+    // 2. Which of this user's own windows is under the point, if any.  A
+    //    popup counts as the window that owns it.
+    gfx::AcceleratedWidget mine = gfx::kNullAcceleratedWidget;
+    for (gfx::AcceleratedWidget owned : state.owned_windows) {
+      if (owned && (owned == under || owned == under_owner)) {
+        mine = owned;
+        break;
+      }
+    }
+
+    if (type == blink::WebInputEvent::Type::kMouseDown) {
+      if (!mine) {
+        // A window nobody owns goes to whoever clicks it first.  Anything
+        // else - another user's window, the desktop, some other program -
+        // gets nothing.
+        if (under && WebViewInWindow(under) &&
+            ClaimForPress(hwid, under, nullptr)) {
+          mine = under;
+          route_log("claim-unowned-window", under);
+        } else {
+          route_log("DROPPED-press-not-my-window", under);
+          MMTRACE("CTRL/Inject", "DROPPED press outside owned windows hwid=%d",
+                  hwid);
+          return;
+        }
+      }
+      if (mine != state.claimed_window) {
+        state.claimed_window = mine;
+        if (RenderWidgetHostViewAura* page = ActiveWebViewInWindow(mine)) {
+          state.keyboard_target_view = page;
+        }
+        route_log("switch-current-window", mine);
+      }
+    }
+
+    const gfx::AcceleratedWidget window = state.claimed_window;
+    RenderWidgetHostViewAura* page = ActiveWebViewInWindow(window);
+    // Over the current window or one of its popups: hover, popups, page and
+    // toolbar all work.  Over anything else, moves and releases still reach
+    // the current page, as under Windows capture.
+    const bool over_current = mine == window;
+#ifdef MOUSEMUX_DEBUG
+    if (type == blink::WebInputEvent::Type::kMouseDown) {
+      const gfx::Rect b = page ? page->GetViewBounds() : gfx::Rect();
+      LogDebug(base::StringPrintf(
+          "OWNED ROUTE: under=%p owner=%p mine=%p current=%p page=%p "
+          "showing=%d bounds=(%d,%d,%dx%d) scale=%.2f contains=%d topmost=%d",
+          static_cast<void*>(under), static_cast<void*>(under_owner),
+          static_cast<void*>(mine), static_cast<void*>(window),
+          static_cast<void*>(page), page && page->IsShowing() ? 1 : 0, b.x(),
+          b.y(), b.width(), b.height(),
+          page ? page->GetDeviceScaleFactor() : 0.0f,
+          page && PageContainsPoint(page, screen_x, screen_y) ? 1 : 0,
+          page && PageIsTopmostAt(page, screen_x, screen_y) ? 1 : 0));
+    }
+#endif
+    if (over_current) {
+      if (is_button_event && under != window &&
+          TryDispatchToOverlayWindow(type, screen_x, screen_y, button_flags,
+                                     window)) {
+        route_log("owned-popup", under);
+        return;
+      }
+      if (page && PageContainsPoint(page, screen_x, screen_y) &&
+          PageIsTopmostAt(page, screen_x, screen_y)) {
+        route_log("owned-page", window);
+        view = page;
+      } else {
+        route_log(page ? "owned-chrome-ui" : "owned-chrome-ui-no-page",
+                  window);
+        if (is_button_event) {
+          DispatchToAuraHost(window, type, screen_x, screen_y, button_flags);
+        }
+        return;
+      }
+    } else {
+      route_log(page ? "elsewhere-to-owned-page" : "elsewhere-NO-PAGE",
+                under);
+      view = page;
+      if (!view) {
+        return;
+      }
+    }
+    if (type == blink::WebInputEvent::Type::kMouseMove && g_ui_hover_hwnd) {
+      ::PostMessage(g_ui_hover_hwnd, WM_MOUSEMUX_MOUSELEAVE, 0, 0);
+      g_ui_hover_hwnd = nullptr;
+    }
+    if (type == blink::WebInputEvent::Type::kMouseDown) {
+      state.drag_target_view = view;
+      state.keyboard_target_view = view;
+    } else if (type == blink::WebInputEvent::Type::kMouseUp &&
+               state.button_state == 0) {
+      state.drag_target_view = nullptr;
+    }
+    InjectMouseEvent(hwid, view, type, screen_x, screen_y, button_flags);
+    return;
+  }
+
+  if (dragging) {
+    route_log("drag-lock", ToplevelWindowOf(state.drag_target_view));
     view = state.drag_target_view;
   } else {
+    route_log("unowned-search", gfx::kNullAcceleratedWidget);
 #ifdef MOUSEMUX_AURA_UI_CLICK_THROUGH
     // For button events, check if there's an overlay window (context menu,
     // popup, dropdown) at the coordinates BEFORE checking web content.
@@ -2331,7 +3073,8 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
     // menu items would hit the web content view behind the menu, dismiss
     // the menu via menu_dismiss_callback_, and lose the menu action.
     if (type == blink::WebInputEvent::Type::kMouseDown ||
-        type == blink::WebInputEvent::Type::kMouseUp) {
+        type == blink::WebInputEvent::Type::kMouseUp ||
+        type == blink::WebInputEvent::Type::kMouseMove) {
       if (TryDispatchToOverlayWindow(type, screen_x, screen_y, button_flags)) {
         return;
       }
@@ -2340,6 +3083,21 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
 
     // Normal case: find the view under the cursor.
     view = FindViewAtPoint(screen_x, screen_y);
+    // Another user's window is off limits for every event, not just presses:
+    // hover from a user who owns nothing must not light up someone else's
+    // page.
+    if (view) {
+      const int other = OwnerOfWindow(ToplevelWindowOf(view));
+      if (other != -1 && other != hwid) {
+        route_log("REFUSED-window-owned-by-other", ToplevelWindowOf(view));
+        return;
+      }
+    }
+    // ...unless something is drawn over the page there.  Then this is a
+    // Chrome-UI event and takes the aura path below.
+    if (view && !PageIsTopmostAt(view, screen_x, screen_y)) {
+      view = nullptr;
+    }
   }
 
   if (!view) {
@@ -2349,27 +3107,17 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
     // No web content view under the cursor — try dispatching through
     // the aura event system so Chrome UI (tabs, toolbar, etc.) can respond.
     if (type == blink::WebInputEvent::Type::kMouseDown ||
-        type == blink::WebInputEvent::Type::kMouseUp) {
+        type == blink::WebInputEvent::Type::kMouseUp ||
+        type == blink::WebInputEvent::Type::kMouseMove) {
       const gfx::AcceleratedWidget target =
           FindAuraTargetWindow(screen_x, screen_y);
       if (!target) {
         return;
       }
-
-      // The hard lock has to hold here too.  A click on another user's tab
-      // strip, toolbar or bookmark bar is still a click in their window, and
-      // this path — anything that is not page content — was the one way
-      // round it.
-      if (hard_lock_) {
-        if (state.locked_window && !::IsWindow(state.locked_window)) {
-          state.locked_window = gfx::kNullAcceleratedWidget;
-        }
-        if (!state.locked_window) {
-          state.locked_window = target;
-        } else if (target != state.locked_window) {
-          MMTRACE("CTRL/HardLock",
-                  "DROPPED hwid=%d clicked outside its window (chrome UI)",
-                  hwid);
+      {
+        const int other = OwnerOfWindow(target);
+        if (other != -1 && other != hwid) {
+          route_log("REFUSED-window-owned-by-other", target);
           return;
         }
       }
@@ -2381,11 +3129,9 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
       // had no target at all, and their typing fell through to whichever
       // view happened to be first in the list — which, with several users,
       // is somebody else's window.
-      if (type == blink::WebInputEvent::Type::kMouseDown) {
-        if (RenderWidgetHostViewAura* web_view = WebViewInWindow(target)) {
-          state.keyboard_target_view = web_view;
-          state.claimed_window = target;
-        }
+      if (type == blink::WebInputEvent::Type::kMouseDown &&
+          WebViewInWindow(target)) {
+        ClaimForPress(hwid, target, nullptr);
       }
 
       DispatchToAuraHost(target, type, screen_x, screen_y, button_flags);
@@ -2399,37 +3145,22 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
     return;
   }
 
-  // Hard lock: confine this device to its own window.
-  //
-  // Applied here, after the view is resolved, so the test is against the
-  // window the click actually landed in.  Movement is deliberately NOT
-  // blocked — only button events — so a user's cursor can still travel across
-  // the screen and they can see where they are; it simply cannot act outside
-  // their window.
-  if (hard_lock_ && type != blink::WebInputEvent::Type::kMouseMove) {
-    const gfx::AcceleratedWidget hit_window = ToplevelWindowOf(view);
-    // A window that has gone away must not keep its user locked out.
-    if (state.locked_window && !::IsWindow(state.locked_window)) {
-      state.locked_window = gfx::kNullAcceleratedWidget;
-    }
-    if (!state.locked_window) {
-      // First click claims a window for this device.
-      state.locked_window = hit_window;
-      LogDebug(base::StringPrintf("HARD LOCK: hwid=0x%x claimed window %p",
-                                  hwid, state.locked_window));
-    } else if (hit_window != state.locked_window) {
-      MMTRACE("CTRL/HardLock", "DROPPED hwid=%d clicked outside its window",
-              hwid);
-      return;
-    }
+  // Back over page content: end the hover on whatever Chrome UI the pointer
+  // was last over, or its highlight sticks.
+  if (type == blink::WebInputEvent::Type::kMouseMove && g_ui_hover_hwnd) {
+    ::PostMessage(g_ui_hover_hwnd, WM_MOUSEMUX_MOUSELEAVE, 0, 0);
+    g_ui_hover_hwnd = nullptr;
   }
+
 
   // Track this device's drag target: set on mousedown, clear on mouseup.
   if (type == blink::WebInputEvent::Type::kMouseDown) {
+    const gfx::AcceleratedWidget window = ToplevelWindowOf(view);
+    if (!ClaimForPress(hwid, window, view)) {
+      route_log("REFUSED-window-owned-by-other", window);
+      return;
+    }
     state.drag_target_view = view;
-    // This device's keyboard follows its own click — not every device's.
-    state.keyboard_target_view = view;
-    state.claimed_window = ToplevelWindowOf(view);
   } else if (type == blink::WebInputEvent::Type::kMouseUp &&
              state.button_state == 0) {
     state.drag_target_view = nullptr;
@@ -2439,11 +3170,46 @@ void MouseMuxInputController::InjectMouseEventToAnyView(
 }
 
 #ifdef MOUSEMUX_AURA_UI_CLICK_THROUGH
+// Hover over Chrome UI and menus.  One window at a time: moving to another
+// window, or back over page content, first sends the old one a leave so its
+// highlight clears.  Throttled to about 60 Hz; hover feedback does not need
+// every SDK motion sample, and each one is a PostMessage plus a views hit
+// test.
+
+static bool PrepareUiHoverMove(HWND hwnd,
+                               int button_flags,
+                               UINT* msg,
+                               WPARAM* wparam) {
+  static base::TimeTicks last;
+  const base::TimeTicks now = base::TimeTicks::Now();
+  if (hwnd == g_ui_hover_hwnd && now - last < base::Milliseconds(16)) {
+    return false;
+  }
+  last = now;
+  if (g_ui_hover_hwnd && g_ui_hover_hwnd != hwnd) {
+    ::PostMessage(g_ui_hover_hwnd, WM_MOUSEMUX_MOUSELEAVE, 0, 0);
+  }
+  g_ui_hover_hwnd = hwnd;
+  *msg = WM_MOUSEMUX_MOUSEMOVE;
+  *wparam = 0;
+  if (button_flags & blink::WebMouseEvent::kLeftButtonDown) {
+    *wparam |= MK_LBUTTON;
+  }
+  if (button_flags & blink::WebMouseEvent::kRightButtonDown) {
+    *wparam |= MK_RBUTTON;
+  }
+  if (button_flags & blink::WebMouseEvent::kMiddleButtonDown) {
+    *wparam |= MK_MBUTTON;
+  }
+  return true;
+}
+
 bool MouseMuxInputController::TryDispatchToOverlayWindow(
     blink::WebInputEvent::Type type,
     float screen_x,
     float screen_y,
-    int button_flags) {
+    int button_flags,
+    gfx::AcceleratedWidget owner) {
   aura::Env* env = aura::Env::GetInstance();
   if (!env) return false;
 
@@ -2456,7 +3222,7 @@ bool MouseMuxInputController::TryDispatchToOverlayWindow(
   }
   if (web_content_hosts.empty()) return false;
 
-  gfx::Point screen_pt(static_cast<int>(screen_x), static_cast<int>(screen_y));
+  const gfx::Point screen_pt = ScreenPixelPoint(screen_x, screen_y);
 
   // Collect all visible hosts at this point, then use Z-order to find topmost.
   const auto& hosts = env->window_tree_hosts();
@@ -2465,6 +3231,11 @@ bool MouseMuxInputController::TryDispatchToOverlayWindow(
     if (!host) continue;
     HWND hwnd = host->GetAcceleratedWidget();
     if (!hwnd || !::IsWindowVisible(hwnd)) continue;
+    // An owned user's events belong to their window and its own popups; a
+    // menu open on somebody else's window is not theirs to click.
+    if (owner && hwnd != owner && ::GetAncestor(hwnd, GA_ROOTOWNER) != owner) {
+      continue;
+    }
 #ifdef MOUSEMUX_EXPERIMENT_NC_HANDLING
     // Use GetWindowRect (full window including title bar) not
     // GetBoundsInPixels (client area only) so title bar clicks match.
@@ -2503,13 +3274,17 @@ bool MouseMuxInputController::TryDispatchToOverlayWindow(
   // It's an overlay window (context menu, popup, dialog).
   // Always PostMessage and return true to prevent InjectMouseEvent from
   // dismissing the menu and forwarding a stale click to the renderer.
-  POINT client_pt = {static_cast<LONG>(screen_x), static_cast<LONG>(screen_y)};
+  POINT client_pt = ScreenPixelPOINT(screen_x, screen_y);
   ::ScreenToClient(topmost_hwnd, &client_pt);
   LPARAM lparam = MAKELPARAM(client_pt.x, client_pt.y);
 
   UINT msg = 0;
   WPARAM wparam = 0;
-  if (type == blink::WebInputEvent::Type::kMouseDown) {
+  if (type == blink::WebInputEvent::Type::kMouseMove) {
+    if (!PrepareUiHoverMove(topmost_hwnd, button_flags, &msg, &wparam)) {
+      return true;  // Throttled.
+    }
+  } else if (type == blink::WebInputEvent::Type::kMouseDown) {
     if (button_flags & blink::WebMouseEvent::kLeftButtonDown) {
       msg = WM_MOUSEMUX_LBUTTONDOWN; wparam = MK_LBUTTON;
     } else if (button_flags & blink::WebMouseEvent::kRightButtonDown) {
@@ -2527,10 +3302,16 @@ bool MouseMuxInputController::TryDispatchToOverlayWindow(
     }
   }
 
-  if (msg) {
+  if (msg && type != blink::WebInputEvent::Type::kMouseMove) {
+    char cls[64] = {};
+    ::GetClassNameA(topmost_hwnd, cls, static_cast<int>(sizeof(cls)));
     DiagLog(base::StringPrintf(
-        "OVERLAY DISPATCH: msg=0x%x to hwnd=%p client(%ld,%ld)",
-        msg, static_cast<void*>(topmost_hwnd), client_pt.x, client_pt.y));
+        "OVERLAY DISPATCH: msg=0x%x to hwnd=%p class=%s client(%ld,%ld) "
+        "fg=%p",
+        msg, static_cast<void*>(topmost_hwnd), cls, client_pt.x, client_pt.y,
+        static_cast<void*>(::GetForegroundWindow())));
+  }
+  if (msg) {
     ::PostMessage(topmost_hwnd, msg, wparam, lparam);
   }
   return true;
@@ -2546,7 +3327,7 @@ gfx::AcceleratedWidget MouseMuxInputController::FindAuraTargetWindow(
     return gfx::kNullAcceleratedWidget;
   }
 
-  gfx::Point screen_pt(static_cast<int>(screen_x), static_cast<int>(screen_y));
+  const gfx::Point screen_pt = ScreenPixelPoint(screen_x, screen_y);
   const auto& hosts = env->window_tree_hosts();
 
   // Collect candidate HWNDs that contain the point and are visible.
@@ -2598,7 +3379,11 @@ void MouseMuxInputController::DispatchToAuraHost(
   // PreHandleMSG in DesktopWindowTreeHostWin converts them back.
   UINT msg = 0;
   WPARAM wparam = 0;
-  if (type == blink::WebInputEvent::Type::kMouseDown) {
+  if (type == blink::WebInputEvent::Type::kMouseMove) {
+    if (!PrepareUiHoverMove(target, button_flags, &msg, &wparam)) {
+      return;  // Throttled.
+    }
+  } else if (type == blink::WebInputEvent::Type::kMouseDown) {
     if (button_flags & blink::WebMouseEvent::kLeftButtonDown) {
       msg = WM_MOUSEMUX_LBUTTONDOWN; wparam = MK_LBUTTON;
     } else if (button_flags & blink::WebMouseEvent::kRightButtonDown) {
@@ -2620,9 +3405,20 @@ void MouseMuxInputController::DispatchToAuraHost(
   HWND target_hwnd = target;
   if (!target_hwnd) return;
 
-  POINT client_pt = {static_cast<LONG>(screen_x), static_cast<LONG>(screen_y)};
+  POINT client_pt = ScreenPixelPOINT(screen_x, screen_y);
   ::ScreenToClient(target_hwnd, &client_pt);
   LPARAM lparam = MAKELPARAM(client_pt.x, client_pt.y);
+#ifdef MOUSEMUX_DEBUG
+  if (type != blink::WebInputEvent::Type::kMouseMove) {
+    char cls[64] = {};
+    ::GetClassNameA(target_hwnd, cls, static_cast<int>(sizeof(cls)));
+    LogDebug(base::StringPrintf(
+        "AURA DISPATCH: type=%d to hwnd=%p class=%s client(%ld,%ld) fg=%p",
+        static_cast<int>(type), static_cast<void*>(target_hwnd), cls,
+        client_pt.x, client_pt.y,
+        static_cast<void*>(::GetForegroundWindow())));
+  }
+#endif
 
   DiagLog(base::StringPrintf(
       "  POSTING msg=0x%x to hwnd=%p client(%ld,%ld)",
@@ -2647,11 +3443,10 @@ void MouseMuxInputController::InjectWheelEvent(
     return;
 
   // Get device scale factor for coordinate transformation.
-  float device_scale = view->GetDeviceScaleFactor();
-
-  // Convert physical screen coordinates to DIP.
-  float dip_screen_x = screen_x / device_scale;
-  float dip_screen_y = screen_y / device_scale;
+  // Chrome's scaled screen coordinates, per monitor (see ScreenPixelsToDIP).
+  const gfx::PointF dip_screen = ScreenPixelsToDIP(screen_x, screen_y);
+  float dip_screen_x = dip_screen.x();
+  float dip_screen_y = dip_screen.y();
 
   // Get view bounds to calculate widget-relative coordinates.
   gfx::Rect view_bounds = view->GetViewBounds();
@@ -2714,118 +3509,100 @@ void MouseMuxInputController::InjectWheelEvent(
     DiagLog("*** DROPPING WHEEL: IsIgnoring=TRUE");
   }
 
+#ifdef MOUSEMUX_DEBUG
+  LogDebug(base::StringPrintf(
+      "OUT wheel: hwid=0x%x view=%p host=%p px=(%.0f,%.0f) dip=(%.1f,%.1f) "
+      "bounds=(%d,%d,%dx%d) widget=(%.1f,%.1f) inside=%d delta=(%.1f,%.1f) "
+      "pending=%d ignoring=%d cross_process_frames=%d",
+      hwid, static_cast<void*>(view), static_cast<void*>(host), screen_x,
+      screen_y, dip_screen_x, dip_screen_y, view_bounds.x(), view_bounds.y(),
+      view_bounds.width(), view_bounds.height(), widget_x, widget_y,
+      (widget_x >= 0 && widget_y >= 0 && widget_x < view_bounds.width() &&
+       widget_y < view_bounds.height()) ? 1 : 0,
+      event.delta_x, event.delta_y,
+      host->input_router()->HasPendingEvents() ? 1 : 0, wheel_ignoring ? 1 : 0,
+      CrossProcessFrameCount(host)));
+#endif
   // Forward the event.
+  host->ForwardWheelEventWithLatencyInfo(event, ui::LatencyInfo());
+
+  // The gesture this notch belongs to must END once the notches stop, or
+  // Chrome treats every later notch as a continuation of it and keeps
+  // scrolling whatever the first one latched onto - nothing, when that
+  // first notch landed on a spot with no scroller or at the end of one.
+  // Measured 2026-09-04: 206 consecutive wheels answered "no consumer" on a
+  // page a real mouse scrolled at once; 447 scroll updates, 3 scroll begins.
+  // A real mouse gets its end from MouseWheelPhaseHandler 100 ms after the
+  // last notch; this is the same thing for an injected one.
+  {
+    DeviceState& state = StateFor(hwid);
+    state.last_wheel_view = view;
+    state.last_wheel_x = screen_x;
+    state.last_wheel_y = screen_y;
+    std::unique_ptr<base::OneShotTimer>& timer = wheel_end_timers_[hwid];
+    if (!timer) {
+      timer = std::make_unique<base::OneShotTimer>();
+    }
+    timer->Start(FROM_HERE, base::Milliseconds(100),
+                 base::BindOnce(&MouseMuxInputController::SendWheelEnd,
+                                base::Unretained(this), hwid));
+  }
+}
+
+void MouseMuxInputController::SendWheelEnd(int hwid) {
+  DeviceState& state = StateFor(hwid);
+  RenderWidgetHostViewAura* view = state.last_wheel_view;
+  state.last_wheel_view = nullptr;
+  if (!view || !registered_views_.count(view)) {
+    return;
+  }
+  RenderWidgetHostImpl* host =
+      RenderWidgetHostImpl::From(view->GetRenderWidgetHost());
+  if (!host) {
+    return;
+  }
+  const gfx::PointF dip_screen =
+      ScreenPixelsToDIP(state.last_wheel_x, state.last_wheel_y);
+  const gfx::Rect view_bounds = view->GetViewBounds();
+  blink::WebMouseWheelEvent event(blink::WebInputEvent::Type::kMouseWheel,
+                                  blink::WebInputEvent::kFromDebugger |
+                                      state.button_state,
+                                  base::TimeTicks::Now());
+  event.SetPositionInWidget(dip_screen.x() - view_bounds.x(),
+                            dip_screen.y() - view_bounds.y());
+  event.SetPositionInScreen(dip_screen.x(), dip_screen.y());
+  event.delta_x = 0;
+  event.delta_y = 0;
+  event.wheel_ticks_x = 0;
+  event.wheel_ticks_y = 0;
+  event.phase = blink::WebMouseWheelEvent::kPhaseEnded;
+  event.delta_units = ui::ScrollGranularity::kScrollByPrecisePixel;
+  event.dispatch_type = blink::WebInputEvent::DispatchType::kEventNonBlocking;
+#ifdef MOUSEMUX_DEBUG
+  LogDebug(base::StringPrintf("OUT wheel-end: hwid=0x%x view=%p host=%p",
+                              hwid, static_cast<void*>(view),
+                              static_cast<void*>(host)));
+#endif
   host->ForwardWheelEventWithLatencyInfo(event, ui::LatencyInfo());
 }
 
-void MouseMuxInputController::FocusKeyboardTargetView() {
-#ifdef MOUSEMUX_MULTI_OWNER
-  // Single-owner by construction: it picks ONE view and drags the OS
-  // foreground window to it, then posts delayed re-focus attempts at 50, 150
-  // and 300ms to beat the dialog.  With several users that is focus churn
-  // arriving a third of a second after a capture toggle, stealing whatever
-  // window somebody else was working in.
-  //
-  // Renderer page focus for every view instead, and nothing at OS level.
-  for (RenderWidgetHostViewAura* v : registered_views_) {
-    if (!v) {
-      continue;
-    }
-    if (RenderWidgetHostImpl* h =
-            RenderWidgetHostImpl::From(v->GetRenderWidgetHost())) {
-      h->Focus();
+void MouseMuxInputController::NoteSdkButtonState() {
+  // Defined in desktop_window_tree_host_win.cc; read by
+  // WebContentsViewAura::StartDragging and
+  // DesktopDragDropClientWin::StartDragAndDrop.  A drag that begins while an
+  // injected mouse holds a button was begun by that mouse, and must not
+  // become an OLE drag: DoDragDrop is a modal Win32 loop that ends only on a
+  // real button release, which the injected mouse never produces, and the
+  // browser process hangs in that loop (field dump, 2026-09-04).
+  extern bool g_mousemux_sdk_button_held;
+  bool held = false;
+  for (const auto& entry : device_state_) {
+    if (entry.second.button_state != 0) {
+      held = true;
+      break;
     }
   }
-  return;
-#else
-  // Single-owner path: the owner's own keyboard target.
-  RenderWidgetHostViewAura* view =
-      (owner_hwid_ == -1) ? nullptr
-                          : StateFor(owner_hwid_).keyboard_target_view.get();
-  if (!view || !registered_views_.count(view)) {
-    // Fall back to first showing view.
-    for (RenderWidgetHostViewAura* v : registered_views_) {
-      if (v && v->IsShowing()) {
-        view = v;
-        break;
-      }
-    }
-  }
-  if (!view) return;
-
-  HWND browser_hwnd = nullptr;
-  aura::Window* native_view = view->GetNativeView();
-  if (native_view) {
-    aura::Window* toplevel = native_view->GetToplevelWindow();
-    if (toplevel) {
-      browser_hwnd = toplevel->GetHost()->GetAcceleratedWidget();
-    }
-  }
-
-  // Immediate focus attempt.
-  if (browser_hwnd) {
-    ::SetForegroundWindow(browser_hwnd);
-  }
-  view->Focus();
-  RenderWidgetHostImpl* host = RenderWidgetHostImpl::From(
-      view->GetRenderWidgetHost());
-  if (host) {
-    host->Focus();
-  }
-
-#ifdef MOUSEMUX_DEBUG
-  HWND fg_now = ::GetForegroundWindow();
-  LogDebug(base::StringPrintf(
-      "FocusKeyboardTargetView: browser_hwnd=%p fg_before=%p fg_after=%p",
-      browser_hwnd, fg_now, ::GetForegroundWindow()));
-#endif
-
-  // The dialog's button-click processing can steal focus back after we return.
-  // Post delayed re-focus attempts to overcome this.
-  if (browser_hwnd) {
-    for (int delay_ms : {50, 150, 300}) {
-      base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
-          FROM_HERE,
-          base::BindOnce(
-              [](MouseMuxInputController* self, HWND target,
-                 int delay_val) {
-                if (!::IsWindow(target))
-                  return;
-                HWND current_fg = ::GetForegroundWindow();
-                if (current_fg == target)
-                  return;  // Already focused, nothing to do.
-
-                ::SetForegroundWindow(target);
-
-                // Also re-focus the view and host for renderer IPC.
-                RenderWidgetHostViewAura* v =
-                    (self->owner_hwid_ == -1)
-                        ? nullptr
-                        : self->StateFor(self->owner_hwid_)
-                              .keyboard_target_view.get();
-                if (v && self->registered_views_.count(v)) {
-                  v->Focus();
-                  RenderWidgetHostImpl* h = RenderWidgetHostImpl::From(
-                      v->GetRenderWidgetHost());
-                  if (h) {
-                    h->Focus();
-                  }
-                }
-
-#ifdef MOUSEMUX_DEBUG
-                self->LogDebug(base::StringPrintf(
-                    "FocusKeyboardTargetView delayed refocus (%dms): "
-                    "was=%p now=%p target=%p",
-                    delay_val, current_fg, ::GetForegroundWindow(), target));
-#else
-                (void)delay_val;
-#endif
-              },
-              base::Unretained(this), browser_hwnd, delay_ms),
-          base::Milliseconds(delay_ms));
-    }
-  }
-#endif  // MOUSEMUX_MULTI_OWNER
+  g_mousemux_sdk_button_held = held;
 }
 
 void MouseMuxInputController::InjectKeyboardEvent(
@@ -2840,6 +3617,7 @@ void MouseMuxInputController::InjectKeyboardEvent(
   }
 
   InjectionStats& stats = injection_stats_[hwid];
+  StateFor(hwid).last_input_time = base::TimeTicks::Now();
 
   RenderWidgetHostImpl* host = RenderWidgetHostImpl::From(
       view->GetRenderWidgetHost());
@@ -2857,54 +3635,13 @@ void MouseMuxInputController::InjectKeyboardEvent(
   stats.last_view_focused = view->HasFocus();
   stats.last_page_focused = host->is_focused();
 
-#ifdef MOUSEMUX_MULTI_OWNER
-  // No OS focus manipulation at all.  Under capture there is no native input
-  // to compete with, so the only thing that ever moved focus was us — and with
-  // several users typing at once, SetForegroundWindow is several keystroke
-  // streams fighting over one foreground window.
-  //
-  // Instead tell EVERY registered view's renderer that its page is focused.
-  // RenderWidgetHostImpl::Focus() ends in SetPageFocus(true), which is a mojo
-  // SetFocus(kFocused) to that one renderer and touches nothing in the OS.
-  // Separate browser windows are separate WebContents, so they are separate
-  // delegates: there is no arbitration that unfocuses one when another is
-  // focused.  Re-asserting on every keystroke also repairs the blur that
-  // OnWindowFocused fired when a window was last activated.
-  //
-  // SPIKE (A6.1): what this is here to answer is whether Blink actually
-  // renders and blinks a caret on renderer page-focus alone, in a window that
-  // is not the OS foreground.  If it does not, multi-owner is not viable and
-  // this block comes out again.
-  for (RenderWidgetHostViewAura* v : registered_views_) {
-    if (!v) {
-      continue;
-    }
-    if (RenderWidgetHostImpl* h =
-            RenderWidgetHostImpl::From(v->GetRenderWidgetHost())) {
-      h->Focus();
-    }
-  }
-#else
-  // Ensure the native window is active and the view has focus.
-  // view->Focus() alone doesn't work if the OS window isn't foreground.
-  aura::Window* native_view = view->GetNativeView();
-  if (native_view) {
-    aura::Window* toplevel = native_view->GetToplevelWindow();
-    if (toplevel) {
-      HWND hwnd = toplevel->GetHost()->GetAcceleratedWidget();
-      if (hwnd && ::GetForegroundWindow() != hwnd) {
-        ::SetForegroundWindow(hwnd);
-      }
-    }
-  }
-  if (!view->HasFocus()) {
-    view->Focus();
-  }
-  // Also set renderer-level page focus (sends SetFocus IPC), matching what
-  // InjectMouseEvent does for button events. Without this, the renderer may
-  // not recognize keyboard focus even though the OS-level window has focus.
-  host->Focus();
-#endif  // MOUSEMUX_MULTI_OWNER
+  // No focus work here.  Focus is the window's business: PreHandleMSG
+  // re-activates the views side of an OS-inactive window before dispatching,
+  // which restores the view the user last focused, and that view focuses its
+  // own renderer when it is the page.  Forcing page focus on every renderer
+  // from here would put a caret back in the page while the user is typing in
+  // the omnibox.
+
 
   // Build modifiers from the keys THIS device pair is holding.  Shared state
   // here would mean one user's held Shift capitalising another user's typing.
@@ -2997,67 +3734,31 @@ void MouseMuxInputController::InjectKeyboardEvent(
   }
 #endif  // MOUSEMUX_KEYBOARD_LAYOUT
 
-  // On Windows, the normal keyboard flow is:
-  //   1. WM_KEYDOWN → aura → OnKeyEvent → ForwardKeyboardEvent(kRawKeyDown)
-  //   2. WM_CHAR    → InsertChar → ForwardKeyboardEvent(kChar) → text insertion
-  // Text insertion happens ONLY via InsertChar, NOT via ForwardKeyboardEvent.
+  // Into the window, where a real keystroke enters.  PreHandleMSG turns these
+  // into ui::KeyEvents flagged EF_IS_SYNTHESIZED and sends them where a
+  // WM_KEYDOWN goes: the aura dispatcher skips the input method for
+  // synthesized events and hands them to the views focus manager, so
+  // accelerators fire and the focused view - omnibox, find bar or page -
+  // receives them.  The character goes separately, to the focused
+  // TextInputClient, because the views layer drops char events on the
+  // dispatch path.
   //
-  // For SDK injection, we replicate both steps using the same APIs:
-  //   1. Send kRawKeyDown via ForwardKeyboardEvent (fires JS keydown)
-  //   2. Call view->InsertChar() with a synthetic ui::KeyEvent (text insertion)
-  // Native WM_CHAR messages are blocked in InsertChar (they check a flag
-  // that is NOT set for SDK-injected events which use kFromDebugger).
-
-  blink::WebInputEvent::Type type = is_down
-      ? blink::WebInputEvent::Type::kRawKeyDown
-      : blink::WebInputEvent::Type::kKeyUp;
-
-  blink::WebKeyboardEvent event(type, modifiers, base::TimeTicks::Now());
-  event.windows_key_code = vkey;
-  event.native_key_code = vkey;
-  event.dom_code = static_cast<int>(dom_code);
-  event.dom_key = static_cast<int>(dom_key);
-
-#ifdef MOUSEMUX_DEBUG
-  LogDebug(base::StringPrintf(
-      ">>> INJECT KEY %s: vkey=0x%x mods=0x%x dom_code=%d dom_key=0x%x "
-      "native_key=%d has_focus=%d",
-      is_down ? "DOWN" : "UP", vkey, modifiers,
-      static_cast<int>(event.dom_code),
-      event.dom_key,
-      event.native_key_code,
-      view->HasFocus()));
-#endif
-
-  // Forward the kRawKeyDown/kKeyUp event (fires JS keydown/keyup).
-  input::NativeWebKeyboardEvent native_event(event, gfx::NativeView());
-  native_event.skip_if_unhandled = true;
-  // Whether the host will silently discard this, recorded before the call:
-  // a forwarded event that the renderer is ignoring looks exactly like a
-  // delivered one from anywhere outside this function.
-  if (host->IsIgnoringWebInputEvents(native_event)) {
-    ++stats.host_ignoring;
+  // PostMessage rather than a call: it is what the mouse path does, it keeps
+  // the content layer out of ui/views, and one window's messages are handled
+  // in order, so a keydown always precedes its characters and never
+  // interleaves with another user's.
+  const HWND hwnd = ToplevelWindowOf(view);
+  if (!hwnd) {
+    LogDebug("InjectKeyboardEvent: view has no toplevel window");
+    return;
   }
-  ++stats.forwarded;
-  host->ForwardKeyboardEvent(native_event);
+  const WPARAM mods = static_cast<WPARAM>(ui_flags & 0xFFFF) << 16;
+  const LPARAM code = static_cast<LPARAM>(static_cast<uint32_t>(dom_code));
+  ++stats.posted_keys;
+  ::PostMessage(hwnd, is_down ? WM_MOUSEMUX_KEYDOWN : WM_MOUSEMUX_KEYUP,
+                mods | static_cast<WPARAM>(vkey & 0xFFFF), code);
 
-  // For character keys on keydown, call InsertChar to trigger text insertion.
-  // This is the exact same path that native WM_CHAR uses. We create a
-  // ui::KeyEvent with the character and call view->InsertChar() directly,
-  // bypassing the native_keyboard_input_blocked_ check (which only blocks
-  // events NOT marked with kFromDebugger).
   if (is_down) {
-    int char_flags = ui::EF_IS_SYNTHESIZED;
-    if (modifiers & blink::WebInputEvent::kShiftKey)
-      char_flags |= ui::EF_SHIFT_DOWN;
-    if (modifiers & blink::WebInputEvent::kControlKey)
-      char_flags |= ui::EF_CONTROL_DOWN;
-    if (modifiers & blink::WebInputEvent::kAltKey)
-      char_flags |= ui::EF_ALT_DOWN;
-
-    // What to insert.  The layout may produce more than one character from a
-    // single key — a composed accent, or a ligature — so this is a string,
-    // not a char.
     std::u16string text;
 #ifdef MOUSEMUX_KEYBOARD_LAYOUT
     text = layout_text;
@@ -3066,20 +3767,25 @@ void MouseMuxInputController::InjectKeyboardEvent(
       text.push_back(static_cast<char16_t>(dom_key.ToCharacter()));
     }
 #endif
-
+    const LPARAM char_param =
+        code | (static_cast<LPARAM>(vkey & 0xFFFF) << 32);
     for (char16_t ch : text) {
-      ui::KeyEvent char_event = ui::KeyEvent::FromCharacter(
-          ch, static_cast<ui::KeyboardCode>(vkey), dom_code, char_flags);
-
-#ifdef MOUSEMUX_DEBUG
-      LogDebug(base::StringPrintf(
-          ">>> INJECT CHAR via InsertChar: vkey=0x%x U+%04X",
-          vkey, static_cast<unsigned>(ch)));
-#endif
-
-      ++stats.inserted;
-      view->InsertChar(char_event);
+      ++stats.posted_chars;
+      ::PostMessage(hwnd, WM_MOUSEMUX_CHAR, mods | ch, char_param);
     }
+#ifdef MOUSEMUX_DEBUG
+    LogDebug(base::StringPrintf(
+        "OUT key DOWN: hwid=0x%x user=%s hwnd=%p view=%p vkey=0x%x flags=0x%x "
+        "chars=%d",
+        hwid, UserNameOf(hwid).c_str(), static_cast<void*>(hwnd),
+        static_cast<void*>(view), MouseMuxLogVkey(vkey), ui_flags,
+        static_cast<int>(text.size())));
+  } else {
+    LogDebug(base::StringPrintf(
+        "OUT key UP: hwid=0x%x user=%s hwnd=%p view=%p vkey=0x%x", hwid,
+        UserNameOf(hwid).c_str(), static_cast<void*>(hwnd),
+        static_cast<void*>(view), MouseMuxLogVkey(vkey)));
+#endif
   }
 }
 

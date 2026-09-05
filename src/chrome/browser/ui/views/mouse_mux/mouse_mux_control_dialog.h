@@ -15,17 +15,19 @@
 #include <vector>
 
 #include "base/memory/raw_ptr.h"
+#include "base/values.h"
 #include "base/memory/weak_ptr.h"
 #include "base/timer/timer.h"
 #include "ui/gfx/image/image_skia.h"
 #include "ui/gfx/native_ui_types.h"
 #include "ui/views/window/dialog_delegate.h"
 
+class BrowserWindowInterface;
+
 namespace views {
 class Checkbox;
 class Combobox;
 class MdTextButton;
-class ToggleButton;
 class Label;
 #ifdef MOUSEMUX_DEBUG
 class Textarea;
@@ -65,9 +67,6 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // Called when capture state changes.
   void OnCaptureStateChanged(bool captured);
 
-  // Called when native input blocking state changes (e.g. from control server).
-  void OnNativeBlockingChanged(bool blocked);
-
   // Shows or hides the dialog window.  Driven by the controller so the
   // control server can reach it without content depending on ui/views.
   void OnVisibilityChanged(bool visible);
@@ -86,9 +85,7 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   void SetupContents();
 
   // Called when controls change.
-  void OnNativeInputToggled();
   void OnConnectClicked();
-  void OnHardLockToggled();
 
   // Drops every owner. A reset rather than a daily action, which is why it
   // lives behind Advanced: releasing capture is what ends a shift, dropping
@@ -108,6 +105,7 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
 
   // Per-user capture, from the checkbox on that user's row.
   void OnOwnerCaptureToggled(int hwid, views::Checkbox* box);
+  void OnOwnerBlockToggled(int hwid, views::Checkbox* box);
 
   // Collapses the dialog to a small strip, and expands it again.  Deliberately
   // not the same as the control server's "visible" flag: collapsing leaves a
@@ -169,12 +167,34 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // own process and profile, started by this executable, sharing nothing.
   void OnNewWindowClicked();
   void OnNewSeatClicked();
+  // The "+ Window" operation as a function: a copy of the signed-in tab in
+  // a window of its own.  Returns the new window, or null when there was
+  // nothing to copy or the copy could not be moved out.
+  BrowserWindowInterface* OpenWindowCopy();
+
+  // The layout file: every normal window's bounds, active URL, owner name
+  // and the owner's two flags, as JSON in the profile directory.  Save
+  // writes it; Load (separate) rebuilds the windows and hands them out by
+  // name.
+  void OnSaveLayoutClicked();
+
+  // Remote seats: the control server's pages, each in a window of its own so
+  // no user's window is touched.  Host shares windows from this machine,
+  // View joins a code from another.  Both need --mousemux-control-port.
+  void OnHostClicked();
+  void OnViewClicked();
+  void OpenControlPage(const char* file);
+  void OnLoadLayoutClicked();
+  // The file has been read (or not); rebuild the windows from it.
+  void ApplyLayout(std::optional<base::DictValue> layout);
 
   // Called when ownership changes.
   void OnOwnershipChanged(int hwid, const std::string& name);
-
-  // Update the dialog title with owner info.
-  void UpdateTitle();
+  // The UI side of OnOwnershipChanged, on its own task: captions, chips,
+  // rows, status.
+  void RefreshOwnershipUi();
+  // A message from the server, in a non-modal window of its own.
+  void ShowNotice(const std::string& text, bool error);
 
 #ifdef MOUSEMUX_DEBUG
   // Write to log file.
@@ -200,19 +220,13 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   raw_ptr<views::MdTextButton> new_window_button_ = nullptr;
   raw_ptr<views::MdTextButton> new_seat_button_ = nullptr;
   raw_ptr<views::MdTextButton> release_all_button_ = nullptr;
+  // Greyed out while disconnected too: owners are assigned by name through
+  // the user list, which only the connection provides.
+  raw_ptr<views::MdTextButton> load_layout_button_ = nullptr;
+  raw_ptr<views::MdTextButton> save_layout_button_ = nullptr;
 
   // "Users (N)" - the count belongs in the heading, not in a separate label.
   raw_ptr<views::Label> users_header_label_ = nullptr;
-
-  // A preference about users, so it sits with them rather than among the
-  // connection controls, and a checkbox rather than a fourth identical toggle.
-  raw_ptr<views::Checkbox> hard_lock_checkbox_ = nullptr;
-
-  // Options that apply to everybody, in the bottom pane.  Native input
-  // blocking is deliberately NOT per user: the Windows messages it drops
-  // carry no device identity, which is the entire reason MouseMux exists.
-  // The per-user equivalent is capture, on each row.
-  raw_ptr<views::Checkbox> native_input_checkbox_ = nullptr;
 
   // One built row, kept so it can be updated without being rebuilt.
   struct OwnerRow {
@@ -223,6 +237,7 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
     raw_ptr<views::Label> where = nullptr;
     raw_ptr<views::Label> typing = nullptr;
     raw_ptr<views::Checkbox> capture = nullptr;
+    raw_ptr<views::Checkbox> block = nullptr;
     raw_ptr<views::MdTextButton> close = nullptr;
   };
   std::vector<OwnerRow> owner_rows_;
@@ -265,10 +280,6 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   // Window icon.
   gfx::ImageSkia window_icon_;
 
-  // Current owner info.
-  int owner_hwid_ = -1;
-  std::string owner_name_;
-
   // Current capture state.
   bool is_captured_ = false;
 
@@ -283,6 +294,9 @@ class MouseMuxControlDialog : public views::DialogDelegateView {
   size_t selected_hotkey_index_ = 0;
 
   static MouseMuxControlDialog* instance_;
+
+  // A RefreshOwnershipUi task is posted and has not run yet.
+  bool ownership_refresh_pending_ = false;
 
   // For ScheduleRebuild(): the dialog can be closed between posting the task
   // and running it.

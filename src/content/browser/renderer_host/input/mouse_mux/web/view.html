@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MouseMux Chrome - remote window</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #000; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  #join { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: #1e1e1e; }
+  #join input { font: 24px monospace; letter-spacing: 3px; padding: 6px 10px; width: 12ch; text-align: center; }
+  #join button { font: inherit; padding: 6px 14px; }
+  #stage { position: absolute; inset: 0; display: none; }
+  video { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; cursor: none; }
+  #status { position: absolute; left: 8px; bottom: 6px; font: 12px monospace; color: #6a6; pointer-events: none; }
+</style>
+<div id="join">
+  <div>Enter the code shown on the host</div>
+  <input id="code" placeholder="CODE" autofocus>
+  <button id="go">Connect</button>
+  <div id="err" style="color:#e77"></div>
+</div>
+<div id="stage"><video id="v" autoplay muted playsinline></video><div id="status"></div></div>
+<script>
+'use strict';
+// The remote end: join the code, show the host window's frames full-screen,
+// and send every pointer and key event back on the data channel, normalized
+// to the frame.  The host turns them into a MouseMux virtual user's input.
+const SIGNAL_URL = 'wss://signal.mousemux.com/ws';
+const status = (m) => { document.getElementById('status').textContent = m; };
+
+document.getElementById('go').onclick = join;
+document.getElementById('code').onkeydown = (e) => { if (e.key === 'Enter') join(); };
+
+function join() {
+  const code = document.getElementById('code').value.trim();
+  if (!code) return;
+  const err = document.getElementById('err'); err.textContent = '';
+  const ws = new WebSocket(SIGNAL_URL);
+  let ice = { iceServers: [{ urls: ['stun:turn.mousemux.com:3478'] }] };
+  let pc = null, channel = null, hostId = null;
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', userId: crypto.randomUUID(), systemId: '00000000-00000000-00000000-00000000-000000000000000000000000-000' }));
+  ws.onerror = () => { err.textContent = 'Could not reach the signalling server.'; };
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data);
+    switch (msg.type) {
+      case 'welcome':
+        if (Array.isArray(msg.iceServers) && msg.iceServers.length) ice = { iceServers: msg.iceServers };
+        ws.send(JSON.stringify({ type: 'join-session', sessionId: code }));
+        break;
+      case 'session-joined': case 'session-rejoined':
+        status('joined ' + code + ', waiting for the host');
+        break;
+      case 'session-error': case 'auth-denied':
+        err.textContent = msg.message || msg.reason || 'Session not found.';
+        break;
+      case 'signal': {
+        const p = msg.payload;
+        if (p.type === 'offer') {
+          hostId = msg.fromId;
+          pc = new RTCPeerConnection(ice);
+          pc.ontrack = (e) => {
+            const v = document.getElementById('v');
+            v.srcObject = e.streams[0] || new MediaStream([e.track]);
+            document.getElementById('join').style.display = 'none';
+            document.getElementById('stage').style.display = 'block';
+            status('connected');
+          };
+          pc.ondatachannel = (e) => { channel = e.channel; channel.onopen = () => status('connected, input live'); };
+          pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'signal', targetId: hostId, payload: { type: 'ice-candidate', candidate: e.candidate } })); };
+          pc.onconnectionstatechange = () => status(pc.connectionState);
+          await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: 'signal', targetId: hostId, payload: { type: 'answer', sdp: pc.localDescription } }));
+        } else if (p.type === 'ice-candidate' && pc && p.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(p.candidate));
+        }
+        break;
+      }
+    }
+  };
+
+  // --- input ------------------------------------------------------------------
+  const send = (m) => { if (channel && channel.readyState === 'open') channel.send(JSON.stringify(m)); };
+  const v = document.getElementById('v');
+  // Where the frame sits inside the element (object-fit: contain letterboxes).
+  function frameCoords(e) {
+    const r = v.getBoundingClientRect();
+    const vw = v.videoWidth || r.width, vh = v.videoHeight || r.height;
+    const scale = Math.min(r.width / vw, r.height / vh);
+    const fw = vw * scale, fh = vh * scale;
+    const ox = r.left + (r.width - fw) / 2, oy = r.top + (r.height - fh) / 2;
+    const x = (e.clientX - ox) / fw, y = (e.clientY - oy) / fh;
+    if (x < 0 || y < 0 || x > 1 || y > 1) return null;
+    return { x, y };
+  }
+  let lastMove = 0;
+  v.addEventListener('pointermove', (e) => {
+    const now = performance.now(); if (now - lastMove < 16) return; lastMove = now;   // ~60 Hz
+    const c = frameCoords(e); if (c) send({ t: 'm', x: c.x, y: c.y });
+  });
+  v.addEventListener('pointerdown', (e) => { const c = frameCoords(e); if (c) send({ t: 'b', b: e.button, d: 1, x: c.x, y: c.y }); v.setPointerCapture(e.pointerId); });
+  v.addEventListener('pointerup', (e) => { const c = frameCoords(e) || { x: 0, y: 0 }; send({ t: 'b', b: e.button, d: 0, x: c.x, y: c.y }); });
+  v.addEventListener('wheel', (e) => { e.preventDefault(); send({ t: 'w', d: e.deltaY < 0 ? 120 : -120 }); }, { passive: false });
+  v.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // Keys: DOM code -> Windows virtual key.  Letters and digits by name, the
+  // rest from a table.  The host injects them as the virtual keyboard.
+  const VK = { Backspace: 0x08, Tab: 0x09, Enter: 0x0D, NumpadEnter: 0x0D, ShiftLeft: 0x10, ShiftRight: 0x10, ControlLeft: 0x11, ControlRight: 0x11,
+    AltLeft: 0x12, AltRight: 0x12, Pause: 0x13, CapsLock: 0x14, Escape: 0x1B, Space: 0x20, PageUp: 0x21, PageDown: 0x22, End: 0x23, Home: 0x24,
+    ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28, Insert: 0x2D, Delete: 0x2E, MetaLeft: 0x5B, MetaRight: 0x5C, ContextMenu: 0x5D,
+    NumpadMultiply: 0x6A, NumpadAdd: 0x6B, NumpadSubtract: 0x6D, NumpadDecimal: 0x6E, NumpadDivide: 0x6F,
+    F1: 0x70, F2: 0x71, F3: 0x72, F4: 0x73, F5: 0x74, F6: 0x75, F7: 0x76, F8: 0x77, F9: 0x78, F10: 0x79, F11: 0x7A, F12: 0x7B,
+    Semicolon: 0xBA, Equal: 0xBB, Comma: 0xBC, Minus: 0xBD, Period: 0xBE, Slash: 0xBF, Backquote: 0xC0, BracketLeft: 0xDB, Backslash: 0xDC, BracketRight: 0xDD, Quote: 0xDE };
+  function vkeyOf(e) {
+    if (/^Key[A-Z]$/.test(e.code)) return e.code.charCodeAt(3);
+    if (/^Digit[0-9]$/.test(e.code)) return e.code.charCodeAt(5);
+    if (/^Numpad[0-9]$/.test(e.code)) return 0x60 + (e.code.charCodeAt(6) - 48);
+    return VK[e.code];
+  }
+  window.addEventListener('keydown', (e) => { if (!channel) return; const vk = vkeyOf(e); if (vk === undefined) return; e.preventDefault(); if (!e.repeat) send({ t: 'k', v: vk, d: 1 }); else send({ t: 'k', v: vk, d: 1 }); });
+  window.addEventListener('keyup', (e) => { if (!channel) return; const vk = vkeyOf(e); if (vk === undefined) return; e.preventDefault(); send({ t: 'k', v: vk, d: 0 }); });
+  // Keys the browser keeps for itself (Ctrl+W, Ctrl+T...) are released to us in fullscreen with keyboard lock.
+  v.addEventListener('dblclick', async () => { try { await document.documentElement.requestFullscreen(); await navigator.keyboard?.lock?.(); } catch (_) {} });
+}
+</script>
