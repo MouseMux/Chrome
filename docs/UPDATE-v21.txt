@@ -639,6 +639,18 @@ Why:    with Multi-keyboard off the native copy of a keystroke lands in the
         dialog, by design.
 Revert: revert the commit alone (entry 57 remains).
 
+59. user.changed action "update" refreshes the user list   src f41a0dda648
+----------------------------------------------------------------------------
+What:   mouse_mux_client.cc treats action "update" like "map": request the
+        user list; OnUserList rebuilds the pairing from scratch.
+Why:    the server (2026-09-05) now sends "update" when a device is
+        detached from a user that still exists - unplug, unmap, the losing
+        side of a keyboard reassignment.  Previously that action was
+        defined but never sent; the client logged it as unhandled, and the
+        losing user kept the keyboard in the cached pairing.
+Revert: revert the commit alone; entry 55's re-request still covers it,
+        two seconds late.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
