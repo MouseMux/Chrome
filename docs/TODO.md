@@ -3,12 +3,18 @@
 Open items, newest first. Each says why it is open and what would close it.
 
 - **Update the Help dialog** (2026-09-04). It still describes the dialog as it
-  was this morning: no per-row "Block native", no window sets, no "[Green]"
-  caption/chip, no column header. Rewrite the Options and row sections and
-  the flow steps to match.
-- **Save / load** (2026-09-04). A named layout: windows, positions, sizes,
-  tabs/URLs, and which user owns which; load it on start or on demand. Same
-  item as the disconnect note below; this is the user-facing form.
+  was that morning: no per-row "Block native", no window sets, no "[Green]"
+  caption/chip, no column header, no Save/Load layout. The "Why
+  Multi-keyboard is required" section is in (2026-09-05). Rewrite the
+  Options and row sections and the flow steps to match.
+- **Save / load, the rest** (2026-09-04; first cut shipped 2026-09-05 as
+  entries 60-65: Save layout and Load layout buttons, one file next to the
+  profile, owners assigned by MouseMux name). Still open: several tabs per
+  window (today the active tab's URL only), named layouts, load on start,
+  and **reconnect memory**: when the connection drops every user is
+  released and has to click again; on the first user list after a reconnect
+  the last owner of each window could be re-assigned by name with
+  `AssignWindow`. One list, filled at disconnect, used once.
 - **Advanced options** (2026-09-04, plan 2026-09-05). Four commits, in order:
   1. logging becomes a runtime switch: the `MOUSEMUX_DEBUG` code stays
      compiled in, the four log sinks (controller log, diag log, controller
@@ -27,7 +33,7 @@ Open items, newest first. Each says why it is open and what would close it.
   and rejected for the same reasons Google dropped Blimp (pages are programs,
   fonts/subresources/session leak, pixel fallback needed anyway).
   What exists already - MouseMux Screen Matrix
-  (`o:\GitHub\Gibster\mousemux-appseleasepps\webapp-screen-matrix`):
+  (`o:\GitHub\Gibster\mousemux-apps\release\apps\webapp-screen-matrix`):
   peer-to-peer WebRTC (`js/p2p-room.js`, LiveKit-shaped API, signalling
   `wss://signal.mousemux.com/ws` with join-session, STUN at
   turn.mousemux.com, TURN credentials from the welcome message), session
@@ -46,33 +52,29 @@ Open items, newest first. Each says why it is open and what would close it.
      the viewer with a code.
   Spike: one hidden host window, one capture track over P2P to a Screen
   Matrix viewer, driven through a virtual user.  Proves 1-3 end to end.
+- **Mouse capture knows about users** (2026-09-05). Another user's click on
+  Chrome UI (a button, a tab; not a page) takes mouse capture, Windows has
+  one capture per thread, and the open menu of the first user closes.
+  Documented limitation (UPDATE-v21 entry 57). Fix means an injected UI
+  press not taking Win32 capture while another window's menu holds it.
+- **Tab × glyph blink** (2026-09-05). Seen once: the × on an inactive tab
+  blinked under an injected pointer, then stopped. The glyph is drawn while
+  the tab believes it is hovered, so it was the tab's hover state toggling.
+  If it recurs: trace Tab::OnMouseEntered/Exited and whether the hover card
+  was up.
 
-- **Tab-strip clicks from an injected mouse do nothing** (2026-09-04). Presses
-  at the top of the window (tab titles, a tab's X) reach the window via the
-  Chrome-UI path but no view handles them (`handled=0` in chrome-log.txt),
-  while the "..." button below them and the page work. Measure where the
-  event stops (the frame's non-client hit test is the suspect: that area is
-  HTCAPTION/HTCLIENT-tab for a real mouse and goes through
-  HWNDMessageHandler, which the custom-message path skips).
 - **Route wheel and mouse through Chrome's input router** instead of straight
   into the main frame's host, so cross-process frames receive them (the
   frame theory for the customer's wheel). Decide after the customer's next
   log with ACK lines: "no consumer" on a page with a scroller under the
   pointer would confirm it.
-
-- **Save/load a layout** (2026-09-04). Save the windows, their positions, and
-  which user owns which, and restore that on start or after a MouseMux
-  disconnect. Today a lost connection releases every user and everyone has
-  to click to claim again. The disconnect itself is left as it is until this
-  exists.
 - **`"debug": true` in app.json for `--tag debug` packages**, if MouseMux
   reads that flag. The packager writes `false` for every build.
-- **New screenshot** of the current dialog (rows read "Window N · title").
-  The packaged one is from 2.2.59.
-- **Remove `MOUSEMUX_MENU_TRACE`** from `ui/views/controls/menu/menu_controller.cc`
-  before a release build; it was a one-off diagnostic (selection-change stack
-  traces).
-- **Menus closing on activation change.** A menu cancels itself when any
-  window's activation changes, so user B activating a window closes user A's
-  menu. Could be suppressed while MouseMux drives. Deliberately left as is
-  for now (2026-09-04).
+- **New screenshot** of the current dialog (rows read "Window N · title",
+  footer has Save layout / Load layout). The packaged one is from 2.2.59.
+
+Done since this list started, removed from it: tab-strip clicks from an
+injected mouse (work since the WindowFromPoint routing, verified
+2026-09-05); `MOUSEMUX_MENU_TRACE` (removed, entry 49); menus closing on
+activation change (fixed 2026-09-04; what remains is the capture item
+above).
