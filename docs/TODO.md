@@ -20,9 +20,32 @@ Open items, newest first. Each says why it is open and what would close it.
      there, plus wheel step, logging, global block, port read-only;
   4. the wheel step (today a constant, 40 px per notch) read from the
      setting.
-- **Screen sharing for remote access** (2026-09-04). Let a remote person see
-  (and possibly drive) one user's window - the seat concept over the network.
-  Scope to be defined: view-only first.
+- **Screen sharing / hosted browsers** (2026-09-04, plan 2026-09-05).
+  Goal: a host runs many of our Chrome windows that nobody sees locally; each
+  remote person drives one from their own machine, as a normal user of the
+  window.  Pixels first: structure streaming (Blimp-style) was considered
+  and rejected for the same reasons Google dropped Blimp (pages are programs,
+  fonts/subresources/session leak, pixel fallback needed anyway).
+  What exists already - MouseMux Screen Matrix
+  (`o:\GitHub\Gibster\mousemux-appseleasepps\webapp-screen-matrix`):
+  peer-to-peer WebRTC (`js/p2p-room.js`, LiveKit-shaped API, signalling
+  `wss://signal.mousemux.com/ws` with join-session, STUN at
+  turn.mousemux.com, TURN credentials from the welcome message), session
+  codes per shared source, window-level coordinate mapping, viewers as
+  MouseMux virtual users with their own cursors.  LiveKit not needed.
+  What only our Chrome can add, in order:
+  1. a capture source per top-level surface (window, menu popup, bubble)
+     straight from the compositor, visible or not, plus its screen rect,
+     exposed to the page as a media track the Web SDK can publish - the OS
+     window capture Screen Matrix uses gives black for hidden windows;
+  2. windows that keep rendering while hidden/off-screen (Chrome throttles
+     occluded windows; flag or placement, measure first);
+  3. the host page: for each window a session code, the virtual user, and
+     AssignWindow(name) so the code is the window is the user;
+  4. the client side is Screen Matrix as it is; later our dialog can open
+     the viewer with a code.
+  Spike: one hidden host window, one capture track over P2P to a Screen
+  Matrix viewer, driven through a virtual user.  Proves 1-3 end to end.
 
 - **Tab-strip clicks from an injected mouse do nothing** (2026-09-04). Presses
   at the top of the window (tab titles, a tab's X) reach the window via the
