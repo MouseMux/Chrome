@@ -565,6 +565,17 @@ Why:    after entry 38 the ... menu and right-click menus flickered again:
         fell back to the real mouse, the exact cause fixed on 2026-09-04.
 Revert: revert the commit alone (entry 38 then has the bug again).
 
+52. Native block covers a blocked window's popups   src 3146c9d8e6a
+----------------------------------------------------------------------------
+What:   MouseMuxWindowBlocked(hwnd): on the list, or its GA_ROOTOWNER is.
+        Used by the PreHandleMSG block and the NATIVE/In trace.
+Why:    the flicker of entry 6 came back with per-owner blocking: the list
+        named the browser windows only, menu popups are windows of their own,
+        and native WM_MOUSEMOVE reached them again (934 under menus in one
+        session, every popup logged "in-open-window").  Entry 51 was aimed
+        at the wrong cause and is harmless.
+Revert: revert the commit alone.
+
 
 Diagnostics in this branch (all off in a release build):
   MOUSEMUX_DEBUG, MOUSEMUX_DEBUG_TRACE (mouse_mux_config.h and, mirrored,
